@@ -1,2 +1,0 @@
-https://raw.githubusercontent.com/nical/lyon/66b9ea7f4ab935763970e828781d8fd5e9305542/LICENSE-MIT
-https://raw.githubusercontent.com/nical/lyon/66b9ea7f4ab935763970e828781d8fd5e9305542/LICENSE-APACHE

@@ -1,4 +1,0 @@
-Registry declaration: Apache-2.0/MIT
-Pinned upstream: https://github.com/zbraniecki/pluralrules at d0715d5b7cca72e228d6e6c4de154bd30dfdd06a
-Exact registry source: https://static.crates.io/crates/intl_pluralrules/intl_pluralrules-7.0.2.crate
-Related distribution license text: ../fluent-0.17.0/

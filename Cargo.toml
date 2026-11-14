@@ -1,0 +1,86 @@
+[package]
+name = "wallpaper-switcher"
+version = "1.0.0"
+edition = "2021"
+authors = ["Kat", "Wallpaper Switcher contributors"]
+description = "Small standalone Windows wallpaper switcher for local images and Wallpaper Engine"
+license = "GPL-3.0-or-later"
+readme = "README.md"
+keywords = ["wallpaper-engine", "gallery", "windows", "rose-pine", "desktop"]
+categories = ["gui", "multimedia"]
+
+[[bin]]
+name = "wallpaper-switcher-gpu-candidate"
+path = "src/bin/gpu_candidate.rs"
+
+[dependencies]
+iced = { version = "0.14", default-features = false, features = ["advanced", "canvas", "image-without-codecs", "thread-pool", "wgpu"] }
+wgpu = "27"
+futures-channel = "0.3"
+clipboard-win = "5.4.1"
+bytemuck = "1.25"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "gif", "webp"] }
+oxiarc-jpeg = { version = "=0.4.2", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+toml = "0.8"
+fluent = "=0.17.0"
+dirs = "5.0"
+windows-sys = { version = "0.59", features = [
+    "Win32_Globalization",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
+    "Win32_System_DataExchange",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
+    "Win32_Graphics_Dwm",
+    "Win32_System_LibraryLoader"
+] }
+windows = { version = "0.62.2", features = [
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_Shell",
+] }
+tray-icon = { version = "0.25.1", default-features = false }
+
+[build-dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+] }
+
+[profile.dev]
+opt-level = 1
+incremental = true
+lto = false
+codegen-units = 16
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

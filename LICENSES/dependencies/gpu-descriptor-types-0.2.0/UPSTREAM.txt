@@ -1,0 +1,4 @@
+Registry declaration: MIT OR Apache-2.0
+Pinned upstream: https://github.com/zakarumych/gpu-descriptor at 9f2fb9546591322e7b77ee1e79385e01effd85e4
+Exact registry source: https://static.crates.io/crates/gpu-descriptor-types/gpu-descriptor-types-0.2.0.crate
+Related distribution license text: ../gpu-descriptor-0.3.2/

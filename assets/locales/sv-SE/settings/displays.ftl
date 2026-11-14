@@ -1,0 +1,10 @@
+settings-displays-card = Aktuella bakgrunder
+settings-displays-card-desc = Det här är bakgrundsbilderna som bakgrundstjänsten rapporterar just nu. Ändringar här gäller en skärm i taget.
+settings-displays-monitor-desc = { $width } × { $height } · { $kind }
+settings-displays-monitor-offline-desc = Frånkopplad · { $width } × { $height }
+settings-displays-placement-label = Placering
+settings-displays-placement-desc = Välj om bakgrundsbilden ska fylla, anpassas, sträckas, centreras, upprepas eller spännas över skärmen.
+settings-displays-lock-label = Lås
+settings-displays-lock-desc = Uppdatera endast skärmens bakgrund genom flerväljaren.
+settings-displays-empty-label = Identifierar skärmar
+settings-displays-empty-desc = Aktuella bakgrundsbilder visas när bakgrundstjänsten rapporterar sina skärmar.

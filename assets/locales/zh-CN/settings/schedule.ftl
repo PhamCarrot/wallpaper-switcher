@@ -1,0 +1,15 @@
+settings-schedule-schedule-card = 计划
+settings-schedule-schedule-card-desc = 在 Windows 控件中编辑支持的星期、时间和显示器目标计划。
+settings-schedule-enable-label = 启用计划
+settings-schedule-enable-desc = 开启或关闭所有计划规则，但不删除规则。
+settings-schedule-apply-on-start-label = 启动时应用
+settings-schedule-apply-on-start-desc = 服务启动时应用第一条匹配的规则。本次会话中手动选择的壁纸仍然优先。
+settings-schedule-editor-label = 计划编辑器
+settings-schedule-editor-desc = 在 Windows 控件中创建星期、时间和目标显示器计划。已保存的计划、定时器恢复和启动时重新应用保持独立。
+settings-schedule-editor-action = 打开
+settings-schedule-location-card = 位置
+settings-schedule-location-card-desc = 用于计算日出和日落时间以及天气条件。
+settings-schedule-latitude-label = 纬度
+settings-schedule-latitude-desc = 十进制度数，北纬为正（例如 59.33）。
+settings-schedule-longitude-label = 经度
+settings-schedule-longitude-desc = 十进制度数，东经为正（例如 18.06）。

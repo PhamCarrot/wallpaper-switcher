@@ -1,0 +1,66 @@
+theme-audition-title = Färgförhandsvisning
+theme-audition-subtitle = Välj en färgkälla och jämför sedan dess profiler med samma bakgrundsbild.
+theme-audition-backend = Färgkälla
+theme-audition-backend-on = { $backend } · på
+theme-audition-selected = Vald
+theme-audition-preview = Förhandsvisa
+theme-audition-loading = Genererar förhandsvisningar från den aktuella bakgrundsbilden…
+theme-audition-empty = Inga färgförhandsvisningar returnerades. Kontrollera att den valda färgkällan är installerad och fungerar.
+
+settings-theme-profile-desc = Redigera de aktuella färgerna och spara en profil för bakgrundsbilden som ger dem.
+theme-profile-load = Läs in aktuella
+theme-profile-save = Spara för denna bakgrundsbild
+theme-profile-enabled = Använd denna profil
+theme-profile-dark = Mörk
+theme-profile-light = Ljus
+
+settings-playback-pause-title = Automatisk paus
+settings-playback-pause-desc = Pausa animerade bakgrundsbilder när något aktiverat villkor uppfylls.
+settings-playback-process-enabled = Pausa när appar körs
+settings-playback-process-desc = Pausa alla skärmar medan en angiven process körs.
+settings-playback-processes = Processer
+settings-playback-choose-process = Välj en process som körs
+settings-playback-target-dialog-title = Mål för automatisk paus
+settings-playback-target-dialog-desc = Lägg till en körande process för att pausa animerade bakgrunder medan den är öppen. Ta bort mål som inte längre ska pausa dem.
+settings-playback-targets = Mål
+settings-playback-targets-empty = Inga processmål har ställts in.
+settings-playback-running = Körande processer
+settings-playback-running-empty = Inga körande processer returnerades.
+settings-playback-target-add = Lägg till
+settings-playback-target-remove = Ta bort
+settings-playback-target-close = Stäng
+settings-playback-target-action-desc = Se målen som pausar bakgrunder och lägg till en körande process.
+settings-playback-target-manual-placeholder = Processnamn, till exempel mpv
+settings-playback-fullscreen = Pausa vid helskärm
+settings-playback-fullscreen-desc = Pausa medan ett helskärmsfönster är synligt. Kräver stöd från kompositorn.
+settings-playback-scope = Skärmar vid fönsterpaus
+settings-playback-scope-desc = Välj om ett pausvillkor för fönster pausar sin skärm eller alla skärmar.
+settings-playback-all = Alla skärmar
+settings-playback-display = Skärmen med fönstret
+settings-playback-resume = Fördröjning före återupptagning
+settings-playback-resume-desc = Vänta efter att det sista villkoret för automatisk paus upphör. Manuell paus fortsätter gälla.
+settings-playback-detection-off = Aktivera paus vid helskärm eller maximerade fönster för att kontrollera kompositorns stöd.
+settings-playback-detection-ready = Identifiering av fönstertillstånd är tillgänglig
+settings-playback-detection-unavailable = Identifiering av fönstertillstånd stöds inte av denna kompositor
+settings-playback-paused-process = Pausad: { $names } körs
+settings-playback-paused-fullscreen = Pausad: helskärmsfönster
+settings-playback-resuming = Väntar på att återuppta
+settings-playback-no-rule = Ingen automatisk pausregel är aktiv
+
+settings-paper-layer-label = Bakgrundslager
+settings-paper-layer-desc = Wayland-lager för videor och scener. Använd Bakgrund med Niris regel place-within-backdrop för att visa den aktiva bakgrunden bakom översikten.
+settings-paper-layer-bottom = Botten (standard)
+settings-paper-layer-background = Bakgrund
+settings-paper-layer-top = Topp
+settings-paper-layer-overlay = Överlägg
+settings-paper-overview-only-label = Animera endast i Niris översikt
+settings-paper-overview-only-desc = Kräver Bakgrund och place-within-backdrop. Pausar när översikten är stängd.
+settings-playback-paused-overview = Pausad medan Niris översikt är stängd
+
+settings-playback-maximized = Pausa vid maximerade fönster
+settings-playback-maximized-desc = Pausa när kompositorn rapporterar ett maximerat fönster. Kräver stöd från kompositorn; Niri rapporterar även fönster på dolda arbetsytor.
+settings-playback-paused-maximized = Pausad: maximerat fönster
+
+settings-playback-full-width = Pausa vid fullbreda kolumner (Niri)
+settings-playback-full-width-desc = Pausa när den aktiva rutlagda kolumnen täcker minst 90% av skärmens bredd. Omfattar Mod+F med normala mellanrum. Andra arbetsytor räknas inte.
+settings-playback-paused-full-width = Pausad: fullbred kolumn

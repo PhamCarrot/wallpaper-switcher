@@ -1,0 +1,867 @@
+[
+  {
+    "id": "theme",
+    "label": "Palette",
+    "description": "Replace each colour with the closest one in a palette.",
+    "params": [
+      {
+        "id": "theme",
+        "label": "Palette",
+        "type": "dropdown",
+        "default": "Catppuccin",
+        "options": [
+          {
+            "mode": "Catppuccin",
+            "label": "Catppuccin"
+          },
+          {
+            "mode": "Nord",
+            "label": "Nord"
+          },
+          {
+            "mode": "Everforest",
+            "label": "Everforest"
+          },
+          {
+            "mode": "Solarized",
+            "label": "Solarized"
+          },
+          {
+            "mode": "Gruvbox",
+            "label": "Gruvbox"
+          },
+          {
+            "mode": "Dracula",
+            "label": "Dracula"
+          },
+          {
+            "mode": "Tokyo Moon",
+            "label": "Tokyo Moon"
+          },
+          {
+            "mode": "Tokyo Storm",
+            "label": "Tokyo Storm"
+          },
+          {
+            "mode": "Tokyo Dark",
+            "label": "Tokyo Dark"
+          },
+          {
+            "mode": "Onedark",
+            "label": "Onedark"
+          },
+          {
+            "mode": "Srcery",
+            "label": "Srcery"
+          },
+          {
+            "mode": "Monokai",
+            "label": "Monokai"
+          },
+          {
+            "mode": "Material",
+            "label": "Material"
+          },
+          {
+            "mode": "Synthwave84",
+            "label": "Synthwave84"
+          },
+          {
+            "mode": "Oceanic Next",
+            "label": "Oceanic Next"
+          },
+          {
+            "mode": "Shades of Purple",
+            "label": "Shades of Purple"
+          },
+          {
+            "mode": "Arc Dark",
+            "label": "Arc Dark"
+          },
+          {
+            "mode": "Night Owl",
+            "label": "Night Owl"
+          },
+          {
+            "mode": "GitHub Light",
+            "label": "GitHub Light"
+          },
+          {
+            "mode": "Rose Pine",
+            "label": "Rose Pine"
+          },
+          {
+            "mode": "Kanagawa",
+            "label": "Kanagawa"
+          },
+          {
+            "mode": "Catppuccin Frappe",
+            "label": "Catppuccin Frappe"
+          },
+          {
+            "mode": "Catppuccin Latte",
+            "label": "Catppuccin Latte"
+          },
+          {
+            "mode": "Melange Dark",
+            "label": "Melange Dark"
+          },
+          {
+            "mode": "Melange Light",
+            "label": "Melange Light"
+          },
+          {
+            "mode": "PaleNight",
+            "label": "PaleNight"
+          },
+          {
+            "mode": "Ayu Dark",
+            "label": "Ayu Dark"
+          },
+          {
+            "mode": "Ayu Light",
+            "label": "Ayu Light"
+          },
+          {
+            "mode": "Ayu Mirage",
+            "label": "Ayu Mirage"
+          }
+        ]
+      }
+    ],
+    "category": "Colour"
+  },
+  {
+    "id": "brightness",
+    "label": "Brightness",
+    "description": "Make the image lighter or darker. Move the slider right for lighter.",
+    "params": [
+      {
+        "id": "factor",
+        "label": "Brightness",
+        "type": "number",
+        "min": 0.1,
+        "max": 10.0,
+        "step": 0.05,
+        "decimals": 2,
+        "default": 1.1
+      }
+    ],
+    "category": "Adjust"
+  },
+  {
+    "id": "contrast",
+    "label": "Contrast",
+    "description": "Pull light and dark areas further apart. Move the slider left to flatten them.",
+    "params": [
+      {
+        "id": "mode",
+        "label": "Mode",
+        "type": "dropdown",
+        "default": "normal",
+        "options": [
+          {
+            "mode": "normal",
+            "label": "Normal"
+          },
+          {
+            "mode": "sigmoid",
+            "label": "Sigmoid"
+          }
+        ]
+      },
+      {
+        "id": "factor",
+        "label": "Contrast",
+        "type": "number",
+        "min": -100.0,
+        "max": 100.0,
+        "step": 1.0,
+        "decimals": 1,
+        "default": 25.0
+      }
+    ],
+    "category": "Adjust"
+  },
+  {
+    "id": "saturation",
+    "label": "Saturation",
+    "description": "Make the colours stronger or weaker.",
+    "params": [
+      {
+        "id": "percentage",
+        "label": "Saturation",
+        "type": "integer",
+        "min": -100,
+        "max": 100,
+        "step": 1,
+        "default": 25
+      }
+    ],
+    "category": "Adjust"
+  },
+  {
+    "id": "gamma",
+    "label": "Gamma",
+    "description": "Change the midtones while mostly leaving black and white alone.",
+    "params": [
+      {
+        "id": "gamma",
+        "label": "Gamma",
+        "type": "number",
+        "min": 0.1,
+        "max": 5.0,
+        "step": 0.05,
+        "decimals": 2,
+        "default": 1.0
+      }
+    ],
+    "category": "Adjust"
+  },
+  {
+    "id": "pixelate",
+    "label": "Pixelate",
+    "description": "Group pixels into blocks. Move the slider right for larger blocks.",
+    "params": [
+      {
+        "id": "scale",
+        "label": "Block size",
+        "type": "integer",
+        "min": 2,
+        "max": 100,
+        "step": 1,
+        "default": 15
+      }
+    ],
+    "category": "Stylize"
+  },
+  {
+    "id": "border",
+    "label": "Border",
+    "description": "Put a solid colour around the image.",
+    "params": [
+      {
+        "id": "color",
+        "label": "Colour",
+        "type": "color",
+        "default": "#1a1a1a"
+      },
+      {
+        "id": "thickness",
+        "label": "Thickness",
+        "type": "integer",
+        "min": 0,
+        "max": 500,
+        "step": 1,
+        "default": 30
+      },
+      {
+        "id": "radius",
+        "label": "Radius",
+        "type": "integer",
+        "min": 0,
+        "max": 500,
+        "step": 1,
+        "default": 0
+      }
+    ],
+    "category": "Transform"
+  },
+  {
+    "id": "round",
+    "label": "Round corners",
+    "description": "Cut away the corners. Move the slider right for rounder corners.",
+    "params": [
+      {
+        "id": "radius",
+        "label": "Radius",
+        "type": "integer",
+        "min": 1,
+        "max": 1000,
+        "step": 1,
+        "default": 60
+      }
+    ],
+    "category": "Transform"
+  },
+  {
+    "id": "duotone",
+    "label": "Duotone",
+    "description": "Use one colour for dark areas and another for light areas.",
+    "params": [
+      {
+        "id": "shadow",
+        "label": "Shadow",
+        "type": "color",
+        "default": "#1e1e2e"
+      },
+      {
+        "id": "highlight",
+        "label": "Highlight",
+        "type": "color",
+        "default": "#cdd6f4"
+      }
+    ],
+    "category": "Colour"
+  },
+  {
+    "id": "gradientmap",
+    "label": "Gradient map",
+    "description": "Pick a colour from the palette based on how bright each pixel is.",
+    "params": [
+      {
+        "id": "theme",
+        "label": "Palette",
+        "type": "dropdown",
+        "default": "Catppuccin",
+        "options": [
+          {
+            "mode": "Catppuccin",
+            "label": "Catppuccin"
+          },
+          {
+            "mode": "Nord",
+            "label": "Nord"
+          },
+          {
+            "mode": "Everforest",
+            "label": "Everforest"
+          },
+          {
+            "mode": "Solarized",
+            "label": "Solarized"
+          },
+          {
+            "mode": "Gruvbox",
+            "label": "Gruvbox"
+          },
+          {
+            "mode": "Dracula",
+            "label": "Dracula"
+          },
+          {
+            "mode": "Tokyo Moon",
+            "label": "Tokyo Moon"
+          },
+          {
+            "mode": "Tokyo Storm",
+            "label": "Tokyo Storm"
+          },
+          {
+            "mode": "Tokyo Dark",
+            "label": "Tokyo Dark"
+          },
+          {
+            "mode": "Onedark",
+            "label": "Onedark"
+          },
+          {
+            "mode": "Srcery",
+            "label": "Srcery"
+          },
+          {
+            "mode": "Monokai",
+            "label": "Monokai"
+          },
+          {
+            "mode": "Material",
+            "label": "Material"
+          },
+          {
+            "mode": "Synthwave84",
+            "label": "Synthwave84"
+          },
+          {
+            "mode": "Oceanic Next",
+            "label": "Oceanic Next"
+          },
+          {
+            "mode": "Shades of Purple",
+            "label": "Shades of Purple"
+          },
+          {
+            "mode": "Arc Dark",
+            "label": "Arc Dark"
+          },
+          {
+            "mode": "Night Owl",
+            "label": "Night Owl"
+          },
+          {
+            "mode": "GitHub Light",
+            "label": "GitHub Light"
+          },
+          {
+            "mode": "Rose Pine",
+            "label": "Rose Pine"
+          },
+          {
+            "mode": "Kanagawa",
+            "label": "Kanagawa"
+          },
+          {
+            "mode": "Catppuccin Frappe",
+            "label": "Catppuccin Frappe"
+          },
+          {
+            "mode": "Catppuccin Latte",
+            "label": "Catppuccin Latte"
+          },
+          {
+            "mode": "Melange Dark",
+            "label": "Melange Dark"
+          },
+          {
+            "mode": "Melange Light",
+            "label": "Melange Light"
+          },
+          {
+            "mode": "PaleNight",
+            "label": "PaleNight"
+          },
+          {
+            "mode": "Ayu Dark",
+            "label": "Ayu Dark"
+          },
+          {
+            "mode": "Ayu Light",
+            "label": "Ayu Light"
+          },
+          {
+            "mode": "Ayu Mirage",
+            "label": "Ayu Mirage"
+          }
+        ]
+      }
+    ],
+    "category": "Colour"
+  },
+  {
+    "id": "sepia",
+    "label": "Sepia",
+    "description": "Mix a sepia tone into the image. Move the slider right for more.",
+    "params": [
+      {
+        "id": "intensity",
+        "label": "Intensity",
+        "type": "number",
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05,
+        "decimals": 2,
+        "default": 1.0
+      }
+    ],
+    "category": "Colour"
+  },
+  {
+    "id": "hue",
+    "label": "Hue",
+    "description": "Move every colour around the colour wheel.",
+    "params": [
+      {
+        "id": "degrees",
+        "label": "Degrees",
+        "type": "integer",
+        "min": 0,
+        "max": 360,
+        "step": 1,
+        "default": 180
+      }
+    ],
+    "category": "Colour"
+  },
+  {
+    "id": "temperature",
+    "label": "Colour temperature",
+    "description": "Move the image between cooler and warmer colours.",
+    "params": [
+      {
+        "id": "amount",
+        "label": "Temperature",
+        "type": "integer",
+        "min": -100,
+        "max": 100,
+        "step": 1,
+        "default": 30
+      }
+    ],
+    "category": "Colour"
+  },
+  {
+    "id": "tint",
+    "label": "Tint",
+    "description": "Lay one colour over the image. Opacity controls how much colour is added.",
+    "params": [
+      {
+        "id": "color",
+        "label": "Colour",
+        "type": "color",
+        "default": "#7aa2f7"
+      },
+      {
+        "id": "opacity",
+        "label": "Opacity",
+        "type": "number",
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05,
+        "decimals": 2,
+        "default": 0.35
+      }
+    ],
+    "category": "Colour"
+  },
+  {
+    "id": "chromatic",
+    "label": "Chromatic aberration",
+    "description": "Pull the red and blue channels apart. Offset controls the distance.",
+    "params": [
+      {
+        "id": "offset",
+        "label": "Offset",
+        "type": "integer",
+        "min": 1,
+        "max": 80,
+        "step": 1,
+        "default": 8
+      }
+    ],
+    "category": "Colour"
+  },
+  {
+    "id": "posterize",
+    "label": "Posterize",
+    "description": "Use fewer colour levels. Fewer levels means flatter colours.",
+    "params": [
+      {
+        "id": "levels",
+        "label": "Levels",
+        "type": "integer",
+        "min": 2,
+        "max": 32,
+        "step": 1,
+        "default": 6
+      }
+    ],
+    "category": "Tone"
+  },
+  {
+    "id": "solarize",
+    "label": "Solarize",
+    "description": "Invert each colour channel once it passes the threshold.",
+    "params": [
+      {
+        "id": "threshold",
+        "label": "Threshold",
+        "type": "integer",
+        "min": 0,
+        "max": 255,
+        "step": 1,
+        "default": 128
+      }
+    ],
+    "category": "Tone"
+  },
+  {
+    "id": "threshold",
+    "label": "Threshold",
+    "description": "Turn every pixel black or white. Cutoff decides where it changes.",
+    "params": [
+      {
+        "id": "cutoff",
+        "label": "Cutoff",
+        "type": "integer",
+        "min": 0,
+        "max": 255,
+        "step": 1,
+        "default": 128
+      }
+    ],
+    "category": "Tone"
+  },
+  {
+    "id": "vignette",
+    "label": "Vignette",
+    "description": "Darken the outside of the image. Radius decides where the darkening starts.",
+    "params": [
+      {
+        "id": "strength",
+        "label": "Strength",
+        "type": "number",
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05,
+        "decimals": 2,
+        "default": 0.6
+      },
+      {
+        "id": "radius",
+        "label": "Radius",
+        "type": "number",
+        "min": 0.1,
+        "max": 1.5,
+        "step": 0.05,
+        "decimals": 2,
+        "default": 0.7
+      }
+    ],
+    "category": "Tone"
+  },
+  {
+    "id": "dim",
+    "label": "Edge darken",
+    "description": "Darken the top, bottom, or both. Size controls how far it reaches.",
+    "params": [
+      {
+        "id": "edge",
+        "label": "Edge",
+        "type": "dropdown",
+        "default": "top",
+        "options": [
+          {
+            "mode": "top",
+            "label": "Top"
+          },
+          {
+            "mode": "bottom",
+            "label": "Bottom"
+          },
+          {
+            "mode": "both",
+            "label": "Top + bottom"
+          }
+        ]
+      },
+      {
+        "id": "strength",
+        "label": "Strength",
+        "type": "number",
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05,
+        "decimals": 2,
+        "default": 0.5
+      },
+      {
+        "id": "size",
+        "label": "Size",
+        "type": "integer",
+        "min": 5,
+        "max": 60,
+        "step": 1,
+        "default": 25
+      }
+    ],
+    "category": "Tone"
+  },
+  {
+    "id": "scanlines",
+    "label": "Scanlines",
+    "description": "Add dark horizontal lines. Spacing controls how far apart they are.",
+    "params": [
+      {
+        "id": "spacing",
+        "label": "Spacing",
+        "type": "integer",
+        "min": 2,
+        "max": 20,
+        "step": 1,
+        "default": 3
+      },
+      {
+        "id": "intensity",
+        "label": "Intensity",
+        "type": "number",
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05,
+        "decimals": 2,
+        "default": 0.4
+      }
+    ],
+    "category": "Stylize"
+  },
+  {
+    "id": "grain",
+    "label": "Film grain",
+    "description": "Add black-and-white noise. Move the slider right for more grain.",
+    "params": [
+      {
+        "id": "amount",
+        "label": "Grain",
+        "type": "integer",
+        "min": 1,
+        "max": 100,
+        "step": 1,
+        "default": 25
+      }
+    ],
+    "category": "Stylize"
+  },
+  {
+    "id": "sharpen",
+    "label": "Sharpen",
+    "description": "Make edges stand out. Move the slider right for harder edges.",
+    "params": [
+      {
+        "id": "amount",
+        "label": "Sharpness",
+        "type": "number",
+        "min": 0.0,
+        "max": 3.0,
+        "step": 0.1,
+        "decimals": 1,
+        "default": 1.0
+      }
+    ],
+    "category": "Stylize"
+  },
+  {
+    "id": "emboss",
+    "label": "Emboss",
+    "description": "Turn the image into raised grey edges.",
+    "params": [],
+    "category": "Stylize"
+  },
+  {
+    "id": "edge",
+    "label": "Edge detect",
+    "description": "Show edges on black. A lower threshold keeps more detail.",
+    "params": [
+      {
+        "id": "threshold",
+        "label": "Threshold",
+        "type": "integer",
+        "min": 0,
+        "max": 255,
+        "step": 1,
+        "default": 60
+      }
+    ],
+    "category": "Stylize"
+  },
+  {
+    "id": "halftone",
+    "label": "Halftone",
+    "description": "Turn the image into black dots. Dot size controls the spacing as well.",
+    "params": [
+      {
+        "id": "size",
+        "label": "Dot size",
+        "type": "integer",
+        "min": 3,
+        "max": 40,
+        "step": 1,
+        "default": 8
+      }
+    ],
+    "category": "Stylize"
+  },
+  {
+    "id": "blur",
+    "label": "Blur",
+    "description": "Blur the image. Move the slider right for more blur.",
+    "params": [
+      {
+        "id": "radius",
+        "label": "Blur radius",
+        "type": "number",
+        "min": 0.5,
+        "max": 50.0,
+        "step": 0.5,
+        "decimals": 1,
+        "default": 8.0
+      }
+    ],
+    "category": "Distort"
+  },
+  {
+    "id": "glitch",
+    "label": "Glitch",
+    "description": "Shift horizontal bands and pull the colour channels apart. Intensity controls how far.",
+    "params": [
+      {
+        "id": "intensity",
+        "label": "Intensity",
+        "type": "integer",
+        "min": 1,
+        "max": 100,
+        "step": 1,
+        "default": 40
+      },
+      {
+        "id": "seed",
+        "label": "Seed",
+        "type": "integer",
+        "min": 0,
+        "max": 9999,
+        "step": 1,
+        "default": 7
+      }
+    ],
+    "category": "Distort"
+  },
+  {
+    "id": "kaleidoscope",
+    "label": "Kaleidoscope",
+    "description": "Mirror the image around its centre. More segments means more repeats.",
+    "params": [
+      {
+        "id": "segments",
+        "label": "Segments",
+        "type": "integer",
+        "min": 2,
+        "max": 24,
+        "step": 1,
+        "default": 6
+      }
+    ],
+    "category": "Distort"
+  },
+  {
+    "id": "kuwahara",
+    "label": "Kuwahara",
+    "description": "Smooth colours without smearing the edges. A larger radius smooths more.",
+    "params": [
+      {
+        "id": "radius",
+        "label": "Smoothing radius",
+        "type": "integer",
+        "min": 1,
+        "max": 10,
+        "step": 1,
+        "default": 4
+      }
+    ],
+    "category": "Distort"
+  },
+  {
+    "id": "invert",
+    "label": "Invert",
+    "description": "Swap every colour for its opposite.",
+    "category": "Adjust",
+    "params": []
+  },
+  {
+    "id": "flip",
+    "label": "Flip",
+    "description": "Turn the image upside down.",
+    "category": "Transform",
+    "params": []
+  },
+  {
+    "id": "mirror",
+    "label": "Mirror",
+    "description": "Swap left and right.",
+    "category": "Transform",
+    "params": []
+  },
+  {
+    "id": "grayscale",
+    "label": "Grayscale",
+    "description": "Remove all colour.",
+    "category": "Adjust",
+    "params": []
+  }
+]

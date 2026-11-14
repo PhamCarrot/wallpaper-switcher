@@ -1,0 +1,25 @@
+slideshow_enabled = false
+active_playlist_id = "review-explicit"
+
+[[playlists]]
+id = "review-explicit"
+name = "Selected wallpapers"
+order = "sequential"
+membership = { membership = "explicit", wallpaper_ids = [] }
+
+[[playlists]]
+id = "review-smart"
+name = "Title matches"
+order = "shuffle"
+membership = { membership = "smart", rule = { text = "wallhaven" } }
+
+[[schedules]]
+id = "review-morning"
+name = "Morning wallpapers"
+enabled = false
+days = 62
+minute_of_day = 480
+priority = 100
+creation_order = 0
+playlist_id = "review-explicit"
+monitor_ids = []

@@ -1,0 +1,49 @@
+audio-masthead = Ljud / mixer
+audio-index-title = Ljud
+audio-index-desc = Pausa bakgrundsbilder per skärm. Skärmar som visar samma källa delar volym och ljudavstängning.
+audio-detecting-outputs = Identifierar utgångar
+audio-state-sound = Ljud
+audio-state-muted = Tystad
+audio-state-none = Inget ljud
+audio-shared-outputs = Delade utgångar
+audio-live-mix = Aktuellt ljud
+audio-live-mix-summary = { $audible } spelar · { $available } med ljud
+audio-kind-video = Videobakgrund
+audio-kind-we = Wallpaper Engine-scen
+audio-kind-static = Statisk bakgrundsbild
+audio-kind-none = Ingen bakgrundskälla
+audio-row-sound = ◆  Ljud
+audio-row-muted = ◇  Tystad
+audio-row-none = -  Inget ljud
+audio-linked-source = Länkad källa
+audio-independent-source = Oberoende källa
+audio-channel-label = Ljud
+audio-no-channel = Den här bakgrundsbilden har ingen ljudkanal.
+audio-outputs-kicker = Ljud / skärmar
+audio-mixer-heading = Bakgrundsmixer
+audio-mixer-desc = Pausa varje skärm för sig. Volym och ljudavstängning förblir länkade för delade bakgrundsbilder.
+audio-outputs-summary =
+    { $total } { $total ->
+        [one] utgång
+       *[other] utgångar
+    } · { $available } med ljud · { $sounding } spelar
+audio-output-channels = Utgångskanaler
+audio-output-channels-desc = Tystade kanaler förblir mörka. Skärmar som visar samma källa delar volym och ljudavstängning.
+audio-looking-displays = Söker efter skärmar
+audio-looking-displays-desc = Ljudkontrollerna visas när bakgrundstjänsten rapporterar sina skärmar.
+audio-live-state = Aktuellt läge
+audio-live-none = Inget bakgrundsljud spelas just nu.
+audio-live-playing = Markerade kanaler spelar ljud.
+audio-close-mixer = Stäng mixern
+audio-source-video = Video
+audio-source-wallpaper-engine = Wallpaper Engine
+audio-source-we-id = Wallpaper Engine ({ $id })
+audio-source-static-image = Statisk bild
+audio-wallpaper-label = Bakgrundsbild
+audio-pause-wallpaper = Pausa bakgrundsbild
+audio-resume-wallpaper = Återuppta bakgrundsbild
+audio-wallpaper-paused = Manuellt pausad
+audio-wallpaper-held = Pausad av en annan regel
+audio-wallpaper-playing = Spelar
+audio-state-paused = Pausad
+audio-playback-error = Kunde inte ändra bakgrundsbildens uppspelning: { $error }

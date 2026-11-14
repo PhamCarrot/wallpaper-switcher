@@ -1,0 +1,20 @@
+# Generated files only; required fonts, image fixtures and source notices stay trackable.
+/target/
+/dist/
+/.serena/
+/candidate-profile/
+/profile/
+/config.toml
+/candidate-state.toml
+/state.toml
+/wallpaper-switcher.log
+*.pdb
+*.ilk
+*.obj
+*.dmp
+*.exe
+/.vscode/
+/.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

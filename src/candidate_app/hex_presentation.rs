@@ -8,6 +8,7 @@ use view::settings::composed::SettingsSource;
 #[derive(Debug, Clone)]
 pub(super) struct HexPresentation {
     pub ids: Arc<[String]>,
+    positions: Arc<HashMap<String, usize>>,
     pub selected: String,
     pub hover: Option<String>,
     pub camera: GalleryMotionState,
@@ -76,7 +77,7 @@ fn parameters(p: &HexProfileSnapshot, viewport: [f32; 2]) -> HexParams {
 
 impl HexPresentation {
     pub fn new(
-        ids: Vec<String>,
+        ids: impl Into<Arc<[String]>>,
         selected: String,
         p: HexProfileSnapshot,
         viewport: [f32; 2],
@@ -84,11 +85,18 @@ impl HexPresentation {
         inset: f32,
         rtl: bool,
     ) -> Self {
+        let ids = ids.into();
         let params = parameters(&p, viewport);
         let index = ids.iter().position(|id| *id == selected).unwrap_or(0);
         let center = params.column_x(index / params.rows);
         let mut state = Self {
-            ids: ids.into(),
+            positions: Arc::new(
+                ids.iter()
+                    .enumerate()
+                    .map(|(i, id)| (id.clone(), i))
+                    .collect(),
+            ),
+            ids,
             selected,
             hover: None,
             camera: GalleryMotionState::source(center, center, duration, 1.0),
@@ -112,7 +120,7 @@ impl HexPresentation {
 
     pub fn sync(
         &mut self,
-        ids: Vec<String>,
+        ids: impl Into<Arc<[String]>>,
         selected: String,
         p: HexProfileSnapshot,
         viewport: [f32; 2],
@@ -120,12 +128,13 @@ impl HexPresentation {
         inset: f32,
         rtl: bool,
     ) -> bool {
+        let ids = ids.into();
         let target = parameters(&p, viewport);
         let geometry = !self.target.settled_to(&target)
             || self.viewport != viewport
             || self.inset != inset
             || self.rtl != rtl;
-        let catalog = self.ids.as_ref() != ids.as_slice();
+        let catalog = !Arc::ptr_eq(&self.ids, &ids) && self.ids != ids;
         let changed = geometry
             || catalog
             || self.selected != selected
@@ -133,6 +142,7 @@ impl HexPresentation {
             || self.parallax != p.parallax
             || self.circle != (p.shape == StateGeometricShape::Circle);
         if !changed {
+            self.ids = ids;
             return false;
         }
         if self.selected != selected {
@@ -147,7 +157,16 @@ impl HexPresentation {
                 );
             }
         }
-        self.selection.retain(|id, _| ids.contains(id));
+        if catalog {
+            self.positions = Arc::new(
+                ids.iter()
+                    .enumerate()
+                    .map(|(i, id)| (id.clone(), i))
+                    .collect(),
+            );
+            self.selection
+                .retain(|id, _| self.positions.contains_key(id));
+        }
         if catalog || self.params.topology_differs(&target) {
             self.scales.clear();
         }
@@ -162,7 +181,7 @@ impl HexPresentation {
             }
         }
         if catalog {
-            self.ids = ids.into();
+            self.ids = ids;
         }
         self.selected = selected;
         self.target = target;
@@ -182,11 +201,7 @@ impl HexPresentation {
     }
     pub fn camera_target(&self) -> f32 {
         let p = &self.params;
-        let index = self
-            .ids
-            .iter()
-            .position(|id| *id == self.selected)
-            .unwrap_or(0);
+        let index = self.positions.get(&self.selected).copied().unwrap_or(0);
         let center = p.column_x(index / p.rows.max(1));
         let cx = self.center_x();
         let fade = ((self.viewport[0] - self.inset - p.visible_band()) * 0.5).max(0.0);
@@ -257,12 +272,13 @@ impl HexPresentation {
         let cx = self.center_x();
         let margin =
             self.viewport[0] + self.params.item_half_w().hypot(self.params.item_half_h()) * 2.0;
-        let active: Vec<_> = (0..count)
-            .filter(|col| {
-                let x = cx - self.camera.value() + self.params.column_x(*col);
-                x >= -margin && x <= self.viewport[0] + margin
-            })
-            .collect();
+        let active = donor_layout::monotone_window(
+            count,
+            |col| cx - self.camera.value() + self.params.column_x(col),
+            -margin,
+            self.viewport[0] + margin,
+        );
+        donor_layout::layout_work(2, active.len());
         self.scales.retain(|col, _| active.contains(col));
         for col in active {
             let target = self.scale_target(col);
@@ -307,11 +323,7 @@ impl HexPresentation {
             .iter()
             .map(|(col, s)| (*col, s.value().clamp(0.0, 1.0)))
             .collect();
-        let selected = self
-            .ids
-            .iter()
-            .position(|id| *id == self.selected)
-            .unwrap_or(0);
+        let selected = self.positions.get(&self.selected).copied().unwrap_or(0);
         let placed: Vec<_> = if self.circle {
             let p = &self.params;
             gpu_gallery::layout_gallery(
@@ -416,11 +428,7 @@ impl GpuCandidate {
         let Snapshot::Hex(p) = view::settings::profile_projection::capture(self) else {
             return false;
         };
-        let ids: Vec<_> = self
-            .filtered_indices
-            .iter()
-            .filter_map(|i| self.wallpapers.get(*i).map(|w| w.id.clone()))
-            .collect();
+        let ids = self.presentation_inputs().ids;
         let selected = self
             .selected
             .and_then(|i| self.wallpapers.get(i))

@@ -23,14 +23,28 @@ pub(super) fn media_applicable(item: &WallpaperItem) -> bool {
 
 impl GpuCandidate {
     pub(super) fn status_for_display(&self) -> Option<String> {
-        match (self.status.as_deref(), self.startup_status.as_deref()) {
+        let mut status = match (self.status.as_deref(), self.startup_status.as_deref()) {
             (Some(status), Some(startup)) if !status.contains(startup) => {
                 Some(format!("{status} {startup}"))
             }
             (Some(status), _) => Some(status.to_owned()),
             (None, Some(startup)) => Some(self.status_with_persistence_issue(startup)),
             (None, None) => None,
+        };
+        for message in [
+            (self.catalog_loaded && !self.catalog_fresh)
+                .then_some("Cached catalog · stale · refreshing…"),
+            self.catalog_snapshot_issue.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            status = Some(match status {
+                Some(status) => format!("{status} {message}"),
+                None => message.to_string(),
+            });
         }
+        status
     }
 
     fn set_startup_status(&mut self, message: String) {
@@ -161,6 +175,9 @@ impl GpuCandidate {
     }
 
     pub(super) fn prepare_startup_reapply(&mut self) {
+        if !self.catalog_fresh {
+            return;
+        }
         if !self.startup_checked
             && self.state.local_library.startup.reapply_enabled
             && self.launch_policy.allows_automatic_provider()
@@ -181,7 +198,7 @@ impl GpuCandidate {
             transition::TransitionConfig,
         ) -> Result<coordinator::ApplySubmission, String>,
     ) {
-        if self.startup_checked {
+        if !self.catalog_fresh || self.startup_checked {
             return;
         }
         self.startup_checked = true;
@@ -232,6 +249,9 @@ impl GpuCandidate {
     }
 
     pub(super) fn advance_startup_reapply(&mut self) {
+        if !self.catalog_fresh {
+            return;
+        }
         if !self.startup_queue.is_empty() && self.launch_policy.allows_automatic_provider() {
             self.refresh_monitors(false);
         }
@@ -249,7 +269,7 @@ impl GpuCandidate {
             transition::TransitionConfig,
         ) -> Result<coordinator::ApplySubmission, String>,
     ) {
-        if self.startup_queue.is_empty() {
+        if !self.catalog_fresh || self.startup_queue.is_empty() {
             return;
         }
         if !self.launch_policy.allows_automatic_provider()

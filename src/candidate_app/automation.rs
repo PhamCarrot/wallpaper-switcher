@@ -594,7 +594,7 @@ impl GpuCandidate {
         weekday: u8,
         minute_of_day: u16,
     ) {
-        if generation != self.automation_generation.load(Ordering::Acquire) {
+        if !self.catalog_fresh || generation != self.automation_generation.load(Ordering::Acquire) {
             return;
         }
         if !self.launch_policy.allows_automatic_provider() {
@@ -635,6 +635,10 @@ impl GpuCandidate {
             transition::TransitionConfig,
         ) -> Result<coordinator::ApplySubmission, String>,
     ) -> bool {
+        if !self.catalog_fresh {
+            trace_automation_decision(trace_context, "rejected", "catalog_not_fresh");
+            return false;
+        }
         if trace_context.generation.is_some_and(|generation| {
             generation != self.automation_generation.load(Ordering::Acquire)
         }) {

@@ -489,7 +489,7 @@ fn pk08_production_settings_compositions_and_actions() {
                     index,
                     PosterSlot {
                         layer,
-                        is_video: false,
+                        kind: crate::poster_worker::PosterKind::Still,
                         generation,
                         catalog_generation,
                         item_id: item.id.clone(),

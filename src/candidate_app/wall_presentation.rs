@@ -15,7 +15,9 @@ pub(super) struct WallPresentation {
     pub camera: GalleryMotionState,
     pub params: WallParams,
     pub target: WallParams,
-    pub aspects: Vec<f32>,
+    pub aspects: Arc<[f32]>,
+    positions: Arc<HashMap<String, usize>>,
+    layout: std::cell::RefCell<Option<Arc<gpu_gallery::WallLayoutWindow>>>,
     pub duration: f32,
     pub morph_ms: f32,
     pub entrance: GalleryMotionState,
@@ -24,13 +26,21 @@ pub(super) struct WallPresentation {
 
 impl WallPresentation {
     pub fn new(
-        ids: Vec<String>,
+        ids: impl Into<Arc<[String]>>,
         selected: String,
         params: WallParams,
-        aspects: Vec<f32>,
+        aspects: impl Into<Arc<[f32]>>,
         duration: f32,
     ) -> Self {
+        let ids = ids.into();
         Self {
+            positions: Arc::new(
+                ids.iter()
+                    .enumerate()
+                    .map(|(i, id)| (id.clone(), i))
+                    .collect(),
+            ),
+            layout: Default::default(),
             ids: ids.into(),
             selected,
             hover: None,
@@ -40,7 +50,7 @@ impl WallPresentation {
             camera: GalleryMotionState::source(0.0, 0.0, duration, 1.0),
             params,
             target: params,
-            aspects,
+            aspects: aspects.into(),
             duration,
             morph_ms: 250.0,
             entrance: GalleryMotionState::source(1.0, 1.0, 250.0, 1.0),
@@ -48,22 +58,28 @@ impl WallPresentation {
         }
     }
 
+    fn layout(&self) -> Arc<gpu_gallery::WallLayoutWindow> {
+        let mut layout = self.layout.borrow_mut();
+        if layout.as_ref().is_none_or(|p| !p.matches(self.params)) {
+            *layout = Some(Arc::new(gpu_gallery::WallLayoutWindow::new(
+                self.ids.len(),
+                self.params,
+                &self.aspects,
+            )));
+        }
+        Arc::clone(layout.as_ref().unwrap())
+    }
+
     fn bounds(&self) -> f32 {
-        let (p, placements) =
-            gpu_gallery::wall_placements(self.ids.len(), self.params, &self.aspects);
-        (placements
-            .iter()
-            .map(|c| c.y + c.height)
-            .fold(0.0, f32::max)
-            - p.total_h())
-        .max(0.0)
+        self.layout().max_scroll
     }
 
     /// Restoration is an explicit anchor; ordinary selection never recenters the camera.
     pub fn restore(&mut self, index: usize, camera: Option<f32>) {
-        let (p, placements) =
-            gpu_gallery::wall_placements(self.ids.len(), self.params, &self.aspects);
-        let anchor = placements
+        let layout = self.layout();
+        let p = &layout.donor;
+        let anchor = layout
+            .placements
             .iter()
             .find(|c| c.index == index)
             .map_or(0.0, |c| c.y + c.height * 0.5 - p.total_h() * 0.5);
@@ -76,7 +92,8 @@ impl WallPresentation {
     }
 
     pub fn follow(&mut self, index: usize) {
-        let (p, _) = gpu_gallery::wall_placements(self.ids.len(), self.params, &self.aspects);
+        let layout = self.layout();
+        let p = &layout.donor;
         let (top, height) = if matches!(self.params.layout, WallLayout::Editorial) {
             let height = p.thumb_h * 2.0 + p.gap_y;
             ((index / 5) as f32 * (height + p.gap_y), height)
@@ -172,56 +189,40 @@ impl WallPresentation {
         composition: WallParams,
     ) -> Vec<(SliceCard, f32, bool, [f32; 4], SurfacePayload)> {
         let p = self.frame_params(composition);
-        let selected = self
-            .ids
-            .iter()
-            .position(|id| *id == self.selected)
-            .unwrap_or(0);
-        gpu_gallery::layout_gallery_with_aspects(
-            GalleryMode::Wall,
-            self.ids.len(),
-            selected,
-            viewport,
-            GalleryLayoutParams {
-                wall: p,
-                ..Default::default()
-            },
-            &self.aspects,
-        )
-        .into_iter()
-        .map(|c| {
-            let id = &self.ids[c.index];
-            let hover = self
-                .fades
-                .get(id)
-                .map_or(f32::from(self.hover.as_ref() == Some(id)), |f| {
-                    f.value().clamp(0.0, 1.0)
-                });
-            let border = if c.selected && self.keyboard {
-                hover.max(0.8)
-            } else {
-                hover
-            };
-            (
-                c,
-                border,
-                self.hover.as_ref() == Some(id),
-                [c.corner_radius.min(c.size[0].min(c.size[1]) * 0.5); 4],
-                SurfacePayload::Plain,
-            )
-        })
-        .collect()
+        let selected = self.positions.get(&self.selected).copied().unwrap_or(0);
+        self.layout()
+            .cards(selected, viewport, p, &self.aspects)
+            .into_iter()
+            .map(|c| {
+                let id = &self.ids[c.index];
+                let hover = self
+                    .fades
+                    .get(id)
+                    .map_or(f32::from(self.hover.as_ref() == Some(id)), |f| {
+                        f.value().clamp(0.0, 1.0)
+                    });
+                let border = if c.selected && self.keyboard {
+                    hover.max(0.8)
+                } else {
+                    hover
+                };
+                (
+                    c,
+                    border,
+                    self.hover.as_ref() == Some(id),
+                    [c.corner_radius.min(c.size[0].min(c.size[1]) * 0.5); 4],
+                    SurfacePayload::Plain,
+                )
+            })
+            .collect()
     }
 }
 
 impl GpuCandidate {
     pub(super) fn sync_wall_presentation(&mut self) -> bool {
         let params = self.configured_wall_params();
-        let ids: Vec<_> = self
-            .filtered_indices
-            .iter()
-            .filter_map(|i| self.wallpapers.get(*i).map(|w| w.id.clone()))
-            .collect();
+        let inputs = self.presentation_inputs();
+        let ids = inputs.ids;
         let selected = self
             .selected
             .and_then(|i| self.wallpapers.get(i))
@@ -229,27 +230,40 @@ impl GpuCandidate {
                 || ids.first().cloned().unwrap_or_default(),
                 |w| w.id.clone(),
             );
-        let aspects = filtered_poster_aspects(&self.catalog, &self.filtered_indices);
+        let aspects = inputs.aspects;
         let source = view::settings::bridge::Source { app: self };
         let duration = source.number("motion.slowMs") as f32;
         let morph_ms = source.number("motion.standardMs") as f32;
         if let Some(p) = &mut self.wall_presentation {
-            let catalog = p.ids.as_ref() != ids.as_slice();
+            let catalog = !Arc::ptr_eq(&p.ids, &ids) && p.ids != ids;
+            let aspects_changed = !Arc::ptr_eq(&p.aspects, &aspects) && p.aspects != aspects;
             let changed = catalog
                 || p.selected != selected
                 || p.target != params
-                || p.aspects != aspects
+                || aspects_changed
                 || p.duration != duration;
-            p.fades.retain(|id, _| ids.contains(id));
-            if p.hover.as_ref().is_some_and(|id| !ids.contains(id)) {
-                p.hover = None;
+            if catalog {
+                p.positions = Arc::new(
+                    ids.iter()
+                        .enumerate()
+                        .map(|(i, id)| (id.clone(), i))
+                        .collect(),
+                );
+                p.fades.retain(|id, _| p.positions.contains_key(id));
+                if p.hover
+                    .as_ref()
+                    .is_some_and(|id| !p.positions.contains_key(id))
+                {
+                    p.hover = None;
+                }
+            }
+            if catalog || aspects_changed {
+                *p.layout.borrow_mut() = None;
             }
             self.gallery_engaged |= p.engaged;
             p.engaged = self.gallery_engaged;
             p.keyboard = self.gallery_keyboard;
-            if catalog {
-                p.ids = ids.into();
-            }
+            p.ids = ids;
             p.selected = selected;
             p.target = params;
             p.aspects = aspects;

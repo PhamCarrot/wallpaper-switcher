@@ -1,6 +1,6 @@
 use std::ptr::null;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, OnceLock};
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
@@ -84,11 +84,34 @@ pub fn capture_frame(target: DesktopRect) -> Result<FrozenFrame, String> {
 }
 
 type CaptureResponse = Result<FrozenFrame, String>;
-type CaptureRequest = (DesktopRect, mpsc::SyncSender<CaptureResponse>);
+type CaptureRequest = (
+    DesktopRect,
+    mpsc::SyncSender<CaptureResponse>,
+    CaptureBusyGuard,
+);
 
-static CAPTURE_WORKER: OnceLock<Result<mpsc::SyncSender<CaptureRequest>, String>> = OnceLock::new();
+static CAPTURE_WORKER: Mutex<Option<mpsc::SyncSender<CaptureRequest>>> = Mutex::new(None);
 static CAPTURE_BUSY: AtomicBool = AtomicBool::new(false);
 const CAPTURE_DEADLINE: Duration = Duration::from_secs(5);
+
+struct CaptureBusyGuard(&'static AtomicBool);
+
+impl CaptureBusyGuard {
+    fn acquire(busy: &'static AtomicBool) -> Result<Self, String> {
+        busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
+                "The Wallpaper Engine capture worker is still completing an earlier capture"
+                    .to_string()
+            })?;
+        Ok(Self(busy))
+    }
+}
+
+impl Drop for CaptureBusyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureSubmissionError {
@@ -120,24 +143,46 @@ fn submit_capture_request(
 }
 
 fn capture_frame_wgc(target: DesktopRect) -> Result<FrozenFrame, String> {
-    let deadline = Instant::now() + CAPTURE_DEADLINE;
-    let sender = CAPTURE_WORKER.get_or_init(|| {
-        let (sender, receiver) = mpsc::sync_channel::<CaptureRequest>(0);
-        std::thread::Builder::new()
-            .name("wallpaper-engine-capture".to_string())
-            .spawn(move || capture_worker(receiver))
-            .map_err(|error| format!("Could not start the capture worker: {error}"))?;
-        Ok(sender)
-    });
-    let sender = sender.as_ref().map_err(Clone::clone)?;
-    CAPTURE_BUSY
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| {
-            "The Wallpaper Engine capture worker is still completing an earlier capture".to_string()
-        })?;
+    capture_frame_with_worker(
+        target,
+        &CAPTURE_BUSY,
+        &CAPTURE_WORKER,
+        CAPTURE_DEADLINE,
+        |receiver| {
+            std::thread::Builder::new()
+                .name("wallpaper-engine-capture".to_string())
+                .spawn(move || capture_worker(receiver))
+                .map(|_| ())
+                .map_err(|error| format!("Could not start the capture worker: {error}"))
+        },
+    )
+}
+
+fn capture_frame_with_worker(
+    target: DesktopRect,
+    busy: &'static AtomicBool,
+    worker: &Mutex<Option<mpsc::SyncSender<CaptureRequest>>>,
+    timeout: Duration,
+    start_worker: impl FnOnce(mpsc::Receiver<CaptureRequest>) -> Result<(), String>,
+) -> CaptureResponse {
+    let deadline = Instant::now() + timeout;
+    let busy = CaptureBusyGuard::acquire(busy)?;
+    // Keep disconnection cleanup bound to this sender, even if the worker
+    // releases busy before this caller receives its response.
+    let mut worker = worker.lock().unwrap_or_else(|error| error.into_inner());
+    let sender = match &*worker {
+        Some(sender) => sender,
+        None => {
+            let (sender, receiver) = mpsc::sync_channel::<CaptureRequest>(0);
+            start_worker(receiver)?;
+            worker.insert(sender)
+        }
+    };
     let (response_sender, response_receiver) = mpsc::sync_channel(1);
-    if let Err(error) = submit_capture_request(sender, (target, response_sender), deadline) {
-        CAPTURE_BUSY.store(false, Ordering::Release);
+    if let Err(error) = submit_capture_request(sender, (target, response_sender, busy), deadline) {
+        if error == CaptureSubmissionError::Disconnected {
+            *worker = None;
+        }
         return Err(match error {
             CaptureSubmissionError::Deadline => {
                 "Wallpaper Engine capture worker was not ready before its 5-second deadline"
@@ -148,24 +193,206 @@ fn capture_frame_wgc(target: DesktopRect) -> Result<FrozenFrame, String> {
             }
         });
     }
-    response_receiver
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|error| match error {
+    // The submitted request owns busy now. A caller timeout must not release
+    // another capture while the worker is still using its graphics resources.
+    match response_receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(result) => result,
+        Err(error) => Err(match error {
             mpsc::RecvTimeoutError::Timeout => {
                 "Wallpaper Engine frame capture exceeded its 5-second deadline".to_string()
             }
             mpsc::RecvTimeoutError::Disconnected => {
+                *worker = None;
                 "The Wallpaper Engine capture worker did not return a frame".to_string()
             }
-        })?
+        }),
+    }
 }
 
 #[cfg(test)]
 mod capture_submission_tests {
     use super::*;
 
+    fn target() -> DesktopRect {
+        DesktopRect {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        }
+    }
+
+    fn frame() -> FrozenFrame {
+        FrozenFrame {
+            width: 1,
+            height: 1,
+            rgba: vec![1, 2, 3, 255],
+        }
+    }
+
+    #[test]
+    fn busy_guard_rejects_a_second_owner_and_releases_on_unwind() {
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        let result = std::panic::catch_unwind(|| {
+            let _busy = CaptureBusyGuard::acquire(&BUSY).unwrap();
+            assert!(CaptureBusyGuard::acquire(&BUSY).is_err());
+            assert!(BUSY.load(Ordering::Acquire));
+            panic!("controlled capture owner unwind");
+        });
+        assert!(result.is_err());
+        assert!(!BUSY.load(Ordering::Acquire));
+        drop(CaptureBusyGuard::acquire(&BUSY).unwrap());
+        assert!(!BUSY.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn submission_deadline_releases_the_unaccepted_request() {
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        let worker = Mutex::new(None);
+        let mut held_receiver = None;
+        let result = capture_frame_with_worker(target(), &BUSY, &worker, Duration::ZERO, |rx| {
+            held_receiver = Some(rx);
+            Ok(())
+        });
+        assert!(result.unwrap_err().contains("not ready"));
+        assert!(!BUSY.load(Ordering::Acquire));
+        assert!(worker.lock().unwrap().is_some());
+        drop(held_receiver);
+    }
+
+    #[test]
+    fn startup_failure_releases_busy_and_allows_retry() {
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        let worker = Mutex::new(None);
+        for _ in 0..2 {
+            let result =
+                capture_frame_with_worker(target(), &BUSY, &worker, Duration::from_secs(1), |_| {
+                    Err("controlled startup failure".into())
+                });
+            assert_eq!(result.unwrap_err(), "controlled startup failure");
+            assert!(!BUSY.load(Ordering::Acquire));
+            assert!(worker.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn capture_error_and_success_release_busy_and_reuse_the_worker() {
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        let worker = Mutex::new(None);
+        let mut thread = None;
+        let result =
+            capture_frame_with_worker(target(), &BUSY, &worker, Duration::from_secs(1), |rx| {
+                thread = Some(std::thread::spawn(move || {
+                    let request = rx.recv().unwrap();
+                    respond_to_capture(request, |_| Err("controlled capture failure".into()));
+                    let request = rx.recv().unwrap();
+                    respond_to_capture(request, |_| Ok(frame()));
+                }));
+                Ok(())
+            });
+        assert_eq!(result.unwrap_err(), "controlled capture failure");
+        assert!(!BUSY.load(Ordering::Acquire));
+        let result =
+            capture_frame_with_worker(target(), &BUSY, &worker, Duration::from_secs(1), |_| {
+                panic!("a capture error must retain the worker")
+            });
+        assert_eq!(result.unwrap(), frame());
+        thread.unwrap().join().unwrap();
+        assert!(!BUSY.load(Ordering::Acquire));
+    }
+
+    fn assert_replacement_succeeds(
+        busy: &'static AtomicBool,
+        worker: &Mutex<Option<mpsc::SyncSender<CaptureRequest>>>,
+    ) {
+        assert!(!busy.load(Ordering::Acquire));
+        assert!(worker.lock().unwrap().is_none());
+        let mut thread = None;
+        let result =
+            capture_frame_with_worker(target(), busy, worker, Duration::from_secs(1), |rx| {
+                thread = Some(std::thread::spawn(move || {
+                    respond_to_capture(rx.recv().unwrap(), |_| Ok(frame()));
+                }));
+                Ok(())
+            });
+        assert_eq!(result.unwrap(), frame());
+        thread.unwrap().join().unwrap();
+        assert!(!busy.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn disconnected_submission_clears_the_slot_and_allows_replacement() {
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        let (sender, receiver) = mpsc::sync_channel(0);
+        drop(receiver);
+        let worker = Mutex::new(Some(sender));
+        let result =
+            capture_frame_with_worker(target(), &BUSY, &worker, Duration::from_secs(1), |_| {
+                panic!("the disconnected sender is still installed until submission")
+            });
+        assert!(result.unwrap_err().contains("worker stopped"));
+        assert_replacement_succeeds(&BUSY, &worker);
+    }
+
+    #[test]
+    fn worker_panic_releases_busy_and_allows_replacement() {
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        let worker = Mutex::new(None);
+        let mut thread = None;
+        let result =
+            capture_frame_with_worker(target(), &BUSY, &worker, Duration::from_secs(1), |rx| {
+                thread = Some(std::thread::spawn(move || {
+                    respond_to_capture(rx.recv().unwrap(), |_| panic!("controlled capture panic"));
+                }));
+                Ok(())
+            });
+        assert!(result.unwrap_err().contains("did not return a frame"));
+        assert!(thread.unwrap().join().is_err());
+        assert_replacement_succeeds(&BUSY, &worker);
+    }
+
+    #[test]
+    fn caller_timeout_keeps_busy_until_the_worker_settles_then_reuses_it() {
+        static BUSY: AtomicBool = AtomicBool::new(false);
+        let worker = Mutex::new(None);
+        let (release_tx, release_rx) = mpsc::channel();
+        let (settled_tx, settled_rx) = mpsc::channel();
+        let mut thread = None;
+        let result =
+            capture_frame_with_worker(target(), &BUSY, &worker, Duration::from_millis(100), |rx| {
+                thread = Some(std::thread::spawn(move || {
+                    respond_to_capture(rx.recv().unwrap(), |_| {
+                        release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                        Ok(frame())
+                    });
+                    settled_tx.send(()).unwrap();
+                    respond_to_capture(rx.recv().unwrap(), |_| Ok(frame()));
+                }));
+                Ok(())
+            });
+        assert!(result.unwrap_err().contains("exceeded"));
+        assert!(BUSY.load(Ordering::Acquire));
+        let refused =
+            capture_frame_with_worker(target(), &BUSY, &worker, Duration::from_secs(1), |_| {
+                panic!("a timed-out active capture must not be replaced")
+            });
+        assert!(refused.unwrap_err().contains("earlier capture"));
+        assert!(BUSY.load(Ordering::Acquire));
+        release_tx.send(()).unwrap();
+        settled_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!BUSY.load(Ordering::Acquire));
+        let recovered =
+            capture_frame_with_worker(target(), &BUSY, &worker, Duration::from_secs(1), |_| {
+                panic!("the settled worker must be reused")
+            });
+        assert_eq!(recovered.unwrap(), frame());
+        thread.unwrap().join().unwrap();
+        assert!(!BUSY.load(Ordering::Acquire));
+    }
+
     #[test]
     fn submission_retries_until_the_rendezvous_worker_is_receiving() {
+        static BUSY: AtomicBool = AtomicBool::new(false);
         let (sender, receiver) = mpsc::sync_channel(0);
         let target = DesktopRect {
             left: 10,
@@ -174,7 +401,11 @@ mod capture_submission_tests {
             bottom: 40,
         };
         let (response_sender, _response_receiver) = mpsc::sync_channel(1);
-        let request = (target, response_sender);
+        let request = (
+            target,
+            response_sender,
+            CaptureBusyGuard::acquire(&BUSY).unwrap(),
+        );
         let request = match sender.try_send(request) {
             Err(mpsc::TrySendError::Full(request)) => request,
             _ => panic!("an unserviced rendezvous channel must reject"),
@@ -220,15 +451,22 @@ fn capture_worker(receiver: mpsc::Receiver<CaptureRequest>) {
     let initialized = unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
         .map(|_| WinRtApartment)
         .map_err(|error| format!("WinRT initialization failed: {error}"));
-    for (target, response) in receiver {
-        let result = match &initialized {
+    for request in receiver {
+        respond_to_capture(request, |target| match &initialized {
             Ok(_) => window_for_monitor(target)
                 .and_then(|window| capture_frame_wgc_on_worker(&window, target)),
             Err(error) => Err(error.clone()),
-        };
-        CAPTURE_BUSY.store(false, Ordering::Release);
-        let _ = response.send(result);
+        });
     }
+}
+
+fn respond_to_capture(
+    (target, response, busy): CaptureRequest,
+    capture: impl FnOnce(DesktopRect) -> CaptureResponse,
+) {
+    let result = capture(target);
+    drop(busy);
+    let _ = response.send(result);
 }
 
 fn capture_frame_wgc_on_worker(

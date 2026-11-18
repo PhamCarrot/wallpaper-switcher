@@ -3,6 +3,7 @@ use crate::donor_ui;
 #[path = "automation.rs"]
 mod automation_integration;
 mod catalog;
+mod catalog_snapshot;
 mod catalog_watch;
 mod colours;
 mod detail_motion;
@@ -15,6 +16,7 @@ mod images;
 mod lifecycle;
 mod local_library;
 mod localization;
+mod motion_mailbox;
 mod native_caption;
 mod operations;
 mod ordinary_roll;
@@ -183,7 +185,10 @@ enum Wake {
         entries: Vec<library::CatalogEntry>,
     },
     ColourReady(poster_worker::colour::Completion),
+    CatalogSnapshotSaved(Result<(), String>),
     PostersReady,
+    PosterWorkerExited(poster_worker::WorkerExit),
+    PosterGpu(gpu_gallery::PosterFeedback),
     BackdropLoaded {
         generation: u64,
         width: u32,
@@ -191,6 +196,7 @@ enum Wake {
         rgba: Vec<u8>,
     },
     CoordinatorFinished(CoordinatorResult),
+    MotionReady,
     MotionFrame {
         generation: u64,
         value: f32,
@@ -592,6 +598,7 @@ struct GpuCandidate {
     wallpapers: Vec<WallpaperItem>,
     catalog: Vec<library::CatalogEntry>,
     filtered_indices: Vec<usize>,
+    presentation_inputs: Option<gallery_presentation::PresentationInputs>,
     source_filter: SourceFilter,
     filter_rule: SmartRule,
     sort_order: SortOrder,
@@ -629,6 +636,8 @@ struct GpuCandidate {
     active_monitor_id: Option<String>,
     selected: Option<usize>,
     catalog_loaded: bool,
+    catalog_fresh: bool,
+    catalog_snapshot_issue: Option<String>,
     poster_failure: bool,
     detail_open: bool,
     status: Option<String>,
@@ -670,16 +679,19 @@ struct GpuCandidate {
     search_tags_sort_az: bool,
     poster_cache_dir: std::path::PathBuf,
     catalog_generation: Arc<AtomicU64>,
+    catalog_scan_generation: Arc<AtomicU64>,
     catalog_watch: Option<catalog_watch::CatalogWatch>,
     cache_operation: Option<u64>,
     cache_status: String,
     posters: Arc<Vec<Poster>>,
     poster_slots: HashMap<usize, PosterSlot>,
+    poster_failed_indices: HashSet<usize>,
     poster_request_key: Option<Vec<PosterRequestIdentity>>,
-    poster_assignment_key: Option<Vec<(usize, u32)>>,
+    poster_assignment_key: Option<(Vec<(usize, u32)>, usize)>,
     poster_generation: Arc<AtomicU64>,
     poster_worker: Option<poster_worker::PosterWorker>,
     poster_mailbox: Arc<poster_worker::PosterMailbox>,
+    motion_mailbox: Arc<motion_mailbox::MotionMailbox>,
     backdrop: Option<iced_image::Handle>,
     backdrop_source: Option<std::path::PathBuf>,
     backdrop_generation: Arc<AtomicU64>,
@@ -725,6 +737,7 @@ struct GpuCandidate {
     next_slideshow_unix: u64,
     automation_suspended: bool,
     gallery_mode: GalleryMode,
+    atlas_entry: Option<GalleryMode>,
     benchmark: Option<BenchmarkState>,
     scenario: Option<ScenarioState>,
     screenshot_path: Option<std::path::PathBuf>,

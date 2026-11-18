@@ -258,7 +258,7 @@ fn seed(app: &mut GpuCandidate) {
             e.card.index,
             PosterSlot {
                 layer: layer as u32,
-                is_video: false,
+                kind: crate::poster_worker::PosterKind::Still,
                 generation: 0,
                 catalog_generation: generation,
                 item_id: e.id.clone(),
@@ -282,6 +282,7 @@ fn p10_ordinary_filter_cut_owns_outgoing_images_and_rejects_stale_hidden_frames(
     ] {
         let mut app = fixture(mode, 24);
         app.filtered_indices = (0..8).collect();
+        app.presentation_inputs = None;
         app.selected = Some(3);
         app.sync_gallery_presentation();
         if let Some(p) = &mut app.gallery_presentation {
@@ -296,6 +297,7 @@ fn p10_ordinary_filter_cut_owns_outgoing_images_and_rejects_stale_hidden_frames(
         let poster = captured.old[0].pin.poster.clone();
         let original = captured.old[0].entry.captured_raw.clone().unwrap();
         app.filtered_indices = (8..16).collect();
+        app.presentation_inputs = None;
         app.selected = Some(10);
         app.sync_gallery_presentation();
         app.ordinary_roll = Some(captured);
@@ -364,6 +366,7 @@ fn p10_wall_unchanged_cells_keep_visible_hits_and_64_plus_64_union_is_pinned() {
     app.state.gallery.wall.gap_y = 10.0;
     app.state.gallery.wall.selected_scale = 1.0;
     app.filtered_indices = (0..64).collect();
+    app.presentation_inputs = None;
     app.sync_gallery_presentation();
     app.wall_presentation.as_mut().unwrap().settle();
     seed(&mut app);
@@ -377,6 +380,7 @@ fn p10_wall_unchanged_cells_keep_visible_hits_and_64_plus_64_union_is_pinned() {
         .iter()
         .all(|e| e.roll == 1.0 && donor_scene::presented_hit_card(e).is_some()));
     app.filtered_indices = (64..128).collect();
+    app.presentation_inputs = None;
     app.selected = Some(67);
     app.sync_gallery_presentation();
     app.ordinary_roll = Some(old);
@@ -389,7 +393,7 @@ fn p10_wall_unchanged_cells_keep_visible_hits_and_64_plus_64_union_is_pinned() {
             index: e.card.index,
             item_id: e.id.clone(),
             source: e.source.clone(),
-            is_video: false,
+            kind: crate::poster_worker::PosterKind::Still,
         })
         .collect();
     let sources = gallery::poster_sources_bounded(

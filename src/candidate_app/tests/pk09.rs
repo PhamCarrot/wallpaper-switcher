@@ -446,7 +446,7 @@ fn production_motion_compositions() {
                     index,
                     PosterSlot {
                         layer,
-                        is_video: false,
+                        kind: crate::poster_worker::PosterKind::Still,
                         generation,
                         catalog_generation,
                         item_id: item.id.clone(),

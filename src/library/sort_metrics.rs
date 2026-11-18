@@ -63,9 +63,17 @@ fn pixel_bucket([r, g, b]: [u8; 3]) -> Option<usize> {
     let hue = if hue < 0.0 { hue + 360.0 } else { hue };
     Some(bucket((hue.round() as u16) % 360))
 }
+#[cfg(test)]
 fn extract(img: &DynamicImage) -> SortMetrics {
+    extract_cancellable(img, &|| false).unwrap()
+}
+
+fn extract_cancellable(img: &DynamicImage, cancelled: &dyn Fn() -> bool) -> Option<SortMetrics> {
     let mut counts = [0u64; 13];
-    for px in img.to_rgba8().pixels() {
+    for (index, px) in img.to_rgba8().pixels().enumerate() {
+        if index % 1024 == 0 && cancelled() {
+            return None;
+        }
         // The reference recipe ignores alpha; W5 retains its alpha-weighted recipe.
         if let Some(bucket) = pixel_bucket([px[0], px[1], px[2]]) {
             counts[bucket] += 1;
@@ -102,14 +110,25 @@ fn extract(img: &DynamicImage) -> SortMetrics {
                 .clamp(10.0, 100.0) as u16,
         )
     };
-    SortMetrics {
+    Some(SortMetrics {
         version: VERSION,
         hue,
         saturation,
         richness,
-    }
+    })
 }
+#[cfg(test)]
 pub fn analyse(img: &DynamicImage) -> SortMetrics {
+    analyse_cancellable(img, &|| false).unwrap()
+}
+
+pub fn analyse_cancellable(
+    img: &DynamicImage,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<SortMetrics> {
+    if cancelled() {
+        return None;
+    }
     let (w, h) = (img.width(), img.height());
     let scale = (1280.0 / f64::from(w)).max(720.0 / f64::from(h));
     let base = if scale < 1.0 {
@@ -120,11 +139,15 @@ pub fn analyse(img: &DynamicImage) -> SortMetrics {
     } else {
         None
     };
-    extract(
+    if cancelled() {
+        return None;
+    }
+    extract_cancellable(
         &base
             .as_ref()
             .unwrap_or(img)
             .resize_to_fill(640, 360, FilterType::Lanczos3),
+        cancelled,
     )
 }
 pub fn compare(

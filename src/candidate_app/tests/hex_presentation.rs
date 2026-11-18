@@ -379,7 +379,7 @@ fn t1_triangle_fixture() -> (GpuCandidate, Arc<std::sync::atomic::AtomicUsize>) 
             i,
             PosterSlot {
                 layer: i as u32,
-                is_video: false,
+                kind: crate::poster_worker::PosterKind::Still,
                 generation: 0,
                 catalog_generation: app.catalog_generation.load(Ordering::Acquire),
                 item_id: w.id.clone(),

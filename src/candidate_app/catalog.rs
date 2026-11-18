@@ -1,3 +1,4 @@
+use super::gallery::poster_media_for_item;
 use super::*;
 use crate::{apply_trace, engine_ipc, library, native_wallpaper, scanner};
 
@@ -145,7 +146,49 @@ pub(super) fn folder_filter_path(path: std::path::PathBuf) -> std::path::PathBuf
 }
 
 impl GpuCandidate {
+    pub(super) fn install_cached_catalog(&mut self, snapshot: catalog_snapshot::Snapshot) {
+        (self.wallpapers, self.catalog) = snapshot.into_catalog();
+        self.project_local_tags();
+        self.catalog_loaded = true;
+        self.catalog_fresh = false;
+        self.reset_default_folder();
+        self.selected = self.active_wallpaper_index();
+        self.refresh_filter();
+        self.start_colours(false);
+        if self.visible {
+            self.schedule_posters();
+            self.refresh_backdrop();
+        }
+        apply_trace::event_lazy("catalog-snapshot-installed", || {
+            format!(
+                "items={} filtered={} fresh={} status={:?}",
+                self.wallpapers.len(),
+                self.filtered_indices.len(),
+                self.catalog_fresh,
+                self.status_for_display(),
+            )
+        });
+    }
+
+    pub(super) fn accept_fresh_catalog(&mut self, generation: u64) {
+        self.catalog_fresh = true;
+        if let Some(owner) = &self.catalog_watch {
+            owner.accept_snapshot(generation);
+        }
+        self.prepare_startup_reapply();
+        apply_trace::event_lazy("catalog-fresh-accepted", || {
+            format!(
+                "scan={generation} revision={} items={} fresh={} status={:?}",
+                self.catalog_generation.load(Ordering::Acquire),
+                self.wallpapers.len(),
+                self.catalog_fresh,
+                self.status_for_display(),
+            )
+        });
+    }
+
     pub(super) fn available_folders(&self) -> Vec<std::path::PathBuf> {
+        donor_layout::layout_work(0, self.catalog.len());
         self.catalog
             .iter()
             .map(|entry| entry.folder.clone())
@@ -164,7 +207,7 @@ impl GpuCandidate {
     }
 
     pub(super) fn refresh_catalog(&mut self) {
-        let generation = self.catalog_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let generation = self.catalog_scan_generation.fetch_add(1, Ordering::AcqRel) + 1;
         if let Some(owner) = &self.catalog_watch {
             owner.request(
                 self.config.catalog.local_folders.clone(),
@@ -177,6 +220,55 @@ impl GpuCandidate {
             self.status =
                 Some("Catalog watch owner is unavailable; refresh was not scheduled.".into());
         }
+    }
+
+    /// Retain only exact healthy resources, remapping stable IDs before replacing the catalog.
+    pub(super) fn retain_catalog_posters(&mut self, incoming: &[WallpaperItem], revision: u64) {
+        self.depth_roll = None;
+        self.ordinary_roll = None;
+        self.ordinary_transition_issue = None;
+        self.depth_frame = None;
+        self.invalidate_poster_work();
+        let mut slots = HashMap::new();
+        let mut posters = Vec::new();
+        let mut ids = HashSet::new();
+        let mut duplicates = HashSet::new();
+        for item in incoming {
+            if !ids.insert(item.id.as_str()) {
+                duplicates.insert(item.id.as_str());
+            }
+        }
+        for (index, item) in incoming.iter().enumerate() {
+            if duplicates.contains(item.id.as_str()) {
+                continue;
+            }
+            let mut matching = self.poster_slots.values().filter(|s| s.item_id == item.id);
+            let Some(slot) = matching.next() else {
+                continue;
+            };
+            let (path, kind) = poster_media_for_item(item);
+            if matching.next().is_some() || slot.source != path || slot.kind != kind {
+                continue;
+            }
+            let stamp = if kind == crate::poster_worker::PosterKind::Placeholder {
+                None
+            } else {
+                library::media_still::Fingerprint::capture(&path)
+            };
+            let Some(poster) = self.posters.iter().find(|p| {
+                p.layer == slot.layer
+                    && p.source == slot.source
+                    && p.matches_source(kind, stamp.as_ref())
+            }) else {
+                continue;
+            };
+            let mut slot = slot.clone();
+            slot.catalog_generation = revision;
+            slots.insert(index, slot);
+            posters.push(poster.clone());
+        }
+        self.poster_slots = slots;
+        self.posters = Arc::new(posters);
     }
 
     pub(super) fn resolution_active(&self) -> bool {
@@ -263,6 +355,9 @@ impl GpuCandidate {
                 .is_some_and(|wallpaper| self.source_filter.accepts(wallpaper.source))
         })
         .collect();
+        if previous_filtered != self.filtered_indices {
+            self.presentation_inputs = None;
+        }
         if self.colours.passive_requery {
             if let Some(index) = self
                 .colours

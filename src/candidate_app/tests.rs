@@ -1,4 +1,7 @@
 use super::*;
+#[path = "tests/catalog_convergence.rs"]
+mod catalog_convergence;
+mod catalog_startup;
 #[path = "tests/colours.rs"]
 mod colour_tests;
 #[path = "tests/detail_integration.rs"]
@@ -11,6 +14,8 @@ mod gallery_presentation;
 mod hex_presentation;
 #[path = "tests/keyboard_navigation.rs"]
 mod keyboard_navigation;
+#[path = "tests/layout_window.rs"]
+mod layout_window;
 #[path = "tests/local_bindings.rs"]
 mod local_bindings;
 #[path = "tests/local_library.rs"]
@@ -810,6 +815,7 @@ fn d3_application_fixture(count: usize) -> (GpuCandidate, Arc<std::sync::atomic:
         wallpapers: Default::default(),
         catalog: Default::default(),
         filtered_indices: Default::default(),
+        presentation_inputs: None,
         source_filter: SourceFilter::All,
         filter_rule: Default::default(),
         sort_order: SortOrder::Colour,
@@ -843,6 +849,8 @@ fn d3_application_fixture(count: usize) -> (GpuCandidate, Arc<std::sync::atomic:
         active_monitor_id: Default::default(),
         selected: Default::default(),
         catalog_loaded: true,
+        catalog_fresh: true,
+        catalog_snapshot_issue: None,
         poster_failure: Default::default(),
         detail_open: Default::default(),
         status: Default::default(),
@@ -888,16 +896,19 @@ fn d3_application_fixture(count: usize) -> (GpuCandidate, Arc<std::sync::atomic:
         search_tags_sort_az: Default::default(),
         poster_cache_dir: root.join("posters"),
         catalog_generation: Default::default(),
+        catalog_scan_generation: Default::default(),
         catalog_watch: None,
         cache_operation: None,
         cache_status: String::new(),
         posters: Default::default(),
         poster_slots: Default::default(),
+        poster_failed_indices: Default::default(),
         poster_request_key: Default::default(),
         poster_assignment_key: None,
         poster_generation: Default::default(),
         poster_worker: Default::default(),
         poster_mailbox: Default::default(),
+        motion_mailbox: Default::default(),
         backdrop: Default::default(),
         backdrop_source: Default::default(),
         backdrop_generation: Default::default(),
@@ -941,6 +952,7 @@ fn d3_application_fixture(count: usize) -> (GpuCandidate, Arc<std::sync::atomic:
         next_slideshow_unix: Default::default(),
         automation_suspended: false,
         gallery_mode: GalleryMode::Depth,
+        atlas_entry: None,
         benchmark: Default::default(),
         scenario: Default::default(),
         screenshot_path: Default::default(),
@@ -1716,6 +1728,7 @@ fn theme_engine_item(app: &GpuCandidate, engine: bool) -> WallpaperItem {
         .unwrap();
     }
     WallpaperItem {
+        scan_metadata: None,
         id: "theme-engine-fixture".into(),
         title: "Theme engine fixture".into(),
         folder_path: root.clone(),
@@ -2783,7 +2796,7 @@ fn d4b_seed_resident(app: &mut GpuCandidate) {
                 layer: layer as u32,
                 item_id: w.id.clone(),
                 source: source.clone(),
-                is_video: w.source == WallpaperSource::LocalVideo,
+                kind: gallery::poster_kind_for_item(w),
                 generation,
                 catalog_generation,
             },
@@ -2833,7 +2846,10 @@ fn d4b_complete(
         .publish(
             poster_worker::PosterCompletion {
                 generation,
+                cursor: 1,
+                finished: true,
                 posters,
+                failures: Vec::new(),
             },
             || true,
         )
@@ -2865,6 +2881,7 @@ fn d4b_disjoint_fixture(new_count: usize) -> GpuCandidate {
 #[test]
 fn d5_screenshot_catalog_selection_reanchors_depth_before_requested_detail() {
     let (mut app, submissions) = d4a_fixture(32);
+    app.catalog_loaded = false; // Exercise first publication, as runtime bootstrap does.
     app.visible = false;
     app.screenshot_path = Some(app.state_path.with_file_name("source-only.png"));
     app.screenshot_index = 15;
@@ -2872,7 +2889,7 @@ fn d5_screenshot_catalog_selection_reanchors_depth_before_requested_detail() {
     app.screenshot_detail_progress = 0.9;
     let wallpapers = app.wallpapers.clone();
     let entries = app.catalog.clone();
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let _ = update(
         &mut app,
         Message::Wake(Wake::CatalogLoaded {
@@ -3148,14 +3165,18 @@ fn d4b_same_cell_identity_reuse_and_media_path_catalog_rejection() {
         index: ghost.index,
         item_id: ghost.slot.item_id.clone(),
         source: ghost.slot.source.clone(),
-        is_video: ghost.slot.is_video,
+        kind: ghost.slot.kind,
     };
     assert!(ghost_matches_request(&ghost, &request, 0));
     assert!(
         depth_poster_sources(&[request.clone()], &app.poster_slots, &[ghost.clone()], 0).is_empty()
     );
     let mut bad = request.clone();
-    bad.is_video = !bad.is_video;
+    bad.kind = if bad.kind == crate::poster_worker::PosterKind::Video {
+        crate::poster_worker::PosterKind::Still
+    } else {
+        crate::poster_worker::PosterKind::Video
+    };
     assert!(!ghost_matches_request(&ghost, &bad, 0));
     bad = request.clone();
     bad.source = "changed-source.png".into();
@@ -3284,9 +3305,10 @@ fn d4b_catalog_hide_mode_empty_reopen_same_mode_and_stale_completion_consumers()
                 app.schedule_posters();
             }
             _ => {
-                let generation = app.catalog_generation.fetch_add(1, Ordering::AcqRel) + 1;
+                let generation = app.catalog_scan_generation.fetch_add(1, Ordering::AcqRel) + 1;
                 let wallpapers = app.wallpapers.clone();
-                let entries = app.catalog.clone();
+                let mut entries = app.catalog.clone();
+                entries[0].modified_unix += 1; // A content change revokes outgoing catalog bodies.
                 let _ = update(
                     &mut app,
                     Message::Wake(Wake::CatalogLoaded {
@@ -3307,13 +3329,17 @@ fn d4b_catalog_hide_mode_empty_reopen_same_mode_and_stale_completion_consumers()
             layer: 0,
             item_id: requests[0].item_id.clone(),
             path: requests[0].source.clone(),
-            is_video: requests[0].is_video,
+            kind: requests[0].kind,
+            video_stamp: None,
             still: None,
         };
         app.poster_mailbox
             .publish(
                 poster_worker::PosterCompletion {
                     generation: old_generation,
+                    cursor: 1,
+                    finished: true,
+                    failures: Vec::new(),
                     posters: vec![poster_worker::DecodedPoster {
                         poster: gpu_gallery::video_placeholder_poster(&source.path, 0),
                         source,
@@ -3464,6 +3490,9 @@ fn d4b_stalled_gui_latest_slot_stale_rejection_and_failure_retry_preserve_pins()
     let wakes = std::sync::atomic::AtomicUsize::new(0);
     let make = |generation| poster_worker::PosterCompletion {
         generation,
+        cursor: 1,
+        finished: false,
+        failures: Vec::new(),
         posters: sources
             .iter()
             .map(|source| poster_worker::DecodedPoster {
@@ -3495,6 +3524,7 @@ fn d4b_stalled_gui_latest_slot_stale_rejection_and_failure_retry_preserve_pins()
     let current = app.poster_generation.load(Ordering::Acquire);
     for invalid in 0..4 {
         let mut completion = make(current);
+        completion.cursor = 2;
         let first = &mut completion.posters[0];
         match invalid {
             0 => first.source.item_id = "reused-id".into(),
@@ -3503,7 +3533,14 @@ fn d4b_stalled_gui_latest_slot_stale_rejection_and_failure_retry_preserve_pins()
                 first.poster =
                     gpu_gallery::video_placeholder_poster(&first.source.path, first.source.layer);
             }
-            2 => first.source.is_video = !first.source.is_video,
+            2 => {
+                first.source.kind = if first.source.kind == crate::poster_worker::PosterKind::Video
+                {
+                    crate::poster_worker::PosterKind::Still
+                } else {
+                    crate::poster_worker::PosterKind::Video
+                }
+            }
             _ => {
                 first.source.layer = pins[0].slot.layer;
                 first.poster =
@@ -3524,10 +3561,19 @@ fn d4b_stalled_gui_latest_slot_stale_rejection_and_failure_retry_preserve_pins()
     assert!(app.poster_mailbox.take().unwrap().is_none());
     let generation = app.poster_generation.load(Ordering::Acquire);
     app.poster_mailbox
-        .publish(make(generation), || {
-            wakes.fetch_add(1, Ordering::AcqRel);
-            true
-        })
+        .publish(
+            poster_worker::PosterCompletion {
+                generation,
+                cursor: 2,
+                finished: true,
+                posters: Vec::new(),
+                failures: Vec::new(),
+            },
+            || {
+                wakes.fetch_add(1, Ordering::AcqRel);
+                true
+            },
+        )
         .unwrap();
     assert_eq!(
         wakes.load(Ordering::Acquire),
@@ -3873,6 +3919,57 @@ fn d6_r1_actual_fit_render_flags_and_disabled_apply_share_panel_contract() {
         }
     }
 }
+#[test]
+fn p310_motion_marker_drains_latest_and_rejects_hidden_or_stale_frames() {
+    let (mut app, submissions) = d3_application_fixture(2);
+    let make_frame = |generation, value| Wake::MotionFrame {
+        generation,
+        value,
+        velocity: 0.0,
+        state: GalleryMotionState::absolute_camera(value, value, 250.0, 50.0, 50.0),
+        selection: Default::default(),
+        presentation: None,
+        filter_wave: None,
+        ordinary: None,
+        hex: None,
+        wall: None,
+        scene: None,
+    };
+    let generation = app.motion_generation.load(Ordering::Acquire);
+    assert!(app.motion_mailbox.publish(
+        make_frame(generation, 0.25),
+        &app.motion_generation,
+        || true
+    ));
+    assert!(app.motion_mailbox.publish(
+        make_frame(generation, 0.75),
+        &app.motion_generation,
+        || panic!("duplicate marker")
+    ));
+    let _ = update(&mut app, Message::Wake(Wake::MotionReady));
+    assert_eq!(app.motion, 0.75);
+    assert!(app.motion_mailbox.take().is_none());
+    app.visible = false;
+    assert!(app.motion_mailbox.publish(
+        make_frame(generation, 0.5),
+        &app.motion_generation,
+        || true
+    ));
+    let _ = update(&mut app, Message::Wake(Wake::MotionReady));
+    assert_eq!(app.motion, 0.75);
+    app.visible = true;
+    assert!(app.motion_mailbox.publish(
+        make_frame(generation, 0.5),
+        &app.motion_generation,
+        || true
+    ));
+    app.motion_generation.fetch_add(1, Ordering::AcqRel);
+    let _ = update(&mut app, Message::Wake(Wake::MotionReady));
+    assert_eq!(app.motion, 0.75);
+    assert!(app.motion_mailbox.take().is_none());
+    assert_eq!(submissions.load(Ordering::Acquire), 0);
+}
+
 fn d4a_motion_tick(app: &mut GpuCandidate, dt: f32) -> bool {
     let mut state = app.depth_camera.unwrap();
     let mut selection = app.depth_selection.clone();
@@ -3885,9 +3982,8 @@ fn d4a_motion_tick(app: &mut GpuCandidate, dt: f32) -> bool {
         dt,
     );
     let generation = app.motion_generation.load(Ordering::Acquire);
-    let _ = update(
-        app,
-        Message::Wake(Wake::MotionFrame {
+    assert!(app.motion_mailbox.publish(
+        Wake::MotionFrame {
             generation,
             value: state.value(),
             velocity: state.velocity,
@@ -3906,8 +4002,11 @@ fn d4a_motion_tick(app: &mut GpuCandidate, dt: f32) -> bool {
                     ))
                 .min(1.6)
             }),
-        }),
-    );
+        },
+        &app.motion_generation,
+        || true,
+    ));
+    let _ = update(app, Message::Wake(Wake::MotionReady));
     moving
 }
 fn d4a_detail_tick(app: &mut GpuCandidate, dt: f32) {
@@ -4773,6 +4872,366 @@ fn d3_actual_matching_window_close_cancels_only_owned_depth_work() {
     assert!(app.detail_generation.load(Ordering::Acquire) > detail);
 }
 #[test]
+fn p22_gallery_merges_first_poster_while_later_decode_is_held() {
+    use std::sync::{mpsc, Mutex};
+    use std::time::Duration;
+
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    let (mut app, _) = d3_application_fixture(3);
+    app.gallery_mode = GalleryMode::Slices;
+    app.depth_frame = None;
+    app.poster_slots.clear();
+    app.posters = Arc::new(Vec::new());
+    let generation = app.poster_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    let sources: Vec<_> = app
+        .wallpapers
+        .iter()
+        .enumerate()
+        .map(|(index, item)| poster_worker::PosterSource {
+            index,
+            layer: index as u32,
+            item_id: item.id.clone(),
+            path: poster_source_for_item(item),
+            kind: gallery::poster_kind_for_item(item),
+            video_stamp: None,
+            still: None,
+        })
+        .collect();
+    app.poster_mailbox
+        .expect(generation, sources.clone())
+        .unwrap();
+    app.poster_loading = true;
+
+    let (wake_tx, wake_rx) = mpsc::channel();
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let mailbox = app.poster_mailbox.clone();
+    let worker = poster_worker::PosterWorker::spawn_with_builder(
+        std::thread::Builder::new(),
+        app.poster_generation.clone(),
+        move |completion| {
+            let finished = completion.finished;
+            let published = mailbox.publish(completion, || wake_tx.send(()).is_ok());
+            if finished {
+                finished_tx.send(()).unwrap();
+            }
+            published.is_ok()
+        },
+        move |source, _| {
+            if source.index == 1 {
+                held_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv_timeout(TIMEOUT).unwrap();
+            }
+            Some(gpu_gallery::video_placeholder_poster(
+                &source.path,
+                source.layer,
+            ))
+        },
+    )
+    .unwrap();
+    worker
+        .submit(poster_worker::PosterBatch::new(
+            generation,
+            sources,
+            app.poster_cache_dir.clone(),
+        ))
+        .unwrap();
+
+    held_rx.recv_timeout(TIMEOUT).unwrap();
+    wake_rx.recv_timeout(TIMEOUT).unwrap();
+    let _ = update(&mut app, Message::Wake(Wake::PostersReady));
+    assert!(app.poster_loading);
+    assert_eq!(app.poster_slots.len(), 1);
+    assert_eq!(app.poster_slots[&0].generation, generation);
+    assert_eq!(app.posters.len(), 1);
+    let first = app.posters[0].clone();
+    assert!(finished_rx.try_recv().is_err());
+
+    release_tx.send(()).unwrap();
+    finished_rx.recv_timeout(TIMEOUT).unwrap();
+    wake_rx.recv_timeout(TIMEOUT).unwrap();
+    assert!(
+        wake_rx.try_recv().is_err(),
+        "one wake carries both deltas and EOF"
+    );
+    let _ = update(&mut app, Message::Wake(Wake::PostersReady));
+    assert!(!app.poster_loading);
+    assert!(!app.poster_failure);
+    assert_eq!(app.poster_slots.len(), 3);
+    assert_eq!(app.posters.len(), 3);
+    assert!(app
+        .posters
+        .iter()
+        .any(|poster| poster.same_resource(&first)));
+}
+
+#[test]
+fn p34_retryable_poster_submissions_keep_worker_and_retry_on_motion_tick() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    for error in [
+        poster_worker::SubmitError::CacheBusy,
+        poster_worker::SubmitError::Closed,
+    ] {
+        let (mut app, submissions) = d3_application_fixture(2);
+        for item in &mut app.wallpapers {
+            item.source = WallpaperSource::LocalVideo;
+        }
+        let mailbox = app.poster_mailbox.clone();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = poster_worker::PosterWorker::spawn_with_builder(
+            std::thread::Builder::new(),
+            app.poster_generation.clone(),
+            move |completion| {
+                let finished = completion.finished;
+                let published = mailbox.publish(completion, || true).is_ok();
+                if finished {
+                    finished_tx.send(()).unwrap();
+                }
+                published
+            },
+            |source, _| {
+                Some(gpu_gallery::video_placeholder_poster(
+                    &source.path,
+                    source.layer,
+                ))
+            },
+        )
+        .unwrap();
+        let worker_id = worker.id();
+        worker.reject_next_submission(error);
+        app.poster_worker = Some(worker);
+        app.poster_loading = true;
+        app.schedule_posters();
+        assert_eq!(app.poster_worker.as_ref().unwrap().id(), worker_id);
+        assert!(!app.poster_loading);
+        assert!(!app.poster_failure);
+        assert!(app.poster_request_key.is_none());
+        assert!(app.poster_mailbox.take().unwrap().is_none());
+        let rejected_generation = app.poster_generation.load(Ordering::Acquire);
+
+        d4a_motion_tick(&mut app, 1.0 / 60.0);
+        assert!(app.poster_loading);
+        assert!(app.poster_request_key.is_some());
+        assert!(app.poster_generation.load(Ordering::Acquire) > rejected_generation);
+        assert_eq!(app.poster_worker.as_ref().unwrap().id(), worker_id);
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let _ = update(&mut app, Message::Wake(Wake::PostersReady));
+        assert!(!app.poster_loading);
+        assert!(!app.poster_failure);
+        assert_eq!(app.poster_slots.len(), 2);
+        assert_eq!(submissions.load(Ordering::Acquire), 0);
+    }
+}
+
+#[test]
+fn p34_retryable_colour_submissions_preserve_cursor_and_retry_on_motion_tick() {
+    // Restore the global wake route so this fixture cannot affect other tests.
+    struct RestoreWake(Option<UnboundedSender<Wake>>);
+    impl Drop for RestoreWake {
+        fn drop(&mut self) {
+            *WAKE_TX.get().unwrap().lock().unwrap() = self.0.take();
+        }
+    }
+    let (tx, mut rx) = unbounded();
+    let _restore = RestoreWake(
+        WAKE_TX
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap()
+            .replace(tx),
+    );
+    let (mut app, submissions) = d3_application_fixture(3);
+    for index in [0, 2] {
+        let path = app
+            .state_path
+            .parent()
+            .unwrap()
+            .join(format!("p34-{index}.png"));
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([230, 20, 10, 255]))
+            .save(&path)
+            .unwrap();
+        app.wallpapers[index].source = WallpaperSource::LocalImage;
+        app.wallpapers[index].file_target = path.clone();
+        app.wallpapers[index].preview_path = Some(path);
+    }
+    let worker =
+        poster_worker::PosterWorker::spawn(app.poster_generation.clone(), |_| true).unwrap();
+    let worker_id = worker.id();
+    app.poster_worker = Some(worker);
+    app.colours.active = true;
+    for error in [
+        poster_worker::SubmitError::CacheBusy,
+        poster_worker::SubmitError::Closed,
+    ] {
+        app.poster_worker
+            .as_ref()
+            .unwrap()
+            .reject_next_submission(error);
+        app.schedule_colour();
+        assert_eq!(app.poster_worker.as_ref().unwrap().id(), worker_id);
+        assert!(app.colours.active);
+        assert_eq!(app.colours.cursor, 0);
+        assert_eq!(app.colours.pending, 0);
+        assert_eq!(app.colours.settled, 0);
+        assert_eq!(app.colours.unavailable, 0);
+        assert!(app.colours.entries.is_empty());
+    }
+    d4a_motion_tick(&mut app, 1.0 / 60.0);
+    assert_eq!(app.poster_worker.as_ref().unwrap().id(), worker_id);
+    assert_eq!(app.colours.cursor, 3);
+    assert_eq!(app.colours.pending, 2);
+    assert_eq!(app.colours.settled, 1);
+    assert_eq!(app.colours.unavailable, 1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.colours.active && std::time::Instant::now() < deadline {
+        if let Ok(wake) = rx.try_recv() {
+            let _ = update(&mut app, Message::Wake(wake));
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    assert!(!app.colours.active);
+    assert_eq!(app.colours.pending, 0);
+    assert_eq!(app.colours.settled, 3);
+    assert_eq!(app.colours.unavailable, 1);
+    assert_eq!(app.colours.metadata.len(), 2);
+    assert_eq!(submissions.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn p33_worker_exit_settles_loading_and_stale_exit_preserves_replacement() {
+    use std::sync::mpsc;
+
+    let (mut app, _) = d3_application_fixture(1);
+    app.wallpapers[0].source = WallpaperSource::LocalVideo;
+    let source = poster_worker::PosterSource {
+        index: 0,
+        layer: 0,
+        item_id: app.wallpapers[0].id.clone(),
+        path: poster_source_for_item(&app.wallpapers[0]),
+        kind: crate::poster_worker::PosterKind::Video,
+        video_stamp: None,
+        still: None,
+    };
+    let (exit_tx, exit_rx) = mpsc::channel();
+    let profile = app.state_path.parent().unwrap().to_owned();
+    let cache_dir = app.poster_cache_dir.clone();
+    let first = poster_worker::PosterWorker::spawn_with_cache(
+        app.poster_generation.clone(),
+        |_| panic!("controlled panic in the poster worker coordinator"),
+        move |exit| exit_tx.send(exit).unwrap(),
+        profile.clone(),
+        None,
+        Some(1),
+        true,
+    )
+    .unwrap();
+    let first_id = first.id();
+    app.poster_worker = Some(first);
+    app.schedule_posters();
+    let generation = app.poster_generation.load(Ordering::Acquire);
+    assert!(app.poster_loading);
+    let request_key = app.poster_request_key.clone();
+    let assignment_key = app.poster_assignment_key.clone();
+    assert!(request_key.is_some());
+    assert!(assignment_key.is_some());
+
+    let timeout = std::time::Duration::from_secs(5);
+    let exit = exit_rx.recv_timeout(timeout).unwrap();
+    assert_eq!(exit.worker_id, first_id);
+    assert_eq!(exit.failure, poster_worker::WorkerFailure::WorkerExited);
+    assert_eq!(
+        exit_rx.recv_timeout(timeout),
+        Err(mpsc::RecvTimeoutError::Disconnected),
+    );
+    app.cache_operation = Some(1);
+    let _ = update(&mut app, Message::Wake(Wake::PosterWorkerExited(exit)));
+    assert!(!app.poster_loading);
+    assert!(app.poster_worker.is_none());
+    assert!(app.poster_failure);
+    assert_eq!(app.cache_operation, None);
+    assert_eq!(
+        app.cache_status,
+        "Poster worker stopped before the cache operation was acknowledged.",
+    );
+    assert_eq!(
+        app.status_for_display().as_deref(),
+        Some("Poster preview worker stopped: poster worker exited unexpectedly"),
+    );
+    let replacement_generation = app.poster_generation.load(Ordering::Acquire);
+    assert!(replacement_generation > generation);
+    for _ in 0..3 {
+        app.schedule_posters();
+        assert!(app.poster_worker.is_none());
+        assert!(!app.poster_loading);
+        assert_eq!(
+            app.poster_generation.load(Ordering::Acquire),
+            replacement_generation
+        );
+        assert_eq!(app.poster_request_key, request_key);
+        assert_eq!(app.poster_assignment_key, assignment_key);
+    }
+
+    let mailbox = app.poster_mailbox.clone();
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let (exit_tx, expected_shutdown) = mpsc::channel();
+    let replacement = poster_worker::PosterWorker::spawn_with_cache(
+        app.poster_generation.clone(),
+        move |completion| {
+            let finished = completion.finished;
+            let published = mailbox.publish(completion, || true).is_ok();
+            if finished {
+                finished_tx.send(()).unwrap();
+            }
+            published
+        },
+        move |exit| exit_tx.send(exit).unwrap(),
+        profile,
+        None,
+        Some(1),
+        true,
+    )
+    .unwrap();
+    let replacement_id = replacement.id();
+    assert_ne!(replacement_id, first_id);
+    app.poster_mailbox
+        .expect(replacement_generation, vec![source.clone()])
+        .unwrap();
+    app.poster_loading = true;
+    replacement
+        .submit(poster_worker::PosterBatch::new(
+            replacement_generation,
+            vec![source],
+            cache_dir,
+        ))
+        .unwrap();
+    app.poster_worker = Some(replacement);
+    finished_rx.recv_timeout(timeout).unwrap();
+    let _ = update(&mut app, Message::Wake(Wake::PosterWorkerExited(exit)));
+    assert_eq!(app.poster_worker.as_ref().unwrap().id(), replacement_id);
+    assert_eq!(
+        app.poster_generation.load(Ordering::Acquire),
+        replacement_generation,
+    );
+    assert!(app.poster_loading);
+    let _ = update(&mut app, Message::Wake(Wake::PostersReady));
+    assert!(!app.poster_loading);
+    assert!(!app.poster_failure);
+    assert_eq!(app.poster_slots[&0].generation, replacement_generation);
+    assert!(app.status_for_display().is_none());
+
+    app.poster_worker = None;
+    assert_eq!(
+        expected_shutdown.recv_timeout(timeout),
+        Err(mpsc::RecvTimeoutError::Disconnected),
+    );
+}
+
+#[test]
 fn d3_actual_filter_empty_mode_and_legacy_poster_consumer_reject_stale_identity() {
     for mode in [
         GalleryMode::Slices,
@@ -4788,11 +5247,15 @@ fn d3_actual_filter_empty_mode_and_legacy_poster_consumer_reject_stale_identity(
             layer: 0,
             item_id: wallpaper.id.clone(),
             path: poster_source_for_item(wallpaper),
-            is_video: false,
+            kind: crate::poster_worker::PosterKind::Still,
+            video_stamp: None,
             still: None,
         };
         let completion = |generation: u64| poster_worker::PosterCompletion {
             generation,
+            cursor: 1,
+            finished: true,
+            failures: Vec::new(),
             posters: vec![poster_worker::DecodedPoster {
                 source: source.clone(),
                 poster: gpu_gallery::video_placeholder_poster(&source.path, 0),
@@ -4809,6 +5272,10 @@ fn d3_actual_filter_empty_mode_and_legacy_poster_consumer_reject_stale_identity(
         assert_eq!(app.posters.len(), 1);
         assert_eq!(app.poster_slots.get(&1).unwrap().item_id, source.item_id);
         // Catalog changes between retention and consumption still fail closed.
+        let generation = app.poster_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        app.poster_mailbox
+            .expect(generation, vec![source.clone()])
+            .unwrap();
         app.poster_mailbox
             .publish(completion(generation), || true)
             .unwrap();
@@ -4817,6 +5284,10 @@ fn d3_actual_filter_empty_mode_and_legacy_poster_consumer_reject_stale_identity(
         assert!(app.posters.is_empty());
         assert!(app.poster_slots.is_empty());
         app.wallpapers.swap(0, 1);
+        let generation = app.poster_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        app.poster_mailbox
+            .expect(generation, vec![source.clone()])
+            .unwrap();
         app.poster_mailbox
             .publish(completion(generation), || true)
             .unwrap();
@@ -4870,6 +5341,8 @@ fn d3_actual_widget_publication_and_consumer_keep_ids_and_button_semantics() {
         .card
         .center;
     let program = GalleryProgram {
+        prewarm: None,
+        poster_feedback: None,
         snapshot: Arc::new(GallerySnapshot {
             ordinary: None,
             cards: frame.cards.iter().map(|c| c.card).collect(),
@@ -5926,6 +6399,7 @@ fn external_detail_suspends_overlapping_chrome_and_close_restores_it() {
 
 fn test_wallpaper(id: &str) -> WallpaperItem {
     WallpaperItem {
+        scan_metadata: None,
         id: id.into(),
         title: id.into(),
         folder_path: std::path::PathBuf::from("C:/wallpapers"),
@@ -7550,13 +8024,13 @@ fn poster_requests_coalesce_equivalent_sets_and_reject_source_changes() {
             index: 9,
             item_id: "nine".into(),
             source: std::path::PathBuf::from("nine.png"),
-            is_video: false,
+            kind: crate::poster_worker::PosterKind::Still,
         },
         PosterRequestIdentity {
             index: 4,
             item_id: "four".into(),
             source: std::path::PathBuf::from("four.png"),
-            is_video: false,
+            kind: crate::poster_worker::PosterKind::Still,
         },
     ];
     let reordered = vec![previous[1].clone(), previous[0].clone()];
@@ -7599,6 +8073,7 @@ fn gallery_mode_changes_invalidate_even_when_poster_identity_sets_match() {
 #[test]
 fn poster_slots_require_stable_item_and_source_identity() {
     let item = |id: &str, path: &str| WallpaperItem {
+        scan_metadata: None,
         id: id.into(),
         title: id.into(),
         folder_path: std::path::PathBuf::new(),
@@ -7613,7 +8088,7 @@ fn poster_slots_require_stable_item_and_source_identity() {
     let changed_path = item("same", "replacement.png");
     let slot = PosterSlot {
         layer: 3,
-        is_video: false,
+        kind: crate::poster_worker::PosterKind::Still,
         generation: 0,
         catalog_generation: 0,
         item_id: original.id.clone(),
@@ -7628,6 +8103,7 @@ fn poster_slots_require_stable_item_and_source_identity() {
 #[test]
 fn decoded_poster_publication_requires_the_worker_identity_contract() {
     let item = WallpaperItem {
+        scan_metadata: None,
         id: "same".into(),
         title: "same".into(),
         folder_path: std::path::PathBuf::new(),
@@ -7642,7 +8118,8 @@ fn decoded_poster_publication_requires_the_worker_identity_contract() {
             index: 0,
             layer: 3,
             item_id: "same".into(),
-            is_video: false,
+            kind: crate::poster_worker::PosterKind::Still,
+            video_stamp: None,
             still: None,
             path: "original.png".into(),
         },
@@ -7672,6 +8149,7 @@ fn empty_filtered_wall_and_missing_preview_requests_are_safe() {
     .is_empty());
 
     let missing = WallpaperItem {
+        scan_metadata: None,
         id: "missing".into(),
         title: "missing".into(),
         folder_path: std::path::PathBuf::new(),
@@ -7685,8 +8163,199 @@ fn empty_filtered_wall_and_missing_preview_requests_are_safe() {
 }
 
 #[test]
+fn p62_p63_engine_preview_discovery_changes_poster_identity_without_broadening_stills() {
+    use crate::poster_worker::PosterKind;
+
+    let (profile, _) = poster_worker::cache::tests::fixture();
+    let project = profile.join("steamapps/workshop/content/431960/123");
+    std::fs::create_dir_all(&project).unwrap();
+    let scene = project.join("payload.mp4");
+    let preview = project.join("preview.mp4");
+    std::fs::write(&scene, b"scene payload with a video extension").unwrap();
+    let project_json = project.join("project.json");
+    std::fs::write(
+        &project_json,
+        r#"{"title":"Owned scene","type":"scene","file":"payload.mp4"}"#,
+    )
+    .unwrap();
+    let scan = || {
+        scanner::scan_wallpapers_from_libraries_until(
+            std::slice::from_ref(&profile),
+            false,
+            &|| false,
+        )
+        .remove(0)
+    };
+    let missing = scan();
+    assert!(missing.preview_path.is_none());
+    assert_eq!(
+        gallery::poster_media_for_item(&missing),
+        (scene.clone(), PosterKind::Placeholder)
+    );
+    let old = poster_worker::PosterSource {
+        index: 0,
+        layer: 0,
+        item_id: missing.id.clone(),
+        kind: PosterKind::Placeholder,
+        path: scene.clone(),
+        still: None,
+        video_stamp: None,
+    };
+    assert!(gallery::poster_source_matches(&old, &missing));
+
+    std::fs::write(&preview, b"owned MP4 scan fixture").unwrap();
+    let discovered = scan();
+    assert_eq!(missing.id, discovered.id);
+    assert_eq!(discovered.preview_path.as_ref(), Some(&preview));
+    assert_eq!(
+        gallery::poster_media_for_item(&discovered),
+        (preview.clone(), PosterKind::Video)
+    );
+    assert!(!gallery::poster_source_matches(&old, &discovered));
+    assert!(library::media_still::MediaStill::select(&discovered, 2).is_none());
+
+    let image = project.join("preview.png");
+    std::fs::write(&image, b"corrupt image remains a still decode failure").unwrap();
+    assert_eq!(
+        gallery::poster_media_for_item(&scan()),
+        (image, PosterKind::Still)
+    );
+    std::fs::write(
+        &project_json,
+        r#"{"title":"Owned scene","type":"scene","file":"payload.mp4","preview":"preview.mp4"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        gallery::poster_media_for_item(&scan()),
+        (preview, PosterKind::Video)
+    );
+}
+
+#[test]
+#[ignore = "requires a Media Foundation H.264 decoder and WALLPAPER_SWITCHER_P6_FIXTURE"]
+fn p62_p63_native_engine_previews_settle_and_remap_through_gallery_worker() {
+    use crate::poster_worker::PosterKind;
+    use std::{sync::mpsc, time::Duration};
+
+    let clip = std::env::var_os("WALLPAPER_SWITCHER_P6_FIXTURE").unwrap();
+    let (profile, _) = poster_worker::cache::tests::fixture();
+    let projects = profile.join("steamapps/workshop/content/431960");
+    for (id, title, preview) in [
+        ("101", "Explicit frame", Some("clip.mp4")),
+        ("102", "Corrupt preview", Some("preview.mp4")),
+        ("103", "Missing preview", None),
+    ] {
+        let folder = projects.join(id);
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut project = serde_json::json!({"title":title, "type":"scene", "file":"payload.mp4"});
+        if let Some(name) = preview {
+            project["preview"] = name.into();
+        }
+        std::fs::write(folder.join("project.json"), project.to_string()).unwrap();
+        // Even a decodable scene payload must not be routed as preview media.
+        std::fs::copy(&clip, folder.join("payload.mp4")).unwrap();
+    }
+    std::fs::copy(&clip, projects.join("101/clip.mp4")).unwrap();
+    std::fs::write(projects.join("102/preview.mp4"), b"owned corrupt MP4").unwrap();
+
+    let (mut app, submissions) = d3_application_fixture(0);
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let mailbox = app.poster_mailbox.clone();
+    app.poster_worker = Some(
+        poster_worker::PosterWorker::spawn(app.poster_generation.clone(), move |completion| {
+            let finished = completion.finished;
+            mailbox.publish(completion, || true).is_ok()
+                && (!finished || finished_tx.send(()).is_ok())
+        })
+        .unwrap(),
+    );
+
+    let scan = || {
+        scanner::scan_wallpapers_from_libraries_until(
+            std::slice::from_ref(&profile),
+            false,
+            &|| false,
+        )
+    };
+    let install = |app: &mut GpuCandidate, items: Vec<WallpaperItem>, revision| {
+        assert_eq!(items.len(), 3);
+        app.retain_catalog_posters(&items, revision);
+        app.catalog_generation.store(revision, Ordering::Release);
+        app.catalog = items
+            .iter()
+            .map(library::CatalogEntry::from_wallpaper)
+            .collect();
+        app.filtered_indices = (0..items.len()).collect();
+        app.wallpapers = items;
+        app.selected = Some(0);
+        app.rebuild_depth_frame();
+    };
+    let settle = |app: &mut GpuCandidate| {
+        app.schedule_posters();
+        assert!(app.poster_loading);
+        finished_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+        let _ = update(app, Message::Wake(Wake::PostersReady));
+        assert!(!app.poster_loading);
+        assert!(app.poster_failed_indices.is_empty());
+        assert_eq!(app.posters.len(), 3);
+    };
+    let poster = |app: &GpuCandidate, title: &str| {
+        let index = app
+            .wallpapers
+            .iter()
+            .position(|item| item.title == title)
+            .unwrap();
+        let slot = &app.poster_slots[&index];
+        let poster = app
+            .posters
+            .iter()
+            .find(|poster| poster.layer == slot.layer)
+            .unwrap();
+        assert!(poster.has_pixels());
+        (slot.kind, poster.aspect_ratio, poster.source.clone())
+    };
+
+    app.gallery_mode = GalleryMode::Wall;
+    install(&mut app, scan(), 1);
+    settle(&mut app);
+    let (kind, aspect, path) = poster(&app, "Explicit frame");
+    assert_eq!(
+        (kind, aspect, path),
+        (PosterKind::Video, 1.5, projects.join("101/clip.mp4"))
+    );
+    assert_eq!(poster(&app, "Corrupt preview").0, PosterKind::Video);
+    assert_eq!(poster(&app, "Corrupt preview").1, 16.0 / 9.0);
+    let (kind, aspect, path) = poster(&app, "Missing preview");
+    assert_eq!(
+        (kind, aspect, path),
+        (
+            PosterKind::Placeholder,
+            16.0 / 9.0,
+            projects.join("103/payload.mp4"),
+        )
+    );
+
+    let added = projects.join("103/preview.mp4");
+    std::fs::copy(clip, &added).unwrap();
+    app.gallery_mode = GalleryMode::Depth;
+    install(&mut app, scan(), 2);
+    assert_eq!(
+        app.posters.len(),
+        1,
+        "only the exact successful frame survives remap"
+    );
+    settle(&mut app);
+    assert_eq!(
+        poster(&app, "Missing preview"),
+        (PosterKind::Video, 1.5, added)
+    );
+    assert_eq!(submissions.load(Ordering::Acquire), 0);
+}
+
+#[test]
 fn catalog_refresh_preserves_selection_by_stable_identity() {
     let item = |id: &str| WallpaperItem {
+        scan_metadata: None,
         id: id.into(),
         title: id.into(),
         folder_path: std::path::PathBuf::new(),
@@ -7715,6 +8384,7 @@ fn active_wallpaper_selection_uses_the_first_catalog_match() {
     std::fs::write(&first_path, b"first").unwrap();
     std::fs::write(&active_path, b"active").unwrap();
     let item = |id: &str, path: &std::path::Path| WallpaperItem {
+        scan_metadata: None,
         id: id.into(),
         title: id.into(),
         folder_path: path.parent().unwrap().to_path_buf(),
@@ -7900,6 +8570,7 @@ fn snapshot_test_catalog_entry(id: &str) -> library::CatalogEntry {
 fn snapshot_test_wallpaper(id: &str, file_target: &str, source: WallpaperSource) -> WallpaperItem {
     let file_target = std::path::PathBuf::from(file_target);
     WallpaperItem {
+        scan_metadata: None,
         id: id.to_owned(),
         title: "Snapshot fixture".into(),
         folder_path: file_target

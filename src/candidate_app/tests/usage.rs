@@ -699,9 +699,10 @@ fn w6_rotation_current_display_order_owns_exclusions_and_new_target_identity() {
 #[test]
 fn w6_catalog_loaded_and_later_status_refresh_retain_startup_refusal() {
     let mut app = fixture(1);
+    app.catalog_loaded = false; // Startup policy belongs to the first fresh publication.
     app.launch_policy = p1_preview_policy();
     app.state.local_library.startup.reapply_enabled = true;
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let wallpapers = app.wallpapers.clone();
     let entries = app.catalog.clone();
     let _ = update(

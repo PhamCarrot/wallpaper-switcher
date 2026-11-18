@@ -16,7 +16,7 @@ use crate::scanner::WallpaperItem;
 /// One card placement produced by the pinned donor Grid row calculation.
 ///
 /// The donor's `GridLayout::Uniform`, `Brick` and `Cylinder` modes share this
-/// row/column placement before their stage and cylinder transforms. 
+/// row/column placement before their stage and cylinder transforms.
 /// consumes the placement in its existing poster renderer, so atlas, texture
 /// and SceneCore ownership stay outside this boundary.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -467,6 +467,7 @@ mod tests {
 
     fn item(id: &str) -> WallpaperItem {
         WallpaperItem {
+            scan_metadata: None,
             id: id.into(),
             title: id.into(),
             folder_path: PathBuf::from("C:/wallpapers"),

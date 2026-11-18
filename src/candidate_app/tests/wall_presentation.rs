@@ -127,6 +127,7 @@ fn p9_wall_six_layouts_share_current_draw_hit_and_stable_demand_with_aspects_and
         app.filtered_indices.rotate_left(7);
         app.catalog[7].width = 400;
         app.catalog[7].height = 1000;
+        app.presentation_inputs = None;
         app.state.gallery.wall.layout = layout;
         app.state.gallery.wall.round_corners = Some(false);
         app.sync_wall_presentation();

@@ -1,11 +1,17 @@
-//! The only disposable files owned here are the current writer's fixed-size RGBA entries.
+//! Guarded cache owners, explicit clearing, and idle disk maintenance.
+#[path = "cache_maintenance.rs"]
+mod maintenance;
+pub(super) use maintenance::Maintenance;
+
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     os::windows::{
         fs::{MetadataExt, OpenOptionsExt},
         io::AsRawHandle,
     },
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 use windows_sys::Win32::{Foundation::*, Storage::FileSystem::*};
 
@@ -53,8 +59,21 @@ fn pin_directory(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 fn owned_name(name: &str) -> bool {
-    name.strip_prefix("poster-")
-        .and_then(|n| n.strip_suffix(".rgba"))
+    poster_entry_size(name).is_some()
+}
+fn poster_entry_size(name: &str) -> Option<u64> {
+    let pixels = crate::gpu_gallery::POSTER_BYTES as u64;
+    if owned_key(name, "poster-", ".rgba") {
+        Some(pixels)
+    } else if owned_key(name, "video-poster-", ".rgba") {
+        Some(pixels + 4)
+    } else {
+        None
+    }
+}
+fn owned_key(name: &str, prefix: &str, suffix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|n| n.strip_suffix(suffix))
         .is_some_and(|n| {
             n.len() == 16
                 && n.bytes()
@@ -72,6 +91,9 @@ impl RootGuard {
     }
     pub fn open_colour(profile: &Path, root: &Path, create: bool) -> Result<Option<Self>, String> {
         Self::open_owner(profile, root, create, "colour-v1")
+    }
+    fn open_native(profile: &Path, root: &Path) -> Result<Option<Self>, String> {
+        Self::open_owner(profile, root, false, "native-images")
     }
     fn open_owner(
         profile: &Path,
@@ -96,7 +118,11 @@ impl RootGuard {
             match std::fs::symlink_metadata(&path) {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
-                    std::fs::create_dir(&path).map_err(|e| e.to_string())?;
+                    if let Err(error) = std::fs::create_dir(&path) {
+                        if error.kind() != std::io::ErrorKind::AlreadyExists {
+                            return Err(error.to_string());
+                        }
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(e.to_string()),
@@ -111,37 +137,160 @@ impl RootGuard {
         }))
     }
 }
+pub(crate) struct PosterCache {
+    root: PathBuf,
+    _guard: RootGuard,
+}
+
+impl PosterCache {
+    pub(crate) fn open(profile: &Path, root: &Path, create: bool) -> Option<Self> {
+        let guard = RootGuard::open(profile, root, create).ok()??;
+        Some(Self {
+            root: root.to_path_buf(),
+            _guard: guard,
+        })
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn read_into(&self, path: &Path, bytes: &mut [u8]) -> Option<()> {
+        self.read_parts(path, &mut [], bytes)
+    }
+
+    pub(crate) fn read_video_into(&self, path: &Path, bytes: &mut [u8]) -> Option<f32> {
+        let mut header = [0; 4];
+        self.read_parts(path, &mut header, bytes)?;
+        video_aspect(header)
+    }
+
+    // A speculative hit must leave the LRU position alone.
+    pub(crate) fn contains(&self, path: &Path, size: u64) -> bool {
+        self.open_entry(path, size, 0).is_some()
+    }
+
+    fn read_parts(&self, path: &Path, header: &mut [u8], bytes: &mut [u8]) -> Option<()> {
+        use std::io::Read;
+        if bytes.len() != crate::gpu_gallery::POSTER_BYTES {
+            return None;
+        }
+        let expected = (header.len() + bytes.len()) as u64;
+        let mut file = self
+            .open_entry(path, expected, FILE_GENERIC_READ | FILE_WRITE_ATTRIBUTES)
+            .or_else(|| self.open_entry(path, expected, FILE_GENERIC_READ))?;
+        file.read_exact(header).ok()?;
+        file.read_exact(bytes).ok()?;
+        if file.read(&mut [0]).ok()? != 0 {
+            return None;
+        }
+        touch(&file);
+        Some(())
+    }
+
+    fn open_entry(&self, path: &Path, size: u64, access: u32) -> Option<File> {
+        if path.parent()? != self.root || poster_entry_size(path.file_name()?.to_str()?)? != size {
+            return None;
+        }
+        let file = OpenOptions::new()
+            .access_mode(access)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .ok()?;
+        let meta = file.metadata().ok()?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if !meta.is_file()
+            || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || meta.len() != size
+            || unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0
+            || info.nNumberOfLinks != 1
+        {
+            return None;
+        }
+        Some(file)
+    }
+}
+
+fn video_aspect(header: [u8; 4]) -> Option<f32> {
+    let aspect = f32::from_le_bytes(header);
+    (1.0 / 8192.0..=8192.0).contains(&aspect).then_some(aspect)
+}
+
+fn touch(file: &File) {
+    // Windows can disable or defer updates from reads. Record completed cache hits explicitly.
+    let _ = file.set_times(std::fs::FileTimes::new().set_accessed(std::time::SystemTime::now()));
+}
+
+pub(crate) use maintenance::touch_native;
+
 pub fn read_poster(path: &Path) -> Option<Vec<u8>> {
-    use std::io::Read;
     let root = path.parent()?;
     let profile = root.parent()?.parent()?;
-    let _guard = RootGuard::open(profile, root, false).ok()??;
-    if !owned_name(path.file_name()?.to_str()?) {
-        return None;
+    let owner = PosterCache::open(profile, root, false)?;
+    let mut bytes = vec![0; crate::gpu_gallery::POSTER_BYTES];
+    owner.read_into(path, &mut bytes)?;
+    Some(bytes)
+}
+
+pub(crate) struct WriteBatch {
+    root: PathBuf,
+    owner: OnceLock<Option<PosterCache>>,
+}
+
+impl WriteBatch {
+    pub(crate) fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            owner: OnceLock::new(),
+        }
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-        .ok()?;
-    let meta = file.metadata().ok()?;
-    let expected =
-        (crate::gpu_gallery::POSTER_WIDTH * crate::gpu_gallery::POSTER_HEIGHT * 4) as usize;
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    if !meta.is_file()
-        || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || meta.len() != expected as u64
-        || unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0
-        || info.nNumberOfLinks != 1
-    {
-        return None;
+
+    #[cfg(test)]
+    pub(super) fn root(&self) -> &Path {
+        &self.root
     }
-    let mut bytes = Vec::with_capacity(expected);
-    file.take(expected as u64 + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() == expected).then_some(bytes)
+
+    pub(crate) fn owner(&self) -> Option<&PosterCache> {
+        self.owner
+            .get_or_init(|| {
+                PosterCache::open(&crate::config::Config::config_dir(), &self.root, true)
+            })
+            .as_ref()
+    }
+
+    pub(super) fn open_attempts(&self) -> usize {
+        usize::from(self.owner.get().is_some())
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ReadBatch {
+    // Restore uses each resource's captured path, including outgoing transition pins.
+    owners: HashMap<PathBuf, Option<PosterCache>>,
+}
+
+impl ReadBatch {
+    pub(crate) fn read_into(&mut self, path: &Path, bytes: &mut [u8]) -> Option<()> {
+        self.owner(path)?.read_into(path, bytes)
+    }
+
+    pub(crate) fn read_video_into(&mut self, path: &Path, bytes: &mut [u8]) -> Option<f32> {
+        self.owner(path)?.read_video_into(path, bytes)
+    }
+
+    fn owner(&mut self, path: &Path) -> Option<&PosterCache> {
+        let root = path.parent()?;
+        let profile = root.parent()?.parent()?;
+        self.owners
+            .entry(root.to_path_buf())
+            .or_insert_with(|| PosterCache::open(profile, root, false))
+            .as_ref()
+    }
+
+    pub(crate) fn open_attempts(&self) -> usize {
+        self.owners.len()
+    }
 }
 
 pub fn read_colour_file(path: &Path) -> Option<Vec<u8>> {
@@ -245,9 +394,6 @@ fn clear_owner(
                 failed += 1;
                 continue;
             };
-            let expected = (crate::gpu_gallery::POSTER_WIDTH as u64)
-                * (crate::gpu_gallery::POSTER_HEIGHT as u64)
-                * 4;
             let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
             let handle = file.as_raw_handle() as HANDLE;
             let identified = unsafe { GetFileInformationByHandle(handle, &mut info) } != 0;
@@ -257,7 +403,7 @@ fn clear_owner(
             }
             if !meta.is_file()
                 || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-                || (!colour && meta.len() != expected)
+                || (!colour && Some(meta.len()) != poster_entry_size(&name))
                 || (colour && meta.len() > super::colour::CACHE_LIMIT)
                 || info.nNumberOfLinks != 1
             {
@@ -280,19 +426,10 @@ fn clear_owner(
                     continue;
                 }
             }
-            let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
-            if unsafe {
-                SetFileInformationByHandle(
-                    handle,
-                    FileDispositionInfo,
-                    (&disposition as *const FILE_DISPOSITION_INFO).cast(),
-                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
-                )
-            } == 0
-            {
-                failed += 1;
-            } else {
+            if delete_file(handle) {
                 deleted += 1;
+            } else {
+                failed += 1;
             }
         }
         Ok((deleted, retained, failed))
@@ -306,6 +443,18 @@ fn clear_owner(
         Err(e) => report.error = Some(e),
     }
     report
+}
+
+fn delete_file(handle: HANDLE) -> bool {
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        ) != 0
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +483,43 @@ pub(crate) mod tests {
         .unwrap();
         path
     }
+
+    #[test]
+    fn restore_batch_pins_each_captured_root_and_retries_missing_roots_next_batch() {
+        let (profile, root) = fixture();
+        let (_, other_root) = fixture();
+        let first = poster(&root, "poster-0123456789abcdef.rgba");
+        let second = poster(&root, "poster-1111111111111111.rgba");
+        let other = poster(&other_root, "poster-0123456789abcdef.rgba");
+        let hard_link = root.join("poster-2222222222222222.rgba");
+        std::fs::hard_link(&second, &hard_link).unwrap();
+        let renamed = profile.join("cache/renamed");
+        let mut pixels = vec![0; crate::gpu_gallery::POSTER_BYTES];
+
+        let mut batch = ReadBatch::default();
+        assert!(batch.read_into(&first, &mut pixels).is_some());
+        assert!(pixels.iter().all(|&byte| byte == 91));
+        assert!(std::fs::rename(&root, &renamed).is_err());
+        assert!(batch.read_into(&hard_link, &mut pixels).is_none());
+        std::fs::remove_file(hard_link).unwrap();
+        assert!(batch.read_into(&second, &mut pixels).is_some());
+        assert_eq!(batch.open_attempts(), 1);
+        assert!(batch.read_into(&other, &mut pixels).is_some());
+        assert_eq!(batch.open_attempts(), 2);
+        drop(batch);
+        std::fs::rename(&root, &renamed).unwrap();
+
+        let mut missing = ReadBatch::default();
+        assert!(missing.read_into(&first, &mut pixels).is_none());
+        assert!(!root.exists());
+        std::fs::rename(&renamed, &root).unwrap();
+        assert!(missing.read_into(&second, &mut pixels).is_none());
+        assert_eq!(missing.open_attempts(), 1);
+        assert!(ReadBatch::default()
+            .read_into(&first, &mut pixels)
+            .is_some());
+    }
+
     #[test]
     fn w4_precise_cache_counts_partial_failure_and_source_recovery_export_survival() {
         let (profile, root) = fixture();

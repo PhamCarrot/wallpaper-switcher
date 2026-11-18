@@ -1,12 +1,28 @@
 //! Ordinary-mode current presentation. Catalog, clock, worker and atlas stay app-owned.
-use super::gallery::{
-    poster_slot_matches_source, poster_source_for_item, prioritized_poster_indices,
-};
+use super::gallery::{poster_media_for_item, poster_slot_matches_source};
 use super::*;
 use candidate_state::mode_profiles::{SlicesProfileSnapshot, Snapshot};
 use donor_scene::{CardPresentation, CardReadiness, LaunchAnimation, SurfacePayload};
 use gpu_gallery::SliceCard;
 use view::settings::composed::SettingsSource;
+
+/// Rebuilt by the existing catalog/filter owners, never by a motion tick.
+#[derive(Debug, Clone)]
+pub(super) struct PresentationInputs {
+    revision: u64,
+    pub ids: Arc<[String]>,
+    pub aspects: Arc<[f32]>,
+    positions: Arc<HashMap<usize, usize>>,
+}
+
+fn id_positions(ids: &[String]) -> Arc<HashMap<String, usize>> {
+    Arc::new(
+        ids.iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect(),
+    )
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SceneMotion {
@@ -95,6 +111,8 @@ impl SceneMotion {
 #[derive(Debug, Clone)]
 pub(super) struct GalleryPresentation {
     pub ids: Arc<[String]>,
+    positions: Arc<HashMap<String, usize>>,
+    layout: std::cell::RefCell<Option<Arc<SliceLayoutWindow>>>,
     pub selected: String,
     pub hover: Option<String>,
     pub camera: GalleryMotionState,
@@ -109,24 +127,34 @@ pub(super) struct GalleryPresentation {
     pub launch: LaunchAnimation,
 }
 
+#[derive(Debug)]
+struct SliceLayoutWindow {
+    narrow: f32,
+    spacing: f32,
+    starts: Vec<f32>,
+}
+
 fn layout_width(width: f32, skew: f32) -> f32 {
     (width - skew.abs()).max(1.0)
 }
 
 impl GalleryPresentation {
     pub fn new(
-        ids: Vec<String>,
+        ids: impl Into<Arc<[String]>>,
         selected: String,
         mut p: SlicesProfileSnapshot,
         viewport: [f32; 2],
         duration: f32,
     ) -> Self {
+        let ids = ids.into();
         // beta.24 clamps the effective getter, preserving configured legacy values.
         p.wobble_strength = p.wobble_strength.clamp(0.0, 2.0);
         let position = ids.iter().position(|id| *id == selected).unwrap_or(0);
         let center = position as f32 * (layout_width(p.width, p.skew_distance) + p.spacing)
             + layout_width(p.expanded_width, p.skew_distance) * 0.5;
         Self {
+            layout: Default::default(),
+            positions: id_positions(&ids),
             ids: ids.into(),
             selected,
             hover: None,
@@ -150,27 +178,31 @@ impl GalleryPresentation {
 
     pub fn sync(
         &mut self,
-        ids: Vec<String>,
+        ids: impl Into<Arc<[String]>>,
         selected: String,
         mut p: SlicesProfileSnapshot,
         viewport: [f32; 2],
         duration: f32,
     ) -> bool {
+        let ids = ids.into();
         p.wobble_strength = p.wobble_strength.clamp(0.0, 2.0);
+        let anchor = !Arc::ptr_eq(&self.ids, &ids) && self.ids != ids;
         let geometry = self.target != p || self.viewport != viewport;
-        let changed = geometry
-            || self.ids.as_ref() != ids.as_slice()
-            || self.selected != selected
-            || self.duration != duration;
+        let changed = geometry || anchor || self.selected != selected || self.duration != duration;
         if !changed {
+            self.ids = ids;
             return false;
         }
-        let anchor = self.ids.as_ref() != ids.as_slice();
-        self.widths.retain(|id, _| ids.contains(id));
-        self.selection.retain(|id, _| ids.contains(id));
+        if anchor {
+            self.positions = id_positions(&ids);
+            *self.layout.borrow_mut() = None;
+            self.widths.retain(|id, _| self.positions.contains_key(id));
+            self.selection
+                .retain(|id, _| self.positions.contains_key(id));
+        }
         if self.selected != selected {
             for (id, was_selected) in [(self.selected.clone(), true), (selected.clone(), false)] {
-                if !ids.contains(&id) {
+                if !self.positions.contains_key(&id) {
                     continue;
                 }
                 self.widths.entry(id.clone()).or_insert_with(|| {
@@ -212,7 +244,7 @@ impl GalleryPresentation {
             }
         }
         if anchor {
-            self.ids = ids.into();
+            self.ids = ids;
         }
         self.selected = selected;
         self.target = p;
@@ -235,11 +267,7 @@ impl GalleryPresentation {
         for (id, spring) in &mut self.selection {
             spring.retarget_source(f32::from(*id == self.selected));
         }
-        let position = self
-            .ids
-            .iter()
-            .position(|id| *id == self.selected)
-            .unwrap_or(0);
+        let position = self.positions.get(&self.selected).copied().unwrap_or(0);
         let target = position as f32 * (layout_width(p.width, p.skew_distance) + p.spacing)
             + layout_width(p.expanded_width, p.skew_distance) * 0.5;
         self.camera.set_zeta(if p.wobble { 0.45 } else { 1.0 });
@@ -306,9 +334,69 @@ impl GalleryPresentation {
         let cx = center + self.viewport[0] * p.offset_x * 0.5;
         // Source TOP_BAR=50, 60px chrome and 15px inset place the body 10px below center.
         let cy = self.viewport[1] * (0.5 + p.offset_y * 0.5) + 10.0;
-        let mut acc = 0.0;
+        let current = self.positions.get(&self.selected).copied().unwrap_or(0);
+        // All but the sparse selection springs share one stride. Keep dynamic
+        // widths separate from the immutable ID index and visit only the window.
+        let narrow = layout_width(p.width.max(1.0), p.skew_distance);
+        let mut layout = self.layout.borrow_mut();
+        if layout.as_ref().is_none_or(|c| {
+            c.narrow != narrow || c.spacing != p.spacing || c.starts.len() != self.ids.len()
+        }) {
+            // Preserve the source's accumulated f32 strip positions once, rather
+            // than introducing an index*stride drift on large fractional layouts.
+            let mut acc = 0.0;
+            let starts = (0..self.ids.len())
+                .map(|_| {
+                    let x = acc;
+                    acc += narrow + p.spacing;
+                    x
+                })
+                .collect();
+            donor_layout::layout_work(1, self.ids.len());
+            *layout = Some(Arc::new(SliceLayoutWindow {
+                narrow,
+                spacing: p.spacing,
+                starts,
+            }));
+        }
+        let layout = layout.as_ref().unwrap();
+        let mut changes: Vec<_> = self
+            .widths
+            .iter()
+            .filter_map(|(id, spring)| {
+                self.positions.get(id).map(|&i| {
+                    (
+                        i,
+                        layout_width(spring.value().max(1.0), p.skew_distance) - narrow,
+                    )
+                })
+            })
+            .collect();
+        if !self.widths.contains_key(&self.selected) && self.positions.contains_key(&self.selected)
+        {
+            changes.push((
+                current,
+                layout_width(p.expanded_width.max(1.0), p.skew_distance) - narrow,
+            ));
+        }
+        changes.sort_by_key(|c| c.0);
+        let padding = changes.iter().map(|c| c.1.abs()).sum::<f32>() + narrow + 1.0;
+        let window = donor_layout::monotone_window(
+            self.ids.len(),
+            |i| layout.starts[i],
+            self.camera.value() - half * 1.2 - padding,
+            self.camera.value() + half * 1.2 + padding,
+        );
+        let mut acc = layout.starts.get(window.start).copied().unwrap_or(0.0)
+            + changes
+                .iter()
+                .filter(|c| c.0 < window.start)
+                .map(|c| c.1)
+                .sum::<f32>();
+        donor_layout::layout_work(2, window.len());
         let mut cards = Vec::new();
-        for (index, id) in self.ids.iter().enumerate() {
+        for index in window {
+            let id = &self.ids[index];
             let selected = *id == self.selected;
             let width = self
                 .widths
@@ -377,11 +465,6 @@ impl GalleryPresentation {
                 payload,
             ));
         }
-        let current = self
-            .ids
-            .iter()
-            .position(|id| *id == self.selected)
-            .unwrap_or(0);
         cards.sort_by_key(|(card, _, hover, _, _)| {
             if card.selected {
                 i64::MAX
@@ -452,6 +535,34 @@ pub(super) fn launch_entrance(
 }
 
 impl GpuCandidate {
+    pub(super) fn presentation_inputs(&mut self) -> PresentationInputs {
+        let revision = self.catalog_generation.load(Ordering::Acquire);
+        if self
+            .presentation_inputs
+            .as_ref()
+            .is_none_or(|p| p.revision != revision)
+        {
+            donor_layout::layout_work(0, self.filtered_indices.len());
+            self.presentation_inputs = Some(PresentationInputs {
+                revision,
+                ids: self
+                    .filtered_indices
+                    .iter()
+                    .filter_map(|i| self.wallpapers.get(*i).map(|w| w.id.clone()))
+                    .collect(),
+                aspects: filtered_poster_aspects(&self.catalog, &self.filtered_indices).into(),
+                positions: Arc::new(
+                    self.filtered_indices
+                        .iter()
+                        .enumerate()
+                        .map(|(p, &i)| (i, p))
+                        .collect(),
+                ),
+            });
+        }
+        self.presentation_inputs.as_ref().unwrap().clone()
+    }
+
     pub(super) fn sync_gallery_presentation(&mut self) -> bool {
         if self.gallery_mode == GalleryMode::Wall {
             return self.sync_wall_presentation();
@@ -465,11 +576,7 @@ impl GpuCandidate {
         let Snapshot::Slices(p) = view::settings::profile_projection::capture(self) else {
             return false;
         };
-        let ids: Vec<_> = self
-            .filtered_indices
-            .iter()
-            .filter_map(|i| self.wallpapers.get(*i).map(|w| w.id.clone()))
-            .collect();
+        let ids = self.presentation_inputs().ids;
         let selected = self
             .selected
             .and_then(|i| self.wallpapers.get(i))
@@ -601,14 +708,16 @@ impl GpuCandidate {
 
     /// One current frame supplies the snapshot and the poster requester.
     pub(super) fn ordinary_base_frame(&self) -> Vec<CardPresentation> {
-        self.ordinary_base_frame_with_source_selector(poster_source_for_item)
+        self.ordinary_base_frame_with_source_selector(poster_media_for_item)
     }
 
     pub(super) fn ordinary_base_frame_with_source_selector(
         &self,
-        mut select_source: impl FnMut(&WallpaperItem) -> std::path::PathBuf,
+        mut select_source: impl FnMut(&WallpaperItem) -> (std::path::PathBuf, poster_worker::PosterKind),
     ) -> Vec<CardPresentation> {
         let slices = self.gallery_mode == GalleryMode::Slices;
+        let wall_params = (self.gallery_mode == GalleryMode::Wall)
+            .then(|| gallery_layout_params_for_app(self).wall);
         let fallback = if slices && self.gallery_presentation.is_none() {
             let Snapshot::Slices(p) = view::settings::profile_projection::capture(self) else {
                 unreachable!()
@@ -645,7 +754,7 @@ impl GpuCandidate {
             self.wall_presentation
                 .as_ref()
                 .unwrap()
-                .cards(self.viewport, gallery_layout_params_for_app(self).wall)
+                .cards(self.viewport, wall_params.unwrap())
         } else {
             gpu_gallery::layout_gallery_with_aspects(
                 self.gallery_mode,
@@ -687,11 +796,11 @@ impl GpuCandidate {
                     radii = radii.map(|v| v * k);
                 }
             }
-            let source = select_source(wallpaper);
+            let (source, kind) = select_source(wallpaper);
             let poster = self
                 .poster_slots
                 .get(&index)
-                .filter(|s| poster_slot_matches_source(s, wallpaper, &source))
+                .filter(|s| poster_slot_matches_source(s, wallpaper, &source, kind))
                 .and_then(|s| {
                     self.posters
                         .iter()
@@ -755,7 +864,8 @@ impl GpuCandidate {
             });
             let readiness = if card.layer.is_some() {
                 CardReadiness::Ready
-            } else if queued && self.poster_loading {
+            } else if queued && self.poster_loading && !self.poster_failed_indices.contains(&index)
+            {
                 CardReadiness::Loading
             } else {
                 CardReadiness::Unavailable
@@ -778,10 +888,7 @@ impl GpuCandidate {
                 source_style: slices,
                 hex_style: self.gallery_mode == GalleryMode::Geometric
                     && self.hex_presentation.is_some(),
-                wall_border: (self.gallery_mode == GalleryMode::Wall).then_some((
-                    selection,
-                    gallery_layout_params_for_app(self).wall.border_width,
-                )),
+                wall_border: wall_params.map(|p| (selection, p.border_width)),
                 shadows: (slices && slice_state.is_some_and(|p| p.slices.shadows))
                     || (self.gallery_mode == GalleryMode::Geometric && selection > 0.01),
                 loading_eligible: self.gallery_mode == GalleryMode::Wall
@@ -813,7 +920,12 @@ impl GpuCandidate {
         result
     }
 
+    #[cfg(test)]
     pub(super) fn ordinary_poster_indices(&self) -> Vec<usize> {
+        self.ordinary_poster_demand().0
+    }
+
+    pub(super) fn ordinary_poster_demand(&self) -> (Vec<usize>, usize) {
         let mut indices = Vec::new();
         let limit = gpu_gallery::ordinary_poster_limit();
         if let Some(card) = self.external_detail_card() {
@@ -827,7 +939,22 @@ impl GpuCandidate {
                 indices.push(entry.card.index);
             }
         }
-        for index in prioritized_poster_indices(&self.filtered_indices, self.selected.unwrap_or(0))
+        let visible = indices.len();
+        let selected_position = self.presentation_inputs.as_ref().map_or_else(
+            || {
+                self.filtered_indices
+                    .iter()
+                    .position(|i| Some(*i) == self.selected)
+                    .unwrap_or(0)
+            },
+            |p| {
+                self.selected
+                    .and_then(|i| p.positions.get(&i).copied())
+                    .unwrap_or(0)
+            },
+        );
+        for index in
+            gallery::prioritized_poster_indices_at(&self.filtered_indices, selected_position)
         {
             let union: HashSet<_> = indices
                 .iter()
@@ -839,7 +966,7 @@ impl GpuCandidate {
             }
             gallery::push_unique_poster_index(&mut indices, index);
         }
-        indices
+        (indices, visible)
     }
 
     pub(super) fn ordinary_capacity_issue(&self) -> Option<String> {

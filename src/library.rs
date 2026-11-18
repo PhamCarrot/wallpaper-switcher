@@ -96,7 +96,10 @@ pub struct CatalogEntry {
 
 impl CatalogEntry {
     pub fn from_wallpaper(item: &WallpaperItem) -> Self {
-        let source_tags = read_project_tags(&item.project_json_path);
+        let source_tags = item.scan_metadata.as_ref().map_or_else(
+            || read_project_tags(&item.project_json_path),
+            |metadata| metadata.tags.clone(),
+        );
         let dimensions = item
             .preview_path
             .as_deref()
@@ -161,6 +164,18 @@ impl SortOrder {
     }
 }
 fn source_modified_unix(item: &WallpaperItem) -> u64 {
+    if let Some(metadata) = &item.scan_metadata {
+        let stamp = if item.source == crate::scanner::WallpaperSource::WallpaperEngine {
+            &metadata.project
+        } else {
+            &metadata.target
+        };
+        return stamp
+            .as_ref()
+            .and_then(|s| s.modified)
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs());
+    }
     let path = if item.source == crate::scanner::WallpaperSource::WallpaperEngine {
         &item.project_json_path
     } else {
@@ -195,9 +210,11 @@ fn project_tags(bytes: &[u8]) -> BTreeSet<String> {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
         return BTreeSet::new();
     };
-    value
-        .get("tags")
-        .and_then(|tags| tags.as_array())
+    normalized_project_tags(value.get("tags"))
+}
+
+pub(crate) fn normalized_project_tags(tags: Option<&serde_json::Value>) -> BTreeSet<String> {
+    tags.and_then(|tags| tags.as_array())
         .into_iter()
         .flatten()
         .filter_map(|tag| tag.as_str())

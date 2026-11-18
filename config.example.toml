@@ -3,6 +3,10 @@
 # Location: %USERPROFILE%\.config\wallpaper-switcher\config.toml
 # =============================================================================
 
+# Optional catalog I/O cap, 1–8. Automatic: 4–8 lanes, or 2 on one logical core.
+# Includes project metadata and image headers; changing this takes effect at restart.
+# catalog_scan_threads = 2
+
 [theme]
 # Color palette preset. Default: "rose-pine-moon"
 preset = "rose-pine-moon"

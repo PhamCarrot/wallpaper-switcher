@@ -1,4 +1,4 @@
-//! One small request in the existing worker; the captured still is the only input.
+//! Bounded colour extraction and guarded, disposable cache publication.
 use crate::library::{
     color_metadata::{self, ColorMetadata},
     media_still::MediaStill,
@@ -16,6 +16,7 @@ use std::{
 pub const MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_PIXELS: u64 = 32 * 1024 * 1024;
 pub const CACHE_LIMIT: u64 = 8192;
+pub const BATCH_LIMIT: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -88,19 +89,61 @@ pub fn valid_bytes(name: &str, bytes: &[u8]) -> Option<Entry> {
     let e: Entry = serde_json::from_slice(bytes).ok()?;
     (e.valid() && e.name() == name).then_some(e)
 }
-fn cached(profile: &Path, name: &str) -> Option<Entry> {
-    let root = profile.join("cache/colour-v1");
-    let _guard = super::cache::RootGuard::open_colour(profile, &root, false).ok()??;
+fn read_entry(root: &Path, name: &str) -> Option<Entry> {
     let bytes = super::cache::read_colour_file(&root.join(name))?;
     valid_bytes(name, &bytes)
 }
+struct CacheBatch<'a> {
+    profile: &'a Path,
+    root: PathBuf,
+    guard: Option<super::cache::RootGuard>,
+    error: Option<String>,
+    opens: usize,
+}
+
+impl<'a> CacheBatch<'a> {
+    fn new(profile: &'a Path) -> Self {
+        Self {
+            profile,
+            root: profile.join("cache/colour-v1"),
+            guard: None,
+            error: None,
+            opens: 0,
+        }
+    }
+
+    fn open(&mut self, create: bool) -> Result<Option<&Path>, String> {
+        if self.guard.is_none() && self.error.is_none() && (create || self.opens == 0) {
+            self.opens += 1;
+            match super::cache::RootGuard::open_colour(self.profile, &self.root, create) {
+                Ok(guard) => self.guard = guard,
+                Err(error) => self.error = Some(error),
+            }
+        }
+        match &self.error {
+            Some(error) => Err(error.clone()),
+            None => Ok(self.guard.as_ref().map(|_| self.root.as_path())),
+        }
+    }
+
+    fn read(&mut self, name: &str) -> Option<Entry> {
+        read_entry(self.open(false).ok()??, name)
+    }
+}
+
+#[cfg(test)]
 fn persist(profile: &Path, entry: &Entry, cancelled: &dyn Fn() -> bool) -> Result<(), String> {
-    let root = profile.join("cache/colour-v1");
-    let _guard = super::cache::RootGuard::open_colour(profile, &root, true)?
-        .ok_or("Colour cache owner absent")?;
+    let mut cache = CacheBatch::new(profile);
+    persist_entry(cache.open(true)?.unwrap(), entry, cancelled)
+}
+
+fn persist_entry(root: &Path, entry: &Entry, cancelled: &dyn Fn() -> bool) -> Result<(), String> {
+    if cancelled() {
+        return Err("Cancelled before colour staging".into());
+    }
     let name = entry.name();
     let destination = root.join(&name);
-    if let Some(old) = cached(profile, &name) {
+    if let Some(old) = read_entry(root, &name) {
         if old.still.item_id == entry.still.item_id && old.metadata == entry.metadata {
             return Ok(());
         }
@@ -118,12 +161,11 @@ fn persist(profile: &Path, entry: &Entry, cancelled: &dyn Fn() -> bool) -> Resul
         .create_new(true)
         .open(&temporary)
         .map_err(|e| e.to_string())?;
-    f.write_all(&bytes)
-        .and_then(|_| f.sync_all())
-        .map_err(|e| e.to_string())?;
+    f.write_all(&bytes).map_err(|e| e.to_string())?;
     drop(f);
     if cancelled() {
-        return Err("Cancelled before colour publication; staged evidence retained".into());
+        let _ = crate::file_publication::remove_if_present(&temporary);
+        return Err("Cancelled before colour publication".into());
     }
     crate::file_publication::publish_staged_file_create_only(&temporary, &destination)
         .map_err(|e| e.to_string())
@@ -136,7 +178,7 @@ struct Analysis {
 
 fn analyse(
     still: &MediaStill,
-    profile: &Path,
+    cache: &mut CacheBatch<'_>,
     refresh: bool,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Analysis, String> {
@@ -177,7 +219,7 @@ fn analyse(
                 richness: 0.0,
             },
         };
-        if let Some(e) = cached(profile, &key.name()) {
+        if let Some(e) = cache.read(&key.name()) {
             if e.still.item_id == still.item_id
                 && e.still.path == still.path
                 && e.still.provenance == still.provenance
@@ -227,69 +269,122 @@ fn analyse(
         )
         .to_rgba8();
     Ok(Analysis {
-        colour: color_metadata::analyse_sample(&sample, fingerprint),
-        sorting: crate::library::sort_metrics::analyse(&decoded),
+        colour: color_metadata::analyse_sample_cancellable(&sample, fingerprint, cancelled),
+        sorting: crate::library::sort_metrics::analyse_cancellable(&decoded, cancelled)
+            .ok_or("Colour analysis cancelled")?,
     })
 }
 
+#[cfg(test)]
 pub(super) fn execute(
     job: Job,
     epoch: u64,
     current_epoch: &AtomicU64,
     shutdown: &dyn Fn() -> bool,
 ) {
-    let clock = job.clock.clone();
-    let generation = job.generation;
-    #[cfg(test)]
-    let mut job = job;
-    let catalog_clock = job.catalog_clock.clone();
-    let catalog_revision = job.still.catalog_revision;
+    execute_batch(
+        vec![job],
+        &|| shutdown() || epoch != current_epoch.load(Ordering::Acquire),
+        |cancelled| !cancelled(),
+        || None,
+    );
+}
+
+pub(super) fn execute_batch(
+    mut jobs: Vec<Job>,
+    invalidated: &dyn Fn() -> bool,
+    wait_for_idle: impl Fn(&dyn Fn() -> bool) -> bool,
+    worker_failure: impl Fn() -> Option<super::WorkerFailure>,
+) {
+    let first = &jobs[0];
+    let profile = first.profile.clone();
+    let clock = first.clock.clone();
+    let catalog_clock = first.catalog_clock.clone();
+    let generation = first.generation;
+    let catalog_revision = first.still.catalog_revision;
+    let epoch = first.epoch;
     let cancelled = || {
-        shutdown()
+        invalidated()
             || generation != clock.load(Ordering::Acquire)
             || catalog_revision != catalog_clock.load(Ordering::Acquire)
-            || epoch != current_epoch.load(Ordering::Acquire)
     };
-    let analysis = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        analyse(&job.still, &job.profile, job.refresh, &cancelled)
-    }))
-    .unwrap_or_else(|_| Err("Colour decoder failed unexpectedly".into()));
-    let (mut result, mut sorting) = match analysis {
-        Ok(a) => (a.colour, Some(a.sorting)),
-        Err(e) => (Err(e), None),
-    };
-    #[cfg(test)]
-    if let Some(held) = job.held.take() {
-        held();
-    }
-    if cancelled() {
-        return;
-    }
-    if !job.still.is_current() {
-        result = Err("Still changed or disappeared; refresh to retry".into());
-        sorting = None;
-    }
-    let persistence = result.as_ref().map_err(Clone::clone).and_then(|metadata| {
-        persist(
-            &job.profile,
-            &Entry {
-                still: job.still.clone(),
-                metadata: metadata.clone(),
-                sorting,
-            },
-            &cancelled,
+    let mut cache = CacheBatch::new(&profile);
+    let mut results = Vec::with_capacity(jobs.len());
+    crate::apply_trace::event_lazy("colour-batch-start", || {
+        format!(
+            "generation={generation}; epoch={epoch}; candidates={}",
+            jobs.len()
         )
     });
-    if !cancelled() {
-        (job.publish)(Completion {
-            generation,
-            epoch,
-            still: job.still,
-            result,
-            sorting,
-            persistence,
-            worker_failure: None,
-        });
+    for job in &mut jobs {
+        if !wait_for_idle(&cancelled) {
+            break;
+        }
+        let analysis = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            analyse(&job.still, &mut cache, job.refresh, &cancelled)
+        }))
+        .unwrap_or_else(|_| Err("Colour decoder failed unexpectedly".into()));
+        #[cfg(test)]
+        if let Some(held) = job.held.take() {
+            held();
+        }
+        results.push(analysis);
+    }
+    let mut completions = Vec::with_capacity(jobs.len());
+    if results.len() == jobs.len() {
+        // No decoded pixels are retained here. Pin the owner across the whole
+        // write pass and publish each entry atomically under its existing key.
+        for (job, analysis) in jobs.iter().zip(results) {
+            if !wait_for_idle(&cancelled) {
+                break;
+            }
+            let (result, sorting) = if !job.still.is_current() {
+                (
+                    Err("Still changed or disappeared; refresh to retry".into()),
+                    None,
+                )
+            } else {
+                match analysis {
+                    Ok(a) => (a.colour, Some(a.sorting)),
+                    Err(error) => (Err(error), None),
+                }
+            };
+            let persistence = result.as_ref().map_err(Clone::clone).and_then(|metadata| {
+                persist_entry(
+                    cache.open(true)?.ok_or("Colour cache owner absent")?,
+                    &Entry {
+                        still: job.still.clone(),
+                        metadata: metadata.clone(),
+                        sorting,
+                    },
+                    &cancelled,
+                )
+            });
+            completions.push(Completion {
+                generation,
+                epoch,
+                still: job.still.clone(),
+                result,
+                sorting,
+                persistence,
+                worker_failure: None,
+            });
+        }
+    }
+    let opens = cache.opens;
+    drop(cache);
+    let mut jobs = jobs.into_iter();
+    let mut completed = 0;
+    for completion in completions.into_iter().take_while(|_| !cancelled()) {
+        let job = jobs.next().unwrap();
+        (job.publish)(completion);
+        completed += 1;
+    }
+    crate::apply_trace::event_lazy("colour-batch", || {
+        format!("generation={generation}; epoch={epoch}; completed={completed}; root_open_attempts={opens}")
+    });
+    if let (Some(job), Some(failure)) = (jobs.next(), worker_failure()) {
+        reject_queued(job, failure);
     }
 }
 

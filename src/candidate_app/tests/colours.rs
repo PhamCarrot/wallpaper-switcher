@@ -19,7 +19,7 @@ fn pk01_same_path_catalog_refresh_updates_mtime_without_history_or_identity_chan
     let wallpapers = app.wallpapers.clone();
     let mut entries = app.catalog.clone();
     entries[0].modified_unix = 100;
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let _ = update(
         &mut app,
         Message::Wake(Wake::CatalogLoaded {
@@ -197,13 +197,13 @@ fn w5_real_worker_result_requeries_preserves_selection_tags_geometry_and_rejects
     app.selected = Some(1);
     assert_eq!(app.colours.query.bucket, snapshot);
     app.colours.active = true;
-    app.colours.pending = true;
+    app.colours.pending = 1;
     let mut failed = stale.clone();
     failed.result = Err("Colour worker stopped".into());
     failed.worker_failure = Some(poster_worker::WorkerFailure::WorkerExited);
     app.install_colour(failed);
     assert!(!app.colours.active);
-    assert!(!app.colours.pending);
+    assert_eq!(app.colours.pending, 0);
     assert!(app.colours.status.contains("failed"));
     app.cancel_colours();
     app.colours.metadata.clear();
@@ -243,7 +243,7 @@ fn w5_actual_sort_reducer_cycles_all_delivered_orders_and_internal_cancellation_
     let clock = app.colours.clock.load(Ordering::Acquire);
     app.cancel_colours();
     assert!(app.colours.clock.load(Ordering::Acquire) > clock);
-    assert!(!app.colours.pending);
+    assert_eq!(app.colours.pending, 0);
 }
 
 #[test]

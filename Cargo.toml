@@ -16,6 +16,7 @@ path = "src/bin/gpu_candidate.rs"
 [dependencies]
 iced = { version = "0.14", default-features = false, features = ["advanced", "canvas", "image-without-codecs", "thread-pool", "wgpu"] }
 wgpu = "27"
+intel_tex_2 = "=0.5.0"
 futures-channel = "0.3"
 clipboard-win = "5.4.1"
 bytemuck = "1.25"
@@ -56,6 +57,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Media_Audio",
+    "Win32_Media_MediaFoundation",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
@@ -82,5 +84,9 @@ codegen-units = 16
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# Keep decoder panic guards effective in the shipping executable.
+panic = "unwind"
 strip = true
+
+[patch.crates-io]
+iced_wgpu = { path = "vendor/iced_wgpu" }

@@ -376,6 +376,25 @@ fn boot(
         "state.toml"
     });
     let poster_cache_dir = Config::cache_dir().join("posters");
+    // Diagnostic catalog setup retains its existing fresh-scan semantics.
+    let snapshot_path =
+        (!benchmark_enabled && screenshot_path.is_none() && scenario_request.is_none())
+            .then(|| state_path.with_file_name("catalog-snapshot-v1.json"));
+    let cached_catalog = snapshot_path.as_ref().and_then(|path| {
+        match catalog_snapshot::load(
+            path,
+            &config.catalog.local_folders,
+            config.behavior.include_default_projects,
+        ) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                apply_trace::event_lazy("catalog-snapshot-load", || {
+                    format!("accepted=false reason={error}")
+                });
+                None
+            }
+        }
+    });
     let load_diagnostic = loaded_state.diagnostic.clone();
     let mut state = loaded_state.state;
     if screenshot_path.is_some() {
@@ -466,15 +485,25 @@ fn boot(
     });
 
     let catalog_generation = Arc::new(AtomicU64::new(1));
+    let catalog_scan_generation = Arc::new(AtomicU64::new(1));
     let catalog_tx = tx.clone();
+    let scan_threads = scanner::configured_catalog_scan_threads(config.catalog_scan_threads);
+    log_debug(&format!(
+        "Catalog scan policy: io_threads={scan_threads} configured={:?}",
+        config.catalog_scan_threads
+    ));
     let catalog_watch = catalog_watch::CatalogWatch::spawn(
+        scan_threads,
         config.catalog.local_folders.clone(),
         config.behavior.include_default_projects,
         state.frontend_preferences.library.clone(),
-        catalog_generation.clone(),
+        catalog_scan_generation.clone(),
         move |wake| catalog_tx.unbounded_send(wake).is_ok(),
     )
     .expect("GPU candidate catalog owner");
+    if let Some(path) = snapshot_path {
+        catalog_watch.enable_snapshots(path);
+    }
 
     let visible = launch_policy.show_at_start(
         benchmark_enabled
@@ -525,11 +554,13 @@ fn boot(
         launch_policy,
         config,
         gallery_mode: gallery_mode(state.gallery.mode),
+        atlas_entry: None,
         state,
         state_path,
         wallpapers: Vec::new(),
         catalog: Vec::new(),
         filtered_indices: Vec::new(),
+        presentation_inputs: None,
         source_filter: screenshot_source_filter,
         filter_rule: diagnostic_search_rule,
         sort_order: SortOrder::Colour,
@@ -568,6 +599,8 @@ fn boot(
         active_monitor_id,
         selected: None,
         catalog_loaded: false,
+        catalog_fresh: false,
+        catalog_snapshot_issue: None,
         poster_failure: false,
         detail_open: false,
         status: load_diagnostic
@@ -621,16 +654,19 @@ fn boot(
         search_tags_sort_az: false,
         poster_cache_dir,
         catalog_generation,
+        catalog_scan_generation,
         catalog_watch: Some(catalog_watch),
         cache_operation: None,
         cache_status: String::new(),
         posters: Arc::new(Vec::new()),
         poster_slots: HashMap::new(),
+        poster_failed_indices: Default::default(),
         poster_request_key: None,
         poster_assignment_key: None,
         poster_generation: Arc::new(AtomicU64::new(0)),
         poster_worker: None,
         poster_mailbox: Arc::new(poster_worker::PosterMailbox::default()),
+        motion_mailbox: Arc::new(motion_mailbox::MotionMailbox::default()),
         backdrop: None,
         backdrop_source: None,
         backdrop_generation: Arc::new(AtomicU64::new(0)),
@@ -715,6 +751,9 @@ fn boot(
         _tray: tray,
         coordinator,
     };
+    if let Some(snapshot) = cached_catalog {
+        app.install_cached_catalog(snapshot);
+    }
     if app.visible && app.gallery_mode == GalleryMode::Depth {
         app.restart_gallery_entrance();
     }

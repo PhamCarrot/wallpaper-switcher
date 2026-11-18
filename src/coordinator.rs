@@ -385,9 +385,40 @@ pub(crate) fn fixture_operation_id() -> OperationId {
 }
 
 static UNRESOLVED_PROVIDER_OPERATIONS: OnceLock<Mutex<Vec<ProviderRecovery>>> = OnceLock::new();
+// Keep input paths and rollback snapshots alive through Apply and recovery recording.
+static NATIVE_CACHE_USE: Mutex<()> = Mutex::new(());
 
 fn unresolved_provider_operations() -> &'static Mutex<Vec<ProviderRecovery>> {
     UNRESOLVED_PROVIDER_OPERATIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub(crate) fn with_native_cache_eviction<T>(
+    evict: impl FnOnce(&HashSet<String>) -> T,
+) -> Result<T, String> {
+    let _gate = NATIVE_CACHE_USE
+        .try_lock()
+        .map_err(|_| "native cache is in use or Apply state is unavailable".to_string())?;
+    let pending = unresolved_provider_operations()
+        .lock()
+        .map_err(|_| "provider recovery state is unavailable".to_string())?;
+    if pending
+        .iter()
+        .any(|record| record.provider == ProviderKind::Native)
+    {
+        return Err("native provider recovery is pending".into());
+    }
+    drop(pending);
+
+    let monitors = native_wallpaper::monitors()?;
+    if monitors.is_empty() {
+        return Err("no monitor wallpaper paths could be confirmed".into());
+    }
+    let mut protected = HashSet::with_capacity(monitors.len());
+    for monitor in monitors {
+        let path = native_wallpaper::get_wallpaper_for_device(&monitor.device_id)?;
+        protected.insert(native_wallpaper::normalized_wallpaper_path(&path));
+    }
+    Ok(evict(&protected))
 }
 
 pub(crate) fn same_recovery(left: &ProviderRecovery, right: &ProviderRecovery) -> bool {
@@ -1599,6 +1630,9 @@ pub(crate) fn resolve_explicit_apply_target_from_device_ids(
 }
 
 fn run_operation(request: ApplyRequest) -> ApplyResult {
+    let _native_cache_use = NATIVE_CACHE_USE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let operation_id = request.operation_id;
     let wallpaper_id = request.wallpaper.id.clone();
     let context = ApplyContext::default();
@@ -3580,6 +3614,7 @@ mod contract_tests {
         ApplyRequest {
             operation_id: OperationId(1201),
             wallpaper: WallpaperItem {
+                scan_metadata: None,
                 id: "item-a".into(),
                 title: "Fixture".into(),
                 folder_path: "C:/fixture".into(),
@@ -4577,6 +4612,7 @@ mod contract_tests {
     #[test]
     fn engine_recovery_uses_the_actual_scene_media_or_local_video_identity() {
         let scene = WallpaperItem {
+            scan_metadata: None,
             id: "scene".into(),
             title: "Scene".into(),
             folder_path: std::path::PathBuf::from(r"C:\scene"),
@@ -4742,6 +4778,7 @@ mod runtime_tests {
 
     fn local_item(path: &Path) -> WallpaperItem {
         WallpaperItem {
+            scan_metadata: None,
             id: format!("runtime-local:{}", path.display()),
             title: "Runtime local image".to_string(),
             folder_path: path.parent().unwrap_or(Path::new("")).to_path_buf(),
@@ -4769,6 +4806,7 @@ mod runtime_tests {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("scene.pkg");
         WallpaperItem {
+            scan_metadata: None,
             id: format!("runtime-engine:{}", path.display()),
             title: value
                 .get("title")

@@ -22,7 +22,7 @@ pub(super) struct State {
     pub entries: HashMap<String, Stored>,
     pub clock: Arc<AtomicU64>,
     pub cursor: usize,
-    pub pending: bool,
+    pub pending: usize,
     pub active: bool,
     pub refresh: bool,
     pub settled: usize,
@@ -35,7 +35,7 @@ pub(super) struct State {
 impl GpuCandidate {
     pub(super) fn cancel_colours(&mut self) {
         self.colours.clock.fetch_add(1, Ordering::AcqRel);
-        self.colours.pending = false;
+        self.colours.pending = 0;
         self.colours.active = false;
         if let Some(worker) = &self.poster_worker {
             worker.cancel_colour();
@@ -60,29 +60,29 @@ impl GpuCandidate {
     }
     pub(super) fn schedule_colour(&mut self) {
         if !self.colours.active
-            || self.colours.pending
+            || self.colours.pending != 0
             || self.exit_requested
             || self.cache_operation.is_some()
         {
             return;
         }
-        while let Some(item) = self.wallpapers.get(self.colours.cursor) {
-            self.colours.cursor += 1;
-            let Some(still) =
-                MediaStill::select(item, self.catalog_generation.load(Ordering::Acquire))
-            else {
-                self.colours.entries.insert(
-                    item.id.clone(),
-                    Stored {
-                        still: None,
-                        reason: Some("No supported stored image/poster".into()),
-                        persistent: false,
-                    },
-                );
-                self.colours.unavailable += 1;
-                self.colours.settled += 1;
-                continue;
+        let mut stills = Vec::with_capacity(poster_worker::colour::BATCH_LIMIT);
+        let mut unavailable = Vec::new();
+        let mut cursor = self.colours.cursor;
+        let catalog_revision = self.catalog_generation.load(Ordering::Acquire);
+        while stills.len() < poster_worker::colour::BATCH_LIMIT {
+            let Some(item) = self.wallpapers.get(cursor) else {
+                break;
             };
+            cursor += 1;
+            if let Some(still) = MediaStill::select(item, catalog_revision) {
+                stills.push(still);
+            } else {
+                unavailable.push(item.id.clone());
+            };
+        }
+        let submitted = !stills.is_empty();
+        if submitted {
             if !self.ensure_preview_worker() {
                 self.colours.status =
                     "Colour worker unavailable; colour information is incomplete.".into();
@@ -94,28 +94,67 @@ impl GpuCandidate {
                 self.colours.status = "Colour wake channel unavailable".into();
                 return;
             };
-            let job = poster_worker::colour::Job {
-                generation: self.colours.clock.load(Ordering::Acquire),
-                catalog_clock: self.catalog_generation.clone(),
-                epoch: 0,
-                clock: self.colours.clock.clone(),
-                still,
-                profile: Config::config_dir(),
-                refresh: self.colours.refresh,
-                publish: Box::new(move |c| {
-                    let _ = tx.unbounded_send(Wake::ColourReady(c));
-                }),
-                #[cfg(test)]
-                held: None,
-            };
-            match self.poster_worker.as_ref().unwrap().submit_colour(job) {
-                Ok(()) => self.colours.pending = true,
+            let profile = Config::config_dir();
+            let generation = self.colours.clock.load(Ordering::Acquire);
+            let count = stills.len();
+            let jobs = stills
+                .into_iter()
+                .map(|still| {
+                    let tx = tx.clone();
+                    poster_worker::colour::Job {
+                        generation,
+                        catalog_clock: self.catalog_generation.clone(),
+                        epoch: 0,
+                        clock: self.colours.clock.clone(),
+                        still,
+                        profile: profile.clone(),
+                        refresh: self.colours.refresh,
+                        publish: Box::new(move |c| {
+                            let _ = tx.unbounded_send(Wake::ColourReady(c));
+                        }),
+                        #[cfg(test)]
+                        held: None,
+                    }
+                })
+                .collect();
+            match self.poster_worker.as_ref().unwrap().submit_colours(jobs) {
+                Ok(()) => self.colours.pending = count,
+                Err(
+                    error @ (poster_worker::SubmitError::CacheBusy
+                    | poster_worker::SubmitError::Closed),
+                ) => {
+                    // Commit neither the cursor nor unsupported-item counts until
+                    // this batch is accepted. The next motion tick retries it.
+                    apply_trace::event_lazy("colour-submit-retry", || {
+                        format!(
+                            "worker={} cursor={} reason={error:?}",
+                            self.poster_worker.as_ref().unwrap().id(),
+                            self.colours.cursor
+                        )
+                    });
+                    return;
+                }
                 Err(e) => {
                     self.colours.active = false;
                     self.colours.status = format!("Colour analysis refused: {e}");
                     return;
                 }
             }
+        }
+        self.colours.cursor = cursor;
+        for id in unavailable {
+            self.colours.entries.insert(
+                id,
+                Stored {
+                    still: None,
+                    reason: Some("No supported stored image/poster".into()),
+                    persistent: false,
+                },
+            );
+            self.colours.unavailable += 1;
+            self.colours.settled += 1;
+        }
+        if submitted {
             self.colours.status = format!(
                 "Colour information: {}/{} settled · {} unavailable",
                 self.colours.settled,
@@ -146,7 +185,11 @@ impl GpuCandidate {
             return;
         }
         let worker_failed = c.worker_failure.is_some();
-        self.colours.pending = false;
+        self.colours.pending = if worker_failed {
+            0
+        } else {
+            self.colours.pending.saturating_sub(1)
+        };
         let current = self
             .wallpapers
             .iter()

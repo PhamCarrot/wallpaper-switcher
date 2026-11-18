@@ -215,7 +215,9 @@ pub(super) fn gallery_rail_model(app: &GpuCandidate) -> donor_rail::RailModel {
                     .iter()
                     .any(|preset| preset.matches_orientation(app.filter_rule.orientation))),
         folder: source.flag_default_true("filterBar.show.folder")
-            && (!app.available_folders().is_empty() || !app.filter_rule.folders.is_empty()),
+            && (!app.catalog.is_empty()
+                || !app.config.catalog.local_folders.is_empty()
+                || !app.filter_rule.folders.is_empty()),
         sort: source.flag_default_true("filterBar.show.sort"),
         favorites: source.flag_default_true("filterBar.show.favourites"),
         random: source.flag_default_true("filterBar.show.random"),
@@ -495,11 +497,22 @@ pub(super) fn view(app: &GpuCandidate, _id: window::Id) -> Element<'_, Message> 
                 || !matches!(app.gallery_mode, GalleryMode::Slices | GalleryMode::Depth),
             viewport: app.viewport,
             time: app.presentation_started.elapsed().as_secs_f32(),
-            visibility: app.scene_motion.opacity(),
+            visibility: if app.atlas_entry.is_some() {
+                0.0
+            } else {
+                app.scene_motion.opacity()
+            },
         },
     });
     let scene: Element<'_, GalleryMessage> = shader(GalleryProgram {
+        prewarm: app.atlas_entry.map(|_| {
+            (
+                app.atlas_prewarm_key(),
+                !app.poster_loading && app.poster_request_key.is_some(),
+            )
+        }),
         snapshot: snapshot.clone(),
+        poster_feedback: Some(super::images::publish_poster_feedback),
     })
     .width(Fill)
     .height(Fill)

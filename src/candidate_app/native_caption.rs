@@ -28,8 +28,7 @@ use windows_sys::Win32::{
     },
 };
 
-const ORIGINAL_PROC: *const u16 =
-    windows_sys::w!("WallpaperSwitcher.NativeCaption.OriginalProc");
+const ORIGINAL_PROC: *const u16 = windows_sys::w!("WallpaperSwitcher.NativeCaption.OriginalProc");
 
 unsafe fn install_on_window(hwnd: HWND) -> bool {
     // Caller owns this live HWND on its event-loop thread; the box belongs to

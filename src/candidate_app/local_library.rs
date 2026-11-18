@@ -68,6 +68,20 @@ impl GpuCandidate {
         self.local_tag_input.clear();
     }
 
+    pub(super) fn revoke_catalog_tag_callbacks(&mut self) {
+        let owner = self.tag_owner();
+        let keep = owner.as_ref().is_some_and(|owner| {
+            self.tag_editor_context.is_some()
+                && self.local_tag_draft_owner.as_ref() == Some(owner)
+                && self.catalog.iter().any(|entry| entry.id == owner.item)
+        });
+        self.tag_edit_session = self.tag_edit_session.wrapping_add(1);
+        self.local_tag_draft_owner = keep.then(|| self.tag_owner()).flatten();
+        if !keep {
+            self.local_tag_input.clear();
+        }
+    }
+
     pub(super) fn project_local_tags(&mut self) {
         for entry in &mut self.catalog {
             entry.tags = self

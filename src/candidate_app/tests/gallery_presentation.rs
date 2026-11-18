@@ -218,7 +218,7 @@ fn p7_flag2_depends_on_wall_loading_readiness_and_never_selection() {
                     index: *i,
                     item_id: current.wallpapers[*i].id.clone(),
                     source: poster_source_for_item(&current.wallpapers[*i]),
-                    is_video: false,
+                    kind: crate::poster_worker::PosterKind::Still,
                 })
                 .collect(),
         );
@@ -233,6 +233,124 @@ fn p7_flag2_depends_on_wall_loading_readiness_and_never_selection() {
             .iter()
             .all(|e| e.readiness == CardReadiness::Unavailable));
     }
+}
+
+#[test]
+fn p32_failed_card_becomes_unavailable_before_healthy_neighbour_settles() {
+    let mut app = fixture(3);
+    app.gallery_mode = GalleryMode::Wall;
+    app.state.gallery.mode = GalleryKind::Wall;
+    app.viewport = [1920.0, 1080.0];
+    app.state.gallery.wall.columns = 3;
+    app.state.gallery.wall.rows = 1;
+    app.sync_gallery_presentation();
+    app.wall_presentation.as_mut().unwrap().settle();
+    app.poster_slots.clear();
+    app.posters = Arc::new(Vec::new());
+    let sources: Vec<_> = app
+        .wallpapers
+        .iter()
+        .enumerate()
+        .map(|(index, item)| poster_worker::PosterSource {
+            index,
+            layer: index as u32,
+            item_id: item.id.clone(),
+            path: poster_source_for_item(item),
+            kind: crate::poster_worker::PosterKind::Still,
+            video_stamp: None,
+            still: None,
+        })
+        .collect();
+    let generation = app.poster_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    app.poster_mailbox
+        .expect(generation, sources.clone())
+        .unwrap();
+    app.poster_request_key = Some(
+        sources
+            .iter()
+            .map(|source| PosterRequestIdentity {
+                index: source.index,
+                item_id: source.item_id.clone(),
+                source: source.path.clone(),
+                kind: source.kind,
+            })
+            .collect(),
+    );
+    app.poster_loading = true;
+    let readiness = |app: &GpuCandidate, source: &poster_worker::PosterSource| {
+        app.ordinary_frame()
+            .into_iter()
+            .find(|entry| entry.id == source.item_id)
+            .unwrap()
+            .readiness
+    };
+    let failed = |generation, source| poster_worker::PosterCompletion {
+        generation,
+        cursor: 1,
+        finished: false,
+        posters: Vec::new(),
+        failures: vec![poster_worker::DecodeFailed {
+            source,
+            tiers: [gpu_gallery::PosterTier::Far, gpu_gallery::PosterTier::Near],
+            error: Arc::new(gpu_gallery::PosterDecodeError::InvalidPixels),
+        }],
+    };
+    let first = &sources[0];
+    let healthy = &sources[1];
+    assert_eq!(readiness(&app, first), CardReadiness::Loading);
+    let mut wrong = first.clone();
+    wrong.item_id.push_str("-different");
+    for stale in [
+        failed(generation - 1, first.clone()),
+        failed(generation, wrong),
+    ] {
+        app.poster_mailbox
+            .publish(stale, || panic!("stale failure woke the gallery"))
+            .unwrap();
+    }
+    assert!(app.poster_mailbox.take().unwrap().is_none());
+    app.poster_mailbox
+        .publish(failed(generation, first.clone()), || true)
+        .unwrap();
+    let _ = update(&mut app, Message::Wake(Wake::PostersReady));
+    assert!(app.poster_loading);
+    assert_eq!(readiness(&app, first), CardReadiness::Unavailable);
+    assert_eq!(readiness(&app, healthy), CardReadiness::Loading);
+
+    app.poster_mailbox
+        .publish(
+            poster_worker::PosterCompletion {
+                generation,
+                cursor: 2,
+                finished: false,
+                posters: vec![poster_worker::DecodedPoster {
+                    source: healthy.clone(),
+                    poster: gpu_gallery::video_placeholder_poster(&healthy.path, healthy.layer),
+                }],
+                failures: Vec::new(),
+            },
+            || true,
+        )
+        .unwrap();
+    app.poster_mailbox
+        .publish(
+            poster_worker::PosterCompletion {
+                generation,
+                cursor: 3,
+                finished: true,
+                posters: Vec::new(),
+                failures: Vec::new(),
+            },
+            || panic!("the healthy result and terminal cursor should share a wake"),
+        )
+        .unwrap();
+    let _ = update(&mut app, Message::Wake(Wake::PostersReady));
+    assert!(!app.poster_loading);
+    assert!(!app.poster_failure);
+    assert_eq!(readiness(&app, first), CardReadiness::Unavailable);
+    assert_eq!(readiness(&app, healthy), CardReadiness::Ready);
+    app.invalidate_poster_work();
+    assert!(app.poster_failed_indices.is_empty());
 }
 
 #[test]
@@ -252,7 +370,7 @@ fn p7_source_regular_compact_fixtures_and_live_controls_preserve_profile_values(
         p.skew_distance = skew;
         p.spacing = 0.0;
         let state = GalleryPresentation::new(
-            (0..24).map(|i| i.to_string()).collect(),
+            (0..24).map(|i| i.to_string()).collect::<Vec<_>>(),
             "5".into(),
             p.clone(),
             viewport,
@@ -346,9 +464,11 @@ fn p7_captured_click_rejects_replaced_catalog_source_and_filtered_identity() {
     assert_eq!(app.selected, Some(5));
     app.wallpapers[6].preview_path = Some(entry.source.clone());
     app.filtered_indices.retain(|i| *i != 6);
+    app.presentation_inputs = None;
     let _ = update(&mut app, click());
     assert_eq!(app.selected, Some(5));
     app.filtered_indices.push(6);
+    app.presentation_inputs = None;
     let _ = update(&mut app, click());
     assert_eq!(app.selected, Some(6));
 }
@@ -422,7 +542,7 @@ fn p7_dense_visible_source_frame_requires_every_distinct_image() {
             index: *i,
             item_id: app.wallpapers[*i].id.clone(),
             source: poster_source_for_item(&app.wallpapers[*i]),
-            is_video: false,
+            kind: crate::poster_worker::PosterKind::Still,
         })
         .collect();
     let sources = crate::candidate_app::gallery::poster_sources_bounded(
@@ -449,6 +569,9 @@ fn p7_dense_visible_source_frame_requires_every_distinct_image() {
         .publish(
             poster_worker::PosterCompletion {
                 generation: 7,
+                cursor: 1,
+                finished: true,
+                failures: Vec::new(),
                 posters: sources
                     .iter()
                     .map(|s| poster_worker::DecodedPoster {
@@ -467,7 +590,7 @@ fn p7_dense_visible_source_frame_requires_every_distinct_image() {
             decoded.source.index,
             PosterSlot {
                 layer: decoded.source.layer,
-                is_video: false,
+                kind: crate::poster_worker::PosterKind::Still,
                 generation: 7,
                 catalog_generation: app.catalog_generation.load(Ordering::Acquire),
                 item_id: decoded.source.item_id,
@@ -654,7 +777,7 @@ fn poster_navigation_captures_each_visible_card_source_once() {
         let mut captures = 0;
         let frame = app.ordinary_base_frame_with_source_selector(|wallpaper| {
             captures += 1;
-            poster_source_for_item(wallpaper)
+            gallery::poster_media_for_item(wallpaper)
         });
         assert!(!frame.is_empty());
         assert_eq!(
@@ -685,4 +808,126 @@ fn poster_navigation_shared_frame_capacity_excludes_outgoing_cards() {
         entry.outgoing = true;
     }
     assert!(app.ordinary_capacity_issue_for_frame(&excess).is_none());
+}
+
+#[test]
+fn p53_real_held_worker_and_current_receipt_control_dense_entry() {
+    use std::sync::{mpsc, Mutex};
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let mut app = fixture(3);
+    app.clear_posters();
+    app.state.gallery.mode = GalleryKind::Slices;
+    let (held_tx, held_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let mailbox = app.poster_mailbox.clone();
+    let worker = poster_worker::PosterWorker::spawn_with_builder(
+        std::thread::Builder::new(),
+        app.poster_generation.clone(),
+        move |completion| {
+            let finished = completion.finished;
+            let result = mailbox.publish(completion, || true).is_ok();
+            if finished {
+                let _ = finished_tx.send(());
+            }
+            result
+        },
+        move |source, _| {
+            if source.index == 1 {
+                held_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv_timeout(TIMEOUT).unwrap();
+            }
+            Some(gpu_gallery::video_placeholder_poster(
+                &source.path,
+                source.layer,
+            ))
+        },
+    )
+    .unwrap();
+    app.poster_worker = Some(worker);
+    app.set_gallery_mode(GalleryMode::Wall);
+    held_rx.recv_timeout(TIMEOUT).unwrap();
+    assert_eq!(app.atlas_entry, Some(GalleryMode::Wall));
+    assert!(app.poster_loading);
+    let _ = update(&mut app, Message::Wake(Wake::PostersReady));
+    let held_key = app.atlas_prewarm_key();
+    let held_posters = app.posters.clone();
+    let _ = update(
+        &mut app,
+        Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Prewarmed {
+            key: held_key,
+            posters: held_posters,
+        })),
+    );
+    assert!(app.atlas_entry.is_some());
+    release_tx.send(()).unwrap();
+    finished_rx.recv_timeout(TIMEOUT).unwrap();
+    let _ = update(&mut app, Message::Wake(Wake::PostersReady));
+    assert!(!app.poster_loading);
+    assert_eq!(app.posters.len(), 3);
+    assert!(app.atlas_entry.is_some());
+    let key = app.atlas_prewarm_key();
+    let posters = app.posters.clone();
+    let mut wrong = key;
+    wrong.selected = Some(999);
+    for (receipt, resources) in [(wrong, posters.clone()), (key, Arc::new(posters.to_vec()))] {
+        let _ = update(
+            &mut app,
+            Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Prewarmed {
+                key: receipt,
+                posters: resources,
+            })),
+        );
+        assert!(app.atlas_entry.is_some());
+    }
+    let _ = update(
+        &mut app,
+        Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Prewarmed {
+            key,
+            posters: posters.clone(),
+        })),
+    );
+    assert!(app.atlas_entry.is_none());
+    assert!(Arc::ptr_eq(&posters, &app.posters));
+    assert_eq!(
+        key.generation,
+        app.poster_generation.load(Ordering::Acquire)
+    );
+    drop(app.poster_worker.take());
+}
+
+#[test]
+fn p53_invalidation_replacement_hide_and_failure_cannot_leave_or_release_an_old_hold() {
+    for cancel in 0..3 {
+        let mut app = fixture(3);
+        app.atlas_entry = Some(GalleryMode::Wall);
+        app.gallery_mode = GalleryMode::Wall;
+        let key = app.atlas_prewarm_key();
+        let posters = app.posters.clone();
+        match cancel {
+            0 => app.invalidate_poster_work(),
+            1 => {
+                let _ = app.set_visible(false, "p53-owned-fixture-hide");
+            }
+            _ => app.clear_posters(),
+        }
+        assert!(app.atlas_entry.is_none());
+        app.atlas_entry = Some(GalleryMode::Geometric);
+        app.gallery_mode = GalleryMode::Geometric;
+        let _ = update(
+            &mut app,
+            Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Prewarmed {
+                key,
+                posters,
+            })),
+        );
+        assert_eq!(app.atlas_entry, Some(GalleryMode::Geometric));
+    }
+    let mut app = fixture(3);
+    app.poster_worker = None;
+    app.set_gallery_mode(GalleryMode::Wall);
+    assert!(app.poster_worker.is_none());
+    assert!(app.atlas_entry.is_none());
+    assert!(app.poster_failure);
 }

@@ -353,7 +353,7 @@ fn pk05_catalog_membership_and_smart_tag_refresh_follow_current_ids_not_indices(
     entries.reverse();
     let mut wallpapers = app.wallpapers.clone();
     wallpapers.reverse();
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let _ = update(
         &mut app,
         Message::Wake(Wake::CatalogLoaded {

@@ -289,11 +289,15 @@ pub(super) fn update(app: &mut GpuCandidate, message: Message) -> Task<Message> 
     let search_under_settings = app.panel_state.settings_open && app.panel_state.search_open;
     let animation_frame = matches!(
         &message,
-        Message::Wake(Wake::RailFrame { .. } | Wake::MotionFrame { .. } | Wake::DetailFrame { .. })
-            | Message::SettingsIntent {
-                intent: view::settings::folio::intent::Message::Frame(_),
-                ..
-            }
+        Message::Wake(
+            Wake::RailFrame { .. }
+                | Wake::MotionReady
+                | Wake::MotionFrame { .. }
+                | Wake::DetailFrame { .. }
+        ) | Message::SettingsIntent {
+            intent: view::settings::folio::intent::Message::Frame(_),
+            ..
+        }
     );
     let task = update_inner(app, message);
     app.reconcile_tag_editor();
@@ -501,11 +505,17 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             return update(app, Message::ResumeRandomRotation)
         }
         Message::Wake(Wake::CatalogDirty { generation }) => {
-            if !app.exit_requested && generation == app.catalog_generation.load(Ordering::Acquire) {
+            if !app.exit_requested
+                && generation == app.catalog_scan_generation.load(Ordering::Acquire)
+            {
                 app.refresh_catalog();
             }
         }
         Message::Wake(Wake::ColourReady(c)) => app.install_colour(c),
+        Message::Wake(Wake::CatalogSnapshotSaved(result)) => {
+            apply_trace::event_lazy("catalog-snapshot-saved", || format!("result={result:?}"));
+            app.catalog_snapshot_issue = result.err();
+        }
         Message::Colour(action) => app.colour_action(action),
         Message::Wake(Wake::CacheAcknowledged(report)) => {
             apply_trace::event_lazy("ui-cache-operation-ack", || {
@@ -525,10 +535,12 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             mut wallpapers,
             mut entries,
         }) => {
-            if let Some(owner) = &app.catalog_watch {
-                owner.acknowledge();
-            }
-            if app.exit_requested || generation != app.catalog_generation.load(Ordering::Acquire) {
+            if app.exit_requested
+                || generation != app.catalog_scan_generation.load(Ordering::Acquire)
+            {
+                if let Some(owner) = &app.catalog_watch {
+                    owner.acknowledge();
+                }
                 return Task::none();
             }
             if let Some(benchmark) = &mut app.benchmark {
@@ -548,18 +560,43 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     }
                 }
             }
+            for entry in &mut entries {
+                entry.tags = app
+                    .state
+                    .local_library
+                    .effective_tags(&entry.id, &entry.source_tags);
+            }
+            if app.catalog_loaded && wallpapers == app.wallpapers && entries == app.catalog {
+                let first_fresh = !app.catalog_fresh;
+                app.accept_fresh_catalog(generation);
+                app.revoke_catalog_tag_callbacks();
+                app.update_catalog_status();
+                if first_fresh {
+                    app.schedule_poster_pregeneration();
+                }
+                apply_trace::event_lazy("catalog-unchanged", || {
+                    format!(
+                        "scan={generation} revision={}",
+                        app.catalog_generation.load(Ordering::Acquire)
+                    )
+                });
+                return Task::none();
+            }
             // Capture before resource/catalog invalidation. A new catalog
             // revision invalidates outgoing ownership even for reused ID/path;
             // omit those old bodies truthfully, retain incoming roll presentation.
             let catalog_roll = app.capture_depth_roll().is_some();
-            app.clear_posters();
-            app.depth_frame = None;
+            let revision = app.catalog_generation.fetch_add(1, Ordering::AcqRel) + 1;
+            app.retain_catalog_posters(&wallpapers, revision);
             app.clear_engine_properties();
             let selected_id = app
                 .selected
                 .and_then(|index| app.wallpapers.get(index))
                 .map(|wallpaper| wallpaper.id.clone());
             app.invalidate_tag_editor();
+            // Never capture outgoing geometry using old indices against the new vectors.
+            app.filtered_indices.clear();
+            app.presentation_inputs = None;
             app.wallpapers = wallpapers;
             app.catalog = entries;
             app.project_local_tags();
@@ -583,7 +620,7 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                 )
             });
             app.catalog_loaded = true;
-            app.prepare_startup_reapply();
+            app.accept_fresh_catalog(generation);
             app.start_colours(false);
             app.poster_failure = false;
             app.refresh_filter();
@@ -615,7 +652,7 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     &app.wallpapers,
                     Config::config_dir(),
                     app.catalog_loaded,
-                    generation,
+                    revision,
                 );
                 let snapshot_json = serde_json::to_string(&snapshot)
                     .unwrap_or_else(|_| "{\"snapshot_serialization\":\"failed\"}".into());
@@ -708,6 +745,7 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                 app.schedule_posters();
                 app.refresh_backdrop();
             }
+            app.schedule_poster_pregeneration();
         }
         Message::PendingForms {
             window,
@@ -716,6 +754,85 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
         } => {
             if view::settings::gateway::valid(app, window, generation) {
                 view::settings::pending_forms::dispatch(app, action);
+            }
+        }
+        Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Restore(mut posters))) => {
+            if app.visible && app.cache_operation.is_none() {
+                posters.retain(|(poster, _)| app.posters.iter().any(|p| p.same_resource(poster)));
+                if !posters.is_empty() && app.ensure_preview_worker() {
+                    if let Some(worker) = &app.poster_worker {
+                        worker.restore(&app.posters, posters, || {
+                            super::images::publish_poster_feedback(
+                                gpu_gallery::PosterFeedback::Redraw,
+                            );
+                        });
+                    }
+                }
+            }
+            return Task::none();
+        }
+        Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Redraw)) => return Task::none(),
+        Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Prewarmed { key, posters })) => {
+            if app.visible
+                && !app.poster_loading
+                && app.cache_operation.is_none()
+                && app.atlas_entry == Some(app.gallery_mode)
+                && key == app.atlas_prewarm_key()
+                && Arc::ptr_eq(&posters, &app.posters)
+            {
+                app.atlas_entry = None;
+                apply_trace::event_lazy("atlas-prewarm-released", || {
+                    format!(
+                        "mode={:?} generation={} resources={}",
+                        app.gallery_mode,
+                        key.generation,
+                        posters.len()
+                    )
+                });
+                app.reveal_gallery_layout();
+            }
+            return Task::none();
+        }
+        Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::MaintenanceAfter(delay))) => {
+            let (send, receive) = futures_channel::oneshot::channel();
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                let _ = send.send(());
+            });
+            return Task::perform(receive, |_| {
+                Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Redraw))
+            });
+        }
+        Message::Wake(Wake::PosterWorkerExited(exit)) => {
+            if let Some(worker) = app
+                .poster_worker
+                .as_ref()
+                .filter(|worker| worker.id() == exit.worker_id)
+            {
+                debug_assert!(worker.can_replace());
+                let generation = app.poster_generation.load(Ordering::Acquire);
+                let was_loading = app.poster_loading;
+                let request_key = app.poster_request_key.take();
+                let assignment_key = app.poster_assignment_key.take();
+                app.poster_worker = None;
+                app.invalidate_poster_work();
+                // Motion ticks may repeat the failed demand. A new request or
+                // explicit invalidation can retry through the normal scheduler.
+                app.poster_request_key = request_key;
+                app.poster_assignment_key = assignment_key;
+                if app.cache_operation.take().is_some() {
+                    app.cache_status =
+                        "Poster worker stopped before the cache operation was acknowledged.".into();
+                }
+                app.poster_failure = true;
+                let message = format!("Poster preview worker stopped: {}", exit.failure);
+                app.status = Some(app.status_with_persistence_issue(&message));
+                apply_trace::event_lazy("poster-worker-stopped", || {
+                    format!(
+                        "worker={} generation={generation} loading={was_loading}->{} failure={:?} status={message:?}",
+                        exit.worker_id, app.poster_loading, exit.failure
+                    )
+                });
             }
         }
         Message::Wake(Wake::PostersReady) => {
@@ -730,7 +847,10 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             };
             let Some(poster_worker::PosterCompletion {
                 generation,
+                cursor,
+                finished,
                 posters,
+                failures,
             }) = completion
             else {
                 return Task::none();
@@ -740,7 +860,21 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                 app.poster_generation.load(Ordering::Acquire),
                 app.visible,
             ) {
-                if !posters.is_empty() {
+                let pins = app.gallery_pins();
+                let valid_posters: Vec<_> = posters
+                    .into_iter()
+                    .filter(|decoded| {
+                        app.wallpapers
+                            .get(decoded.source.index)
+                            .is_some_and(|wallpaper| poster_completion_matches(decoded, wallpaper))
+                            && !pins.iter().any(|pin| {
+                                pin.index == decoded.source.index
+                                    || pin.slot.layer == decoded.source.layer
+                            })
+                    })
+                    .collect();
+                if !valid_posters.is_empty() {
+                    app.poster_failure = false;
                     if let Some(benchmark) = &mut app.benchmark {
                         if benchmark.cold_open_ms.is_none() {
                             benchmark.cold_open_ms =
@@ -752,50 +886,86 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                         }
                     }
                 }
-                let valid_posters = posters
-                    .into_iter()
-                    .filter(|decoded| {
-                        app.wallpapers
-                            .get(decoded.source.index)
-                            .is_some_and(|wallpaper| poster_completion_matches(decoded, wallpaper))
-                    })
-                    .collect::<Vec<_>>();
-                let pins = app.gallery_pins();
-                let valid_posters: Vec<_> = valid_posters
-                    .into_iter()
-                    .filter(|decoded| {
-                        !pins
-                            .iter()
-                            .any(|pin| pin.slot.layer == decoded.source.layer)
-                    })
-                    .collect();
-                let live_pin = pins.iter().any(|pin| {
-                    (app.gallery_mode != GalleryMode::Depth
-                        && app.filtered_indices.contains(&pin.index))
-                        || app
-                            .depth_frame
-                            .as_ref()
-                            .is_some_and(|frame| frame.live_poster_indices.contains(&pin.index))
-                });
-                app.poster_failure =
-                    valid_posters.is_empty() && !live_pin && !app.filtered_indices.is_empty();
-                app.poster_slots = valid_posters
+                let catalog_generation = app.catalog_generation.load(Ordering::Acquire);
+                let mut failed = 0;
+                for failure in failures {
+                    let source = &failure.source;
+                    if app.wallpapers.get(source.index).is_some_and(|wallpaper| {
+                        gallery::poster_source_matches(source, wallpaper)
+                            && source
+                                .still
+                                .as_ref()
+                                .is_none_or(|still| still.catalog_revision == catalog_generation)
+                    }) && !pins
+                        .iter()
+                        .any(|pin| pin.index == source.index || pin.slot.layer == source.layer)
+                    {
+                        app.poster_failed_indices.insert(source.index);
+                        failed += 1;
+                        apply_trace::event_lazy("poster-item-failed", || {
+                            let [far, near] = failure.tiers;
+                            format!(
+                                "generation={generation} index={} layer={} tiers={far:?},{near:?} item={:?} source={:?} error={}",
+                                source.index, source.layer, source.item_id, source.path, failure.error,
+                            )
+                        });
+                    }
+                }
+                let incoming_indices: HashSet<_> = valid_posters
                     .iter()
-                    .map(|decoded| {
-                        (
-                            decoded.source.index,
-                            PosterSlot {
-                                layer: decoded.source.layer,
-                                is_video: decoded.source.is_video,
-                                generation,
-                                catalog_generation: app.catalog_generation.load(Ordering::Acquire),
-                                item_id: decoded.source.item_id.clone(),
-                                source: decoded.source.path.clone(),
-                            },
-                        )
-                    })
+                    .map(|decoded| decoded.source.index)
                     .collect();
-                let mut resident = Vec::with_capacity(gpu_gallery::MAX_POSTERS);
+                let incoming_layers: HashSet<_> = valid_posters
+                    .iter()
+                    .map(|decoded| decoded.source.layer)
+                    .collect();
+                app.poster_failed_indices
+                    .retain(|index| !incoming_indices.contains(index));
+                // Older slots can still draw while their replacements arrive.
+                // Reclaim a slot on either kind of collision and retire leftovers at EOF.
+                app.poster_slots.retain(|index, slot| {
+                    slot.catalog_generation == catalog_generation
+                        && (!finished || slot.generation == generation)
+                        && !incoming_indices.contains(index)
+                        && !app.poster_failed_indices.contains(index)
+                        && !incoming_layers.contains(&slot.layer)
+                        && !pins
+                            .iter()
+                            .any(|pin| pin.index == *index || pin.slot.layer == slot.layer)
+                });
+                let retained_layers: HashSet<_> =
+                    app.poster_slots.values().map(|slot| slot.layer).collect();
+                let resident = Arc::make_mut(&mut app.posters);
+                resident.retain(|poster| retained_layers.contains(&poster.layer));
+                let installed = valid_posters.len();
+                for decoded in valid_posters {
+                    let source = decoded.source;
+                    app.poster_slots.insert(
+                        source.index,
+                        PosterSlot {
+                            layer: source.layer,
+                            kind: source.kind,
+                            generation,
+                            catalog_generation,
+                            item_id: source.item_id,
+                            source: source.path,
+                        },
+                    );
+                    resident.push(decoded.poster);
+                }
+                if finished {
+                    let live_pin = pins.iter().any(|pin| {
+                        (app.gallery_mode != GalleryMode::Depth
+                            && app.filtered_indices.contains(&pin.index))
+                            || app
+                                .depth_frame
+                                .as_ref()
+                                .is_some_and(|frame| frame.live_poster_indices.contains(&pin.index))
+                    });
+                    app.poster_failure =
+                        resident.is_empty() && !live_pin && !app.filtered_indices.is_empty();
+                    app.poster_loading = false;
+                }
                 for pin in pins {
                     app.poster_slots.insert(pin.index, pin.slot);
                     if !resident
@@ -805,13 +975,18 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                         resident.push(pin.poster);
                     }
                 }
-                resident.extend(valid_posters.into_iter().map(|decoded| decoded.poster));
-                app.posters = Arc::new(resident);
-                app.poster_loading = false;
+                apply_trace::event_lazy("poster-gallery-merge", || {
+                    format!(
+                        "generation={generation} cursor={cursor} finished={finished} installed={installed} slots={} failed={failed}",
+                        resident.len()
+                    )
+                });
                 app.rebuild_depth_frame();
                 app.update_catalog_status();
-                app.maybe_schedule_screenshot();
-                app.scenario_ready_after_posters();
+                if finished {
+                    app.maybe_schedule_screenshot();
+                    app.scenario_ready_after_posters();
+                }
             }
         }
         Message::Wake(Wake::BackdropLoaded {
@@ -1131,6 +1306,11 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     .map(|message| app.status_with_persistence_issue(&message));
             }
         }
+        Message::Wake(Wake::MotionReady) => {
+            if let Some(frame) = app.motion_mailbox.take() {
+                return update_inner(app, Message::Wake(frame));
+            }
+        }
         Message::Wake(Wake::MotionFrame {
             generation,
             value,
@@ -1201,6 +1381,7 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                 ) {
                     app.schedule_posters();
                 }
+                app.schedule_colour();
             }
         }
         Message::Wake(Wake::RailFrame { generation, value }) => {

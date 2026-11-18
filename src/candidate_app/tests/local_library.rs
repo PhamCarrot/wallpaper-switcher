@@ -59,7 +59,7 @@ fn w3_production_tag_edit_query_playlist_reload_orphan_and_source_preservation()
         .iter()
         .map(library::CatalogEntry::from_wallpaper)
         .collect();
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let wallpapers = app.wallpapers.clone();
     let _ = update(
         &mut app,
@@ -150,7 +150,7 @@ fn w3_partial_tag_publication_keeps_overlay_until_deliberate_reconciliation() {
 #[test]
 fn w3_config_and_tag_failures_remain_separate_and_refresh_requires_config_success() {
     let mut app = fixture();
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let before = app.config.catalog.local_folders.clone();
     let mut config = app.config.clone();
     config
@@ -166,7 +166,10 @@ fn w3_config_and_tag_failures_remain_separate_and_refresh_requires_config_succes
         ))
     });
     assert_eq!(app.config.catalog.local_folders, before);
-    assert_eq!(app.catalog_generation.load(Ordering::Acquire), generation);
+    assert_eq!(
+        app.catalog_scan_generation.load(Ordering::Acquire),
+        generation
+    );
     edit(&mut app, TagEdit::Text("independent".into()));
     edit(&mut app, TagEdit::Add);
     assert!(app.catalog[0].tags.contains("independent"));
@@ -187,7 +190,7 @@ fn w3_config_and_tag_failures_remain_separate_and_refresh_requires_config_succes
         config.catalog.local_folders
     );
     assert_eq!(
-        app.catalog_generation.load(Ordering::Acquire),
+        app.catalog_scan_generation.load(Ordering::Acquire),
         generation + 1
     );
     assert_eq!(std::fs::read(blocker).unwrap(), b"retain");
@@ -415,7 +418,7 @@ fn w3_old_same_item_drawer_session_cannot_replay_text_add_or_remove() {
 fn w3_config_partial_primary_failure_requires_reconciliation_and_retains_tag_owner() {
     let mut app = fixture();
     let previous = app.config.catalog.local_folders.clone();
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let mut proposed = app.config.clone();
     proposed
         .catalog
@@ -442,7 +445,10 @@ fn w3_config_partial_primary_failure_requires_reconciliation_and_retains_tag_own
     assert!(app.library_config_reconcile);
     assert!(app.status.as_deref().unwrap().contains("reconciliation"));
     assert_eq!(app.config.catalog.local_folders, previous);
-    assert_eq!(app.catalog_generation.load(Ordering::Acquire), generation);
+    assert_eq!(
+        app.catalog_scan_generation.load(Ordering::Acquire),
+        generation
+    );
     app.publish_library_config_using(proposed, |_| {
         panic!("must not republish before reconciliation")
     });
@@ -469,7 +475,7 @@ fn w3_actual_scanner_raw_config_root_and_default_reach_canonical_catalog() {
         .collect();
     let canonical = root.canonicalize().unwrap();
     app.config.catalog.local_folders = vec![raw.clone()];
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let _ = update(
         &mut app,
         Message::Wake(Wake::CatalogLoaded {
@@ -507,7 +513,7 @@ fn w3_catalog_publication_revokes_an_editor_minted_during_the_same_scan_generati
     edit(&mut app, TagEdit::Text("old-scan-body".into()));
     let owner = app.tag_owner().unwrap();
     let before = app.state.clone();
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let wallpapers = app.wallpapers.clone();
     let entries = app.catalog.clone();
     let _ = update(
@@ -544,7 +550,7 @@ fn w3_installed_folder_picker_and_retained_smart_playlist_preserve_raw_intent() 
     let file = item.file_target.clone();
     let entry = library::CatalogEntry::from_wallpaper(&item);
     assert_eq!(entry.folder, ordinary);
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let _ = update(
         &mut app,
         Message::Wake(Wake::CatalogLoaded {

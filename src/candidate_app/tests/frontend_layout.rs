@@ -1921,7 +1921,7 @@ fn w3_owned_drawer_badges_and_library_1080p_1440p() {
                         index,
                         PosterSlot {
                             layer: index as u32,
-                            is_video: item.source == WallpaperSource::LocalVideo,
+                            kind: gallery::poster_kind_for_item(item),
                             generation: app.poster_generation.load(Ordering::Acquire),
                             catalog_generation: app.catalog_generation.load(Ordering::Acquire),
                             item_id: item.id.clone(),
@@ -2053,6 +2053,19 @@ fn dense_real_images_and_recreation(mode: GalleryMode) {
         widget::Tree,
         Layout,
     };
+    thread_local! {
+        static FEEDBACK: std::cell::RefCell<Vec<gpu_gallery::PosterFeedback>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+    fn feedback(message: gpu_gallery::PosterFeedback) {
+        FEEDBACK.with_borrow_mut(|messages| messages.push(message));
+    }
+    let worker =
+        poster_worker::PosterWorker::spawn(Arc::new(std::sync::atomic::AtomicU64::new(0)), |_| {
+            true
+        })
+        .unwrap();
     let output =
         std::path::PathBuf::from(std::env::var_os("P5_LAYOUT_OUTPUT").expect("owned output"));
     let media = output.join("media");
@@ -2116,7 +2129,7 @@ fn dense_real_images_and_recreation(mode: GalleryMode) {
                 *index,
                 PosterSlot {
                     layer: layer as u32,
-                    is_video: false,
+                    kind: crate::poster_worker::PosterKind::Still,
                     generation: 1,
                     catalog_generation: app.catalog_generation.load(Ordering::Acquire),
                     item_id: app.wallpapers[*index].id.clone(),
@@ -2158,37 +2171,113 @@ fn dense_real_images_and_recreation(mode: GalleryMode) {
                 <iced::Renderer as Headless>::new(UI_FONT, iced::Pixels(16.0), Some("wgpu")),
             )
             .unwrap();
-            let mut element: Element<'_, GalleryMessage> = shader(GalleryProgram {
-                snapshot: snapshot.clone(),
-            })
-            .width(Fill)
-            .height(Fill)
-            .into();
-            let size = iced::Size::new(width as f32, height as f32);
-            let bounds = iced::Rectangle::with_size(size);
-            let mut tree = Tree::new(&element);
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(size, size),
-            );
-            renderer.reset(bounds);
-            element.as_widget().draw(
-                &tree,
-                &mut renderer,
-                &iced::Theme::Dark,
-                &iced::advanced::renderer::Style {
-                    text_color: iced::Color::WHITE,
-                },
-                Layout::new(&node),
-                iced::mouse::Cursor::Unavailable,
-                &bounds,
-            );
-            let bytes = Headless::screenshot(
-                &mut renderer,
-                iced::Size::new(width, height),
-                1.0,
-                iced::Color::BLACK,
+            let mut render = |frame: Arc<GallerySnapshot>| {
+                let mut element: Element<'_, GalleryMessage> = shader(GalleryProgram {
+                    prewarm: None,
+                    poster_feedback: Some(feedback),
+                    snapshot: frame,
+                })
+                .width(Fill)
+                .height(Fill)
+                .into();
+                let size = iced::Size::new(width as f32, height as f32);
+                let bounds = iced::Rectangle::with_size(size);
+                let mut tree = Tree::new(&element);
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(size, size),
+                );
+                renderer.reset(bounds);
+                element.as_widget().draw(
+                    &tree,
+                    &mut renderer,
+                    &iced::Theme::Dark,
+                    &iced::advanced::renderer::Style {
+                        text_color: iced::Color::WHITE,
+                    },
+                    Layout::new(&node),
+                    iced::mouse::Cursor::Unavailable,
+                    &bounds,
+                );
+                Headless::screenshot(
+                    &mut renderer,
+                    iced::Size::new(width, height),
+                    1.0,
+                    iced::Color::BLACK,
+                )
+            };
+            if pass == 0 {
+                // Seed eight exact resources before the full snapshot fills the
+                // remaining far tiles. Their original CPU pixels are gone.
+                let mut seed = (*snapshot).clone();
+                seed.posters = Arc::new(
+                    snapshot
+                        .posters
+                        .iter()
+                        // Seed far-only resources; a selected canonical canvas now needs worker mip encoding.
+                        .filter(|poster| {
+                            !snapshot
+                                .cards
+                                .iter()
+                                .any(|card| card.selected && card.layer == Some(poster.layer))
+                        })
+                        .take(8)
+                        .cloned()
+                        .collect(),
+                );
+                let seed = Arc::new(seed);
+                let _ = render(seed.clone());
+                assert!(seed.posters.iter().all(|poster| !poster.has_pixels()));
+                assert!(FEEDBACK.with_borrow_mut(std::mem::take).is_empty());
+            }
+            let mut recovered = 0;
+            let mut frames = 0;
+            let bytes = loop {
+                frames += 1;
+                assert!(frames < 40, "a stable snapshot must finish uploading");
+                let bytes = render(snapshot.clone());
+                let remaining = snapshot.posters.iter().filter(|p| p.has_pixels()).count();
+                let mut redraw = false;
+                for message in FEEDBACK.with_borrow_mut(std::mem::take) {
+                    match message {
+                        gpu_gallery::PosterFeedback::Restore(posters) => {
+                            assert!(
+                                pass == 1
+                                    || posters.iter().all(|(_, encoding)| *encoding
+                                        == gpu_gallery::PosterEncoding::NearRgbaMips),
+                                "first fill may request worker mip encoding only"
+                            );
+                            recovered += posters.len();
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            worker.restore(&snapshot.posters, posters, move || {
+                                tx.send(()).unwrap();
+                            });
+                            rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+                            redraw = true;
+                        }
+                        gpu_gallery::PosterFeedback::Redraw => redraw = true,
+                        gpu_gallery::PosterFeedback::MaintenanceAfter(_) => {}
+                        gpu_gallery::PosterFeedback::Prewarmed { .. } => {
+                            panic!("fixture has no prewarm intent")
+                        }
+                    }
+                }
+                if !redraw {
+                    assert_eq!(remaining, 0);
+                    break bytes;
+                }
+            };
+            // Far tiles fit in one frame; selected canonical pixels need one worker mip-encoding round trip.
+            let near = entries.iter().any(|entry| entry.card.selected);
+            assert_eq!(frames, if pass == 1 || near { 2 } else { 1 });
+            assert_eq!(
+                recovered,
+                if pass == 1 {
+                    snapshot.posters.len() + usize::from(near)
+                } else {
+                    usize::from(near)
+                }
             );
             let samples: HashSet<_> = entries
                 .iter()
@@ -2230,7 +2319,7 @@ fn dense_real_images_and_recreation(mode: GalleryMode) {
                 ::image::ImageFormat::Png,
             )
             .unwrap();
-            receipts.push(serde_json::json!({"width":width,"height":height,"pass":pass,"posters":indices.len(),"distinctImageCenters":samples.len(),"path":path,"source":"production GalleryProgram/material/shader/atlas; real decoded PNGs; new headless device each pass"}));
+            receipts.push(serde_json::json!({"width":width,"height":height,"pass":pass,"posters":indices.len(),"frames":frames,"recovered":recovered,"distinctImageCenters":samples.len(),"path":path,"source":"production GalleryProgram/material/shader/atlas; real decoded PNGs; new headless device each pass"}));
             previous = Some(bytes);
         }
     }

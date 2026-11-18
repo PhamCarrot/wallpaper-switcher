@@ -771,6 +771,7 @@ pub struct GridPlacement {
 /// ownership. All aspect inputs are presentation-only and must be supplied in
 /// filtered order.
 pub fn grid_placements(count: usize, params: &GridParams, aspects: &[f32]) -> Vec<GridPlacement> {
+    layout_work(1, count);
     let cols = params.cols.max(1);
     let mut out = match params.layout {
         GridLayout::Uniform | GridLayout::Brick | GridLayout::Cylinder => (0..count)
@@ -1022,7 +1023,14 @@ fn hex_placements_inner(
     let coarse_margin = viewport[0] + params.item_half_w().hypot(params.item_half_h()) * 2.0;
     let mut placements = Vec::with_capacity(count.min(params.cols.max(1) * rows));
 
-    for col in 0..total_cols {
+    let columns = monotone_window(
+        total_cols,
+        |col| origin.0 - camera + params.column_x(col),
+        -coarse_margin,
+        viewport[0] + coarse_margin,
+    );
+    layout_work(2, columns.len() * rows);
+    for col in columns {
         // beta.24 rebuild_hex omits faded columns from bodies, hits and demand.
         if current.is_some_and(|(_, _, scales)| scales.get(&col).copied().unwrap_or(1.0) <= 0.01) {
             continue;
@@ -1097,6 +1105,62 @@ fn hex_placements_inner(
         }
     }
     placements
+}
+
+/// Binary-search a regularly ordered axis, including reversed and collapsed axes.
+/// Keep the caller's exact predicate after this conservative candidate window.
+pub(crate) fn monotone_window(
+    count: usize,
+    value: impl Fn(usize) -> f32,
+    low: f32,
+    high: f32,
+) -> std::ops::Range<usize> {
+    if count == 0 {
+        return 0..0;
+    }
+    let first = value(0);
+    let last = value(count - 1);
+    if !first.is_finite() || !last.is_finite() || !low.is_finite() || !high.is_finite() {
+        return 0..count;
+    }
+    let reverse = first > last;
+    let (low, high) = if reverse { (-high, -low) } else { (low, high) };
+    let at = |i| if reverse { -value(i) } else { value(i) };
+    let partition = |bound: f32, inclusive: bool| {
+        let (mut left, mut right) = (0, count);
+        while left < right {
+            let mid = left + (right - left) / 2;
+            if if inclusive {
+                at(mid) <= bound
+            } else {
+                at(mid) < bound
+            } {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        left
+    };
+    partition(low, false)..partition(high, true)
+}
+
+static LAYOUT_WORK: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+pub(crate) fn layout_work(kind: usize, count: usize) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED
+        .get_or_init(|| cfg!(test) || std::env::var_os("WALLPAPER_SWITCHER_LAYOUT_TRACE").is_some())
+    {
+        LAYOUT_WORK[kind].fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn layout_work_snapshot() -> [u64; 3] {
+    LAYOUT_WORK
+        .each_ref()
+        .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn smoothstep(value: f32) -> f32 {

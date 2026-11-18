@@ -192,7 +192,7 @@ pub(in crate::candidate_app) fn sync_preview(app: &mut GpuCandidate) -> Task<Mes
     let poster = selected
         .and_then(|index| app.poster_slots.get(&index))
         .filter(|slot| {
-            !slot.is_video
+            slot.kind == crate::poster_worker::PosterKind::Still
                 && slot.item_id == still.item_id
                 && slot.catalog_generation == still.catalog_revision
                 && slot.source == still.path

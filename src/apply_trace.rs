@@ -127,7 +127,7 @@ impl Drop for CpuSpan {
 /// Callers must only request it after confirming that tracing is enabled.
 pub fn next_widget_mouse_sequence() -> u64 {
     WIDGET_MOUSE_SEQUENCE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .expect("widget mouse trace sequence exhausted")

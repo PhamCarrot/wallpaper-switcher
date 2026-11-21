@@ -19,7 +19,7 @@ This inventory includes license files from the Cargo dependency graph resolved f
 | bytes 1.12.1 | MIT | [Registry archive](https://static.crates.io/crates/bytes/bytes-1.12.1.crate) |
 | cfg-if 1.0.5 | MIT OR Apache-2.0 | [Registry archive](https://static.crates.io/crates/cfg-if/cfg-if-1.0.5.crate) |
 | cfg_aliases 0.2.2 | MIT | [Registry archive](https://static.crates.io/crates/cfg_aliases/cfg_aliases-0.2.2.crate) |
-| clipboard-win 5.4.1 | BSL-1.0 | [Registry archive](https://static.crates.io/crates/clipboard-win/clipboard-win-5.4.1.crate) |
+| clipboard-win 5.4.3 | BSL-1.0 | [Registry archive](https://static.crates.io/crates/clipboard-win/clipboard-win-5.4.3.crate) |
 | codespan-reporting 0.12.0 | Apache-2.0 | [Registry archive](https://static.crates.io/crates/codespan-reporting/codespan-reporting-0.12.0.crate) |
 | color_quant 1.1.0 | MIT | [Registry archive](https://static.crates.io/crates/color_quant/color_quant-1.1.0.crate) |
 | core_maths 0.1.1 | MIT | [Registry archive](https://static.crates.io/crates/core_maths/core_maths-0.1.1.crate) |

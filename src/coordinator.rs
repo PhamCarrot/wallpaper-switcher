@@ -134,6 +134,9 @@ pub struct ApplyResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionStatus {
     NotRequested,
+    /// A transition was requested, but the display already shows the requested
+    /// wallpaper, so there is nothing to animate.
+    Unchanged,
     NotAttempted,
     Completed,
     DirectFallback,
@@ -161,6 +164,14 @@ impl TransitionResult {
     pub const fn not_requested() -> Self {
         Self {
             status: TransitionStatus::NotRequested,
+            warnings: Vec::new(),
+            displays: Vec::new(),
+        }
+    }
+
+    const fn unchanged() -> Self {
+        Self {
+            status: TransitionStatus::Unchanged,
             warnings: Vec::new(),
             displays: Vec::new(),
         }
@@ -209,6 +220,7 @@ impl TransitionResult {
     pub fn status_name(&self) -> &'static str {
         match self.status {
             TransitionStatus::NotRequested => "not-requested",
+            TransitionStatus::Unchanged => "unchanged",
             TransitionStatus::NotAttempted => "not-attempted",
             TransitionStatus::Completed => "completed",
             TransitionStatus::DirectFallback => "direct-fallback",
@@ -236,7 +248,9 @@ impl TransitionResult {
             TransitionStatus::PlaybackFailed => {
                 "Wallpaper changed, but its animation did not complete"
             }
-            TransitionStatus::NotRequested | TransitionStatus::Completed => return None,
+            TransitionStatus::NotRequested
+            | TransitionStatus::Unchanged
+            | TransitionStatus::Completed => return None,
         };
         Some(format!("{prefix}: {}", self.warnings.join("; ")))
     }
@@ -2022,31 +2036,20 @@ fn apply_with_outcomes(
     }
 
     match prepare_transition(request, monitors.clone(), context) {
-        Ok(Some(mut prepared)) => {
+        Ok(Some(prepared)) => {
             #[cfg(test)]
             eprintln!("trace: transition prepared");
-            let applied = apply_direct_to_monitors(
-                request,
-                prepared
-                    .outputs
-                    .iter()
-                    .map(|output| output.monitor.clone())
-                    .collect(),
-                context,
-            );
-            outcomes.extend(applied);
             let duration = std::time::Duration::from_millis(request.transition.duration_ms);
             let overlay_windows: Vec<_> = prepared
                 .outputs
                 .iter()
+                .flat_map(|(_, output)| output.as_ref())
                 .map(|output| output.session.window_identity())
                 .collect();
-            let transition = settle_incoming_transitions(
-                &outcomes,
-                prepared
-                    .outputs
-                    .drain(..)
-                    .map(|output| (output.monitor.device_id.clone(), output)),
+            // Every target receives the provider command, in target order.
+            let (applied, transition) = settle_prepared_transition(
+                prepared.outputs,
+                || apply_direct_to_monitors(request, monitors, context),
                 |mut output| {
                     let display = &output.monitor.device_id;
                     if output.incoming.is_none() {
@@ -2073,6 +2076,7 @@ fn apply_with_outcomes(
                 },
                 |playable| play_synchronized(playable, effect, duration),
             );
+            outcomes.extend(applied);
             return (order_outcomes(outcomes), transition);
         }
         Ok(None) => {
@@ -2083,10 +2087,6 @@ fn apply_with_outcomes(
                     "the transition surface was unavailable; no animation was attempted",
                 ),
             );
-        }
-        Err(error) if error.contains(SAME_WALLPAPER_REAPPLY) => {
-            outcomes.extend(apply_direct_to_monitors(request, monitors, context));
-            return (order_outcomes(outcomes), TransitionResult::not_requested());
         }
         Err(error) => {
             crate::log_debug(&format!(
@@ -2105,6 +2105,45 @@ fn apply_with_outcomes(
 fn apply(request: ApplyRequest) -> Result<(), String> {
     let result = run_operation(request);
     result.error_message().map_or(Ok(()), Err)
+}
+
+/// Dispatches every target, then animates the displays whose wallpaper changes.
+/// `None` marks a display that already shows the requested wallpaper; it has
+/// nothing to animate and reports `Unchanged` without a warning.
+fn settle_prepared_transition<T>(
+    targets: Vec<(String, Option<T>)>,
+    dispatch: impl FnOnce() -> Vec<MonitorApplyOutcome>,
+    capture: impl FnMut(T) -> Result<T, String>,
+    play: impl FnOnce(&mut [T]) -> Vec<PlaybackProgress>,
+) -> (Vec<MonitorApplyOutcome>, TransitionResult) {
+    let providers = dispatch();
+    let (changed, unchanged): (Vec<_>, Vec<_>) = targets
+        .into_iter()
+        .partition(|(_, output)| output.is_some());
+    if changed.is_empty() {
+        return (providers, TransitionResult::unchanged());
+    }
+    let mut transition = settle_incoming_transitions(
+        &providers,
+        changed
+            .into_iter()
+            .filter_map(|(display, output)| Some((display, output?))),
+        capture,
+        play,
+    );
+    transition
+        .displays
+        .extend(
+            unchanged
+                .into_iter()
+                .map(|(display_id, _)| DisplayTransitionOutcome {
+                    display_id,
+                    status: TransitionStatus::Unchanged,
+                    intermediate_submitted: false,
+                    error: None,
+                }),
+        );
+    (providers, transition)
 }
 
 fn settle_incoming_transitions<T>(
@@ -2335,7 +2374,9 @@ fn next_random_sample(state: &std::sync::atomic::AtomicU64, seed: u64) -> u64 {
 }
 
 struct PreparedTransition {
-    outputs: Vec<PreparedOutput>,
+    // One slot per target in target order; `None` when the display already
+    // shows the requested wallpaper.
+    outputs: Vec<(String, Option<PreparedOutput>)>,
 }
 
 struct PreparedOutput {
@@ -2345,16 +2386,13 @@ struct PreparedOutput {
     outgoing_fingerprint: engine_capture::FrameFingerprint,
 }
 
-// Re-applying the wallpaper already on screen has no visible change to animate.
-const SAME_WALLPAPER_REAPPLY: &str = "the requested wallpaper is already on this display";
-
 fn outgoing_frame(
     operation_id: OperationId,
     monitor: &native_wallpaper::NativeMonitor,
     context: &ApplyContext,
     overlay_windows: &[usize],
     requested: &std::path::Path,
-) -> Result<FrozenFrame, String> {
+) -> Result<Option<FrozenFrame>, String> {
     crate::apply_trace::event(
         "outgoing-capture-start",
         format!(
@@ -2366,11 +2404,18 @@ fn outgoing_frame(
     );
     let result = outgoing_frame_inner(operation_id, monitor, context, overlay_windows, requested);
     match &result {
-        Ok(frame) => crate::apply_trace::event(
+        Ok(Some(frame)) => crate::apply_trace::event(
             "outgoing-capture-complete",
             format!(
                 "display={:?} width={} height={}",
                 monitor.device_id, frame.width, frame.height
+            ),
+        ),
+        Ok(None) => crate::apply_trace::event(
+            "outgoing-capture-skipped",
+            format!(
+                "display={:?} reason=\"requested wallpaper already shown\"",
+                monitor.device_id
             ),
         ),
         Err(error) => crate::apply_trace::event(
@@ -2387,7 +2432,7 @@ fn outgoing_frame_inner(
     context: &ApplyContext,
     overlay_windows: &[usize],
     requested: &std::path::Path,
-) -> Result<FrozenFrame, String> {
+) -> Result<Option<FrozenFrame>, String> {
     match engine_ipc::availability() {
         engine_ipc::EngineAvailability::ControlAvailable => {
             let location = context.engine_location_for_device(&monitor.device_id)?;
@@ -2400,8 +2445,10 @@ fn outgoing_frame_inner(
                         .adequate_for(&EngineTarget::bound(&monitor.device_id, &location))
                         .is_ok() =>
                 {
+                    // Re-applying the wallpaper already on screen has no
+                    // visible change to animate.
                     if engine_ipc::same_engine_project(requested, current) {
-                        return Err(SAME_WALLPAPER_REAPPLY.into());
+                        return Ok(None);
                     }
                     let endpoint = endpoint
                         .ok_or("Wallpaper Engine did not confirm an outgoing capture owner")?;
@@ -2413,7 +2460,8 @@ fn outgoing_frame_inner(
                         endpoint,
                         overlay_windows,
                         None,
-                    );
+                    )
+                    .map(Some);
                 }
                 EngineObservationState::ConfirmedAbsent
                     if observation
@@ -2438,6 +2486,7 @@ fn outgoing_frame_inner(
     }
     let outgoing_path = native_wallpaper::get_wallpaper_for_device(&monitor.device_id)?;
     FrozenFrame::from_path_cover(&outgoing_path, monitor.rect.width(), monitor.rect.height())
+        .map(Some)
 }
 
 fn prepare_transition(
@@ -2450,7 +2499,7 @@ fn prepare_transition(
     for monitor in targets {
         #[cfg(test)]
         eprintln!("trace: capturing outgoing frame");
-        let outgoing = outgoing_frame(
+        let Some(outgoing) = outgoing_frame(
             request.operation_id,
             &monitor,
             context,
@@ -2462,7 +2511,11 @@ fn prepare_transition(
                 "{}: outgoing frame unavailable ({error})",
                 monitor.device_id
             )
-        })?;
+        })?
+        else {
+            outputs.push((monitor.device_id, None));
+            continue;
+        };
         let incoming = match request.wallpaper.source {
             WallpaperSource::LocalImage => {
                 crate::apply_trace::event(
@@ -2523,12 +2576,15 @@ fn prepare_transition(
             )
         });
         overlay_windows.push(session.window_identity());
-        outputs.push(PreparedOutput {
-            monitor,
-            session,
-            incoming,
-            outgoing_fingerprint,
-        });
+        outputs.push((
+            monitor.device_id.clone(),
+            Some(PreparedOutput {
+                monitor,
+                session,
+                incoming,
+                outgoing_fingerprint,
+            }),
+        ));
     }
     Ok(Some(PreparedTransition { outputs }))
 }
@@ -4944,6 +5000,79 @@ mod contract_tests {
         );
         assert_eq!(receipt.status, TransitionStatus::NotAttempted);
         assert_eq!(providers[1].state, ApplyOperationState::Unknown);
+    }
+
+    #[test]
+    fn same_wallpaper_skips_animation_only_when_every_target_already_shows_it() {
+        // `None` marks a display that already shows the requested wallpaper.
+        for (case, slots, animated) in [
+            ("none-same", [Some(0), Some(1)], vec![0, 1]),
+            ("mixed", [Some(0), None], vec![0]),
+            ("all-same", [None, None], vec![]),
+        ] {
+            let targets: Vec<(String, Option<usize>)> = ["display-a", "display-b"]
+                .into_iter()
+                .map(String::from)
+                .zip(slots)
+                .collect();
+            let mut dispatched = false;
+            let mut presented = Vec::new();
+            let (providers, transition) = settle_prepared_transition(
+                targets,
+                || {
+                    dispatched = true;
+                    vec![
+                        confirmed_outcome("display-a".into()),
+                        confirmed_outcome("display-b".into()),
+                    ]
+                },
+                Ok,
+                |outputs| {
+                    presented.extend_from_slice(outputs);
+                    outputs
+                        .iter()
+                        .map(|_| PlaybackProgress {
+                            intermediate_submitted: true,
+                            final_submitted: true,
+                            error: None,
+                        })
+                        .collect()
+                },
+            );
+            assert!(
+                dispatched,
+                "{case}: every target receives the provider command"
+            );
+            assert!(
+                providers
+                    .iter()
+                    .all(|outcome| outcome.state == ApplyOperationState::ProviderConfirmed),
+                "{case}: provider confirmation is untouched"
+            );
+            assert_eq!(presented, animated, "{case}: animated displays");
+            assert_eq!(transition.warning_message(), None, "{case}: no warning");
+            if animated.is_empty() {
+                assert_eq!(transition.status, TransitionStatus::Unchanged, "{case}");
+                assert_eq!(transition.status_name(), "unchanged");
+                continue;
+            }
+            assert_eq!(transition.status, TransitionStatus::Completed, "{case}");
+            for (display, slot) in ["display-a", "display-b"].into_iter().zip(slots) {
+                let animation = transition
+                    .displays
+                    .iter()
+                    .find(|item| item.display_id == display)
+                    .unwrap_or_else(|| panic!("{case}: {display} has a transition outcome"));
+                let expected =
+                    slot.map_or(TransitionStatus::Unchanged, |_| TransitionStatus::Completed);
+                assert_eq!(animation.status, expected, "{case}: {display}");
+                assert_eq!(animation.error, None, "{case}: {display}");
+            }
+        }
+        assert_ne!(
+            TransitionResult::unchanged().status_name(),
+            TransitionResult::not_requested().status_name()
+        );
     }
 
     #[test]

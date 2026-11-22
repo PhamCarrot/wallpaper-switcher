@@ -11,6 +11,9 @@ use crate::scanner::{WallpaperItem, WallpaperSource};
 use crate::transition::{TransitionConfig, TransitionEffect};
 
 const APPLY_FLAG: &str = "--diagnostic-apply";
+// Settled evidence for the live matrix: how long after playback the desktop is
+// fingerprinted again, to compare with the captured incoming frame.
+const SETTLED_CAPTURE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const TARGET_FLAG: &str = "--diagnostic-target";
 const TRANSITION_FLAG: &str = "--diagnostic-transition";
 
@@ -275,11 +278,16 @@ where
             "Diagnostic Apply requires --diagnostic-transition <off|random|catalog effect>",
         ));
     };
-    // Every catalog effect is reachable so the live matrix can use this harness;
-    // migrated legacy names stay out because they do not name the played effect.
-    let transition = match TransitionEffect::parse_saved(&transition) {
-        Ok(parsed) if parsed.migration.is_none() => parsed.effect,
-        _ => {
+    // Every catalog effect is reachable so the live matrix can use this harness.
+    // Only exact keys are accepted, so the recorded name is the played effect;
+    // display names and legacy aliases stay out.
+    let transition = match std::iter::once(TransitionEffect::Off)
+        .chain(std::iter::once(TransitionEffect::Random))
+        .chain(crate::transition::TRANSITION_CATALOG)
+        .find(|effect| effect.key() == transition)
+    {
+        Some(effect) => effect,
+        None => {
             return DiagnosticInvocation::Invalid(DiagnosticApplyOutput::invalid(
                 Some(target.requested_name()),
                 Some(wallpaper_path.to_string_lossy().into_owned()),
@@ -347,6 +355,10 @@ pub fn run(request: DiagnosticRequest) -> DiagnosticApplyOutput {
         effect: request.transition,
         duration_ms: TransitionConfig::default().duration_ms,
     };
+    let engine_rendered = matches!(
+        wallpaper.source,
+        WallpaperSource::WallpaperEngine | WallpaperSource::LocalVideo
+    );
     let (finished_tx, finished_rx) = mpsc::sync_channel(1);
     let coordinator = WallpaperCoordinator::spawn(move |result| {
         let _ = finished_tx.send(result);
@@ -387,7 +399,16 @@ pub fn run(request: DiagnosticRequest) -> DiagnosticApplyOutput {
     );
 
     let output = match execution {
-        Ok((_, result)) => DiagnosticApplyOutput::from_apply_result(&request, result),
+        Ok((_, result)) => {
+            // Trace-only and Diagnostic-Apply-only; normal Apply never waits here.
+            if crate::apply_trace::enabled() && engine_rendered {
+                let operation = result.operation_id.get();
+                record_settled_frames(operation, &result.outcomes, std::thread::sleep, |display| {
+                    settled_capture(operation, display)
+                });
+            }
+            DiagnosticApplyOutput::from_apply_result(&request, result)
+        }
         Err((Some(operation_id), error)) => {
             DiagnosticApplyOutput::after_submission(&request, operation_id, error)
         }
@@ -402,6 +423,63 @@ pub fn run(request: DiagnosticRequest) -> DiagnosticApplyOutput {
         output.error
     ));
     output
+}
+
+/// Fingerprints each confirmed display once the new wallpaper has settled and
+/// records it in the apply trace. Returns the recorded trace details.
+fn record_settled_frames(
+    operation: u64,
+    outcomes: &[MonitorApplyOutcome],
+    sleep: impl FnOnce(std::time::Duration),
+    mut capture: impl FnMut(&str) -> Result<crate::transition::FrozenFrame, String>,
+) -> Vec<String> {
+    let confirmed: Vec<_> = outcomes
+        .iter()
+        .filter(|outcome| outcome.state == ApplyOperationState::ProviderConfirmed)
+        .collect();
+    if confirmed.is_empty() {
+        return Vec::new();
+    }
+    sleep(SETTLED_CAPTURE_DELAY);
+    confirmed
+        .into_iter()
+        .map(|outcome| {
+            let captured = capture(&outcome.target_id)
+                .map(|frame| crate::engine_capture::FrameFingerprint::of(&frame));
+            let details = format!(
+                "display={:?} delay_ms={} {}",
+                outcome.target_id,
+                SETTLED_CAPTURE_DELAY.as_millis(),
+                match captured {
+                    Ok(fingerprint) => format!("fingerprint={fingerprint}"),
+                    Err(error) => format!("error={error:?}"),
+                }
+            );
+            crate::apply_trace::event_for(operation, "transition-settled-capture", &details);
+            details
+        })
+        .collect()
+}
+
+/// Read-only capture of a display through the existing capture worker.
+fn settled_capture(
+    operation: u64,
+    display: &str,
+) -> Result<crate::transition::FrozenFrame, String> {
+    let monitor = crate::native_wallpaper::monitors()?
+        .into_iter()
+        .find(|monitor| monitor.device_id.eq_ignore_ascii_case(display))
+        .ok_or("the display is no longer available")?;
+    let endpoint = crate::engine_ipc::control_window_identity()?;
+    crate::engine_capture::capture_for_apply(
+        monitor.rect,
+        operation,
+        display,
+        "settled",
+        endpoint,
+        &[],
+        None,
+    )
 }
 
 fn resolve_diagnostic_wallpaper(reference: &Path) -> Result<WallpaperItem, String> {
@@ -572,7 +650,14 @@ mod tests {
             assert_eq!(request.transition, expected);
         }
 
-        for rejected in ["sand", "definitely-not-an-effect"] {
+        for rejected in [
+            "sand",
+            "definitely-not-an-effect",
+            "none",
+            "wipe",
+            "ripple",
+            TransitionEffect::WipeLeft.display_name(),
+        ] {
             let DiagnosticInvocation::Invalid(output) =
                 parse_with_existing_path(&valid_args(rejected))
             else {
@@ -644,6 +729,67 @@ mod tests {
         );
         assert_eq!(value["confirmation_state"], "provider-confirmed");
         assert!(value["error"].is_null());
+    }
+
+    #[test]
+    fn settled_capture_records_a_fingerprint_for_each_confirmed_display() {
+        let outcomes = vec![
+            MonitorApplyOutcome {
+                target_id: "display-a".into(),
+                state: ApplyOperationState::ProviderConfirmed,
+                error: None,
+            },
+            MonitorApplyOutcome {
+                target_id: "display-b".into(),
+                state: ApplyOperationState::Unknown,
+                error: Some("no independent confirmation".into()),
+            },
+            MonitorApplyOutcome {
+                target_id: "display-c".into(),
+                state: ApplyOperationState::ProviderConfirmed,
+                error: None,
+            },
+        ];
+        let frame = crate::transition::FrozenFrame {
+            width: 8,
+            height: 4,
+            rgba: (0..32u8)
+                .flat_map(|value| [value * 8, value * 8, value * 8, 255])
+                .collect(),
+        };
+        let expected = crate::engine_capture::FrameFingerprint::of(&frame).to_string();
+        let mut slept = None;
+        let mut captured = Vec::new();
+        let details = record_settled_frames(
+            51,
+            &outcomes,
+            |delay| slept = Some(delay),
+            |display| {
+                captured.push(display.to_string());
+                if display == "display-c" {
+                    Err("presenter changed".into())
+                } else {
+                    Ok(frame.clone())
+                }
+            },
+        );
+        assert_eq!(slept, Some(SETTLED_CAPTURE_DELAY));
+        assert_eq!(captured, ["display-a", "display-c"]);
+        assert_eq!(
+            details,
+            [
+                format!("display=\"display-a\" delay_ms=1000 fingerprint={expected}"),
+                "display=\"display-c\" delay_ms=1000 error=\"presenter changed\"".to_string(),
+            ]
+        );
+
+        assert!(record_settled_frames(
+            51,
+            &outcomes[1..2],
+            |_| panic!("nothing to settle"),
+            |_| panic!("nothing to capture")
+        )
+        .is_empty());
     }
 
     #[test]

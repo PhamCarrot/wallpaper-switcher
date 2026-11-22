@@ -540,10 +540,26 @@ mod tests {
         }
     }
 
+    // 99.9% residual limit: about twice the largest measured value (Warp 0.130,
+    // Pixelate 0.088 on 23 November). The pre-8d659f5 Pixelate left 2.1–2.4.
+    const MAX_LATE_RESIDUAL: f32 = 0.26;
+    // No pixel may be visibly revealed at the first frame.
+    const MAX_FIRST_FRAME_MASK: f32 = 0.02;
+    // Smallest mid-frame difference between two catalog effects. Iris/Diamond
+    // measured 1.138 at 21:9 (closest by design); identical styles give 0.
+    const MIN_MID_FRAME_DIFFERENCE: f32 = 0.5;
+
     #[test]
     fn every_catalog_effect_completes_moves_and_keeps_its_landmarks() {
         let replay = Replay::new();
         let steps = [0.0, 0.001, 0.1, 0.25, 0.5, 0.75, 0.9, 0.999, 1.0];
+        // Collect every failed guard so one run reports all of them.
+        let mut failures = Vec::new();
+        let mut check = |passed: bool, message: String| {
+            if !passed {
+                failures.push(message);
+            }
+        };
         for (width, height) in [(160u32, 90u32), (210, 90)] {
             let (outgoing, incoming) = (
                 patterned(width, height, false),
@@ -572,37 +588,53 @@ mod tests {
                     .count() as f32
                     / (width * height) as f32
             };
+            let difference = |a: &[u8], b: &[u8]| {
+                a.iter()
+                    .zip(b)
+                    .map(|(a, b)| f32::from(a.abs_diff(*b)))
+                    .sum::<f32>()
+                    / a.len() as f32
+            };
+            let mut mid_frames = Vec::new();
             for effect in TRANSITION_CATALOG {
                 let frames: Vec<_> = steps
                     .iter()
                     .map(|progress| replay.render(&outgoing, &incoming, effect, *progress))
                     .collect();
                 let name = format!("{effect:?} at {width}x{height}");
-                assert_eq!(frames[0], outgoing.rgba, "{name} start frame");
-                assert_eq!(frames[8], incoming.rgba, "{name} final frame");
-                assert!(
-                    fraction(&frames[1], &|mask| mask > 0.5) <= 0.005,
-                    "{name} jumps at the first frame"
+                check(frames[0] == outgoing.rgba, format!("{name} start frame"));
+                check(frames[8] == incoming.rgba, format!("{name} final frame"));
+                let jump = fraction(&frames[1], &|mask| mask > 0.5);
+                check(
+                    jump <= 0.005,
+                    format!("{name} jumps at the first frame: {jump}"),
                 );
-                assert!(
-                    fraction(&frames[7], &|mask| mask < 0.98) <= 0.005,
-                    "{name} snaps at the final frame"
+                let first_max = frames[1]
+                    .chunks_exact(4)
+                    .map(|pixel| f32::from(pixel[2]) / 255.0)
+                    .fold(0.0, f32::max);
+                check(
+                    first_max <= MAX_FIRST_FRAME_MASK,
+                    format!("{name} partially reveals at the first frame: max mask {first_max}"),
+                );
+                let unfinished = fraction(&frames[7], &|mask| mask < 0.98);
+                check(
+                    unfinished <= 0.005,
+                    format!("{name} snaps at the final frame: {unfinished}"),
                 );
                 let means: Vec<f32> = frames.iter().map(|f| mean_where(f, &|_, _| true)).collect();
-                assert!(means[3] >= 0.02, "{name} barely moves by 25%: {means:?}");
-                assert!(
-                    means.windows(2).all(|pair| pair[1] >= pair[0] - 0.02),
-                    "{name} reverses: {means:?}"
+                check(
+                    means[3] >= 0.02,
+                    format!("{name} barely moves by 25%: {means:?}"),
                 );
-                let residual = frames[7]
-                    .iter()
-                    .zip(&incoming.rgba)
-                    .map(|(a, b)| f32::from(a.abs_diff(*b)))
-                    .sum::<f32>()
-                    / frames[7].len() as f32;
-                assert!(
-                    residual <= 2.0,
-                    "{name} distortion remains at 99.9%: {residual}"
+                check(
+                    means.windows(2).all(|pair| pair[1] >= pair[0] - 0.02),
+                    format!("{name} reverses: {means:?}"),
+                );
+                let residual = difference(&frames[7], &incoming.rgba);
+                check(
+                    residual <= MAX_LATE_RESIDUAL,
+                    format!("{name} distortion remains at 99.9%: {residual}"),
                 );
 
                 let quarter = &frames[3];
@@ -615,23 +647,43 @@ mod tests {
                 let top = |_: f32, v: f32| v < 0.5;
                 let bottom = |_: f32, v: f32| v >= 0.5;
                 let lead = match effect {
-                    TransitionEffect::WipeLeft | TransitionEffect::Wave => side(&left, &right),
-                    TransitionEffect::WipeRight => side(&right, &left),
-                    TransitionEffect::WipeUp | TransitionEffect::Checker => side(&top, &bottom),
-                    TransitionEffect::WipeDown => side(&bottom, &top),
+                    TransitionEffect::WipeLeft | TransitionEffect::Wave => {
+                        Some(side(&left, &right))
+                    }
+                    TransitionEffect::WipeRight => Some(side(&right, &left)),
+                    TransitionEffect::WipeUp | TransitionEffect::Checker => {
+                        Some(side(&top, &bottom))
+                    }
+                    TransitionEffect::WipeDown => Some(side(&bottom, &top)),
                     TransitionEffect::Iris
                     | TransitionEffect::Ring
                     | TransitionEffect::Diamond
                     | TransitionEffect::Circle
                     | TransitionEffect::Kaleidoscope
-                    | TransitionEffect::ChromaticRipple => {
+                    | TransitionEffect::ChromaticRipple => Some(
                         mean_where(half, &|u, v| (u - 0.5).abs() < 0.1 && (v - 0.5).abs() < 0.1)
-                            - mean_where(half, &|u, v| u < 0.1 || u > 0.9 || v < 0.1 || v > 0.9)
-                    }
-                    _ => continue,
+                            - mean_where(half, &|u, v| u < 0.1 || u > 0.9 || v < 0.1 || v > 0.9),
+                    ),
+                    _ => None,
                 };
-                assert!(lead > 0.2, "{name} landmark lead {lead}");
+                if let Some(lead) = lead {
+                    check(lead > 0.2, format!("{name} landmark lead {lead}"));
+                }
+                mid_frames.push((effect, frames.into_iter().nth(4).unwrap()));
+            }
+            // Two styles rendering alike points at a duplicated or swapped index.
+            for (index, (first, first_frame)) in mid_frames.iter().enumerate() {
+                for (second, second_frame) in &mid_frames[index + 1..] {
+                    let distance = difference(first_frame, second_frame);
+                    check(
+                        distance >= MIN_MID_FRAME_DIFFERENCE,
+                        format!(
+                            "{first:?} and {second:?} render alike at 50% ({width}x{height}): {distance}"
+                        ),
+                    );
+                }
             }
         }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }

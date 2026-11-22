@@ -1333,16 +1333,16 @@ fn capture_frame_on_worker(
     let mut graphics = None;
 
     let started = Instant::now();
-    let mut attempts = 0usize;
-    let mut repeated = (String::new(), 0u32);
-    wait_for_presenter(capture_deadline, || {
-        let attempt = (|| {
+    let (frame, presenter, attempts) = retry_capture(
+        capture_deadline,
+        details,
+        started,
+        |attempt| {
             record_stage(
                 progress,
                 "checking the verified Engine presenter and display",
             );
-            let log_candidates = attempts.is_multiple_of(8);
-            attempts += 1;
+            let log_candidates = attempt.is_multiple_of(8);
             let window = match current_capture_window(target, details, log_candidates)? {
                 PresenterAttempt::Ready(window) => window,
                 PresenterAttempt::Retry(reason) => return Ok(PresenterAttempt::Retry(reason)),
@@ -1378,33 +1378,57 @@ fn capture_frame_on_worker(
                         "Wallpaper Engine's frame exceeded the capture deadline".into(),
                     ));
                 }
-                if let PresenterAttempt::Ready(frame) = &frame {
-                    // Provider confirmation precedes the new presenter's first
-                    // frame; keep waiting within the budget for fresh pixels.
-                    if let Some(reason) = details
-                        .outgoing
-                        .as_ref()
-                        .and_then(|outgoing| incoming_frame_is_stale(frame, outgoing))
-                    {
-                        return Ok(PresenterAttempt::Retry(reason));
-                    }
-                    crate::apply_trace::event_lazy("transition-engine-capture-frame", || {
-                        format!(
-                            "display={:?} phase={} attempts={attempts} elapsed_ms={} fingerprint={} visible_detail={} subtree={:?}",
-                            details.display,
-                            details.phase,
-                            started.elapsed().as_millis(),
-                            FrameFingerprint::of(frame),
-                            has_visible_detail(&frame.rgba),
-                            subtree_summary(window.presenter),
-                        )
-                    });
-                }
             }
-            Ok(frame)
-        })();
-        if let Ok(PresenterAttempt::Retry(reason)) = &attempt {
-            record_stage(progress, reason.clone());
+            Ok(match frame {
+                PresenterAttempt::Ready(frame) => {
+                    PresenterAttempt::Ready((frame, window.presenter))
+                }
+                PresenterAttempt::Retry(reason) => PresenterAttempt::Retry(reason),
+            })
+        },
+    )?;
+    crate::apply_trace::event_lazy("transition-engine-capture-frame", || {
+        format!(
+            "display={:?} phase={} attempts={attempts} elapsed_ms={} fingerprint={} visible_detail={} subtree={:?}",
+            details.display,
+            details.phase,
+            started.elapsed().as_millis(),
+            FrameFingerprint::of(&frame),
+            has_visible_detail(&frame.rgba),
+            subtree_summary(presenter),
+        )
+    });
+    Ok(frame)
+}
+
+/// Retry policy around one capture's native readback attempts. An incoming
+/// frame that still looks like the outgoing wallpaper retries until the
+/// deadline; a structural refusal that repeats unchanged ends the capture.
+/// Returns the frame, the attempt's companion value and the attempt count.
+fn retry_capture<T>(
+    deadline: Instant,
+    details: &ApplyCapture,
+    started: Instant,
+    mut attempt: impl FnMut(usize) -> Result<PresenterAttempt<(FrozenFrame, T)>, String>,
+) -> Result<(FrozenFrame, T, usize), String> {
+    let mut attempts = 0usize;
+    let mut repeated = (String::new(), 0u32);
+    wait_for_presenter(deadline, || {
+        let mut result = attempt(attempts);
+        attempts += 1;
+        if let Ok(PresenterAttempt::Ready((frame, _))) = &result {
+            // Provider confirmation precedes the new presenter's first
+            // frame; keep waiting within the budget for fresh pixels.
+            if let Some(reason) = details
+                .outgoing
+                .as_ref()
+                .and_then(|outgoing| incoming_frame_is_stale(frame, outgoing))
+            {
+                result = Ok(PresenterAttempt::Retry(reason));
+            }
+        }
+        if let Ok(PresenterAttempt::Retry(reason)) = &result {
+            record_stage(&details.progress, reason.clone());
             if *reason == repeated.0 {
                 repeated.1 += 1;
             } else {
@@ -1425,7 +1449,12 @@ fn capture_frame_on_worker(
                 ));
             }
         }
-        attempt
+        result.map(|ready| match ready {
+            PresenterAttempt::Ready((frame, companion)) => {
+                PresenterAttempt::Ready((frame, companion, attempts))
+            }
+            PresenterAttempt::Retry(reason) => PresenterAttempt::Retry(reason),
+        })
     })
 }
 
@@ -1794,6 +1823,95 @@ mod presenter_tests {
         assert!(!is_permanent_refusal(
             "No rendered Wallpaper Engine window covers the target monitor"
         ));
+    }
+
+    #[test]
+    fn retry_loop_ends_unchanged_structure_and_waits_for_a_fresh_incoming_frame() {
+        let gradient = |mirrored: bool| {
+            let (width, height) = (64u32, 36u32);
+            let mut rgba = Vec::new();
+            for _ in 0..height {
+                for x in 0..width {
+                    let value = (x * 4) as u8;
+                    let value = if mirrored { 255 - value } else { value };
+                    rgba.extend([value, value, value, 255]);
+                }
+            }
+            FrozenFrame {
+                width,
+                height,
+                rgba,
+            }
+        };
+        let outgoing = gradient(false);
+        let details = ApplyCapture {
+            operation: 0,
+            display: "test-display".into(),
+            phase: "incoming",
+            endpoint: (0, 0),
+            overlay_windows: Vec::new(),
+            progress: Arc::default(),
+            outgoing: Some(FrameFingerprint::of(&outgoing)),
+        };
+        let structural = |detail: &str| {
+            format!("PrintWindow presenter child hwnd=0x1: destination contains unwritten pixels; WorkerW unavailable: {detail}")
+        };
+        // Runs the policy with scripted attempts; returns the result, the
+        // number of attempts and the elapsed time.
+        let run =
+            |budget: Duration, script: &dyn Fn(usize) -> PresenterAttempt<(FrozenFrame, ())>| {
+                let started = Instant::now();
+                let mut calls = 0;
+                let result = retry_capture(started + budget, &details, started, |attempt| {
+                    calls += 1;
+                    Ok(script(attempt))
+                });
+                (result, calls, started.elapsed())
+            };
+
+        let visible = structural("WorkerW contains another visible window");
+        let (result, calls, elapsed) = run(Duration::from_secs(5), &|_| {
+            PresenterAttempt::Retry(visible.clone())
+        });
+        let error = result.err().unwrap();
+        assert!(error.ends_with("(unchanged after 3 attempts)"), "{error}");
+        assert_eq!(calls, PERMANENT_REFUSAL_ATTEMPTS as usize);
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+
+        let budget = Duration::from_millis(300);
+        let icons = structural("WorkerW contains icons");
+        let (result, calls, elapsed) = run(budget, &|attempt| {
+            PresenterAttempt::Retry(if attempt % 2 == 0 {
+                visible.clone()
+            } else {
+                icons.clone()
+            })
+        });
+        let error = result.err().unwrap();
+        assert!(!error.contains("unchanged after"), "{error}");
+        assert!(calls > 3 && elapsed >= budget, "{calls} {elapsed:?}");
+
+        let replaced = structural("WorkerW no longer contains the selected presenter");
+        let (result, calls, elapsed) = run(budget, &|_| PresenterAttempt::Retry(replaced.clone()));
+        let error = result.err().unwrap();
+        assert!(!error.contains("unchanged after"), "{error}");
+        assert!(calls > 3 && elapsed >= budget, "{calls} {elapsed:?}");
+
+        let (result, calls, elapsed) =
+            run(budget, &|_| PresenterAttempt::Ready((outgoing.clone(), ())));
+        let error = result.err().unwrap();
+        assert!(
+            error.contains("still matches the outgoing wallpaper"),
+            "{error}"
+        );
+        assert!(calls > 3 && elapsed >= budget, "{calls} {elapsed:?}");
+
+        let (result, calls, _) = run(Duration::from_secs(5), &|attempt| {
+            PresenterAttempt::Ready((gradient(attempt >= 4), ()))
+        });
+        let (frame, (), attempts) = result.unwrap();
+        assert_eq!(frame.rgba, gradient(true).rgba);
+        assert_eq!((calls, attempts), (5, 5));
     }
 
     #[test]

@@ -139,8 +139,10 @@ float4 PSMain(FullOutput input) : SV_Target
         mask = step(0.02 + hash21(floor(uv * float2(20.0, 12.0))) * 0.96, progress);
     else if (effect == 14)
     {
+        // Lower edges start no earlier than the travel (-0.05), so no cell is
+        // revealed at the first frame; travel ends past the corner's upper edge.
         float2 cell = frac(uv * 14.0) - 0.5;
-        mask = smoothstep(length(cell) + hash21(floor(uv * 14.0)) * 0.25 - 0.18,
+        mask = smoothstep(max(length(cell) + hash21(floor(uv * 14.0)) * 0.25 - 0.18, -0.05),
                           length(cell) + 0.12, lerp(-0.05, 0.83, progress));
     }
     else if (effect == 15)

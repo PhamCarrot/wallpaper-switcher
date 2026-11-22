@@ -195,7 +195,6 @@ fn pk01_source_mtime_still_video_engine_project_missing_and_whole_seconds() {
     fs::create_dir_all(&root).unwrap();
     let path = root.join("image.png");
     image::RgbImage::new(2, 2).save(&path).unwrap();
-    let mut item = crate::scanner::local_image_item(&path).unwrap();
     let time = SystemTime::UNIX_EPOCH + Duration::from_millis(123456);
     fs::File::options()
         .write(true)
@@ -203,7 +202,24 @@ fn pk01_source_mtime_still_video_engine_project_missing_and_whole_seconds() {
         .unwrap()
         .set_modified(time)
         .unwrap();
+    let mut item = crate::scanner::local_image_item(&path).unwrap();
     assert_eq!(super::super::source_modified_unix(&item), 123);
+    let file = fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(456))
+        .unwrap();
+    assert_eq!(
+        super::super::source_modified_unix(&item),
+        123,
+        "a captured scan keeps its timestamp"
+    );
+    assert_eq!(
+        super::super::source_modified_unix(&crate::scanner::local_image_item(&path).unwrap()),
+        456,
+        "a fresh scan captures changed time"
+    );
+    // The following source/path mutations are synthetic; preserve the live-read fallback contract.
+    item.scan_metadata = None;
+    file.set_modified(time).unwrap();
     item.source = crate::scanner::WallpaperSource::LocalVideo;
     item.wallpaper_type = "video".into();
     assert_eq!(super::super::source_modified_unix(&item), 123);

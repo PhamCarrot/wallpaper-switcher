@@ -9,7 +9,7 @@ pub use map::InputMap;
 pub use nav_keys::NavKeys;
 pub use trigger::{
     binding_config, binding_label, parse_binding, slot_triggers, with_slot, KeyId, KeySpec, Mods,
-    MouseButton, MouseSpec, Trigger, SLOTS,
+    MouseButton, MouseSpec, Trigger, WheelDirection, WheelSpec, SLOTS,
 };
 
 #[cfg(test)]

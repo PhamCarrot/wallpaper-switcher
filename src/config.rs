@@ -494,6 +494,13 @@ pub struct Config {
     pub catalog: CatalogConfig,
     #[serde(default)]
     pub slideshow: SlideshowConfig,
+    /// Overrides the shared on-disk cache cap when greater than zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_max_mib: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poster_decode_threads: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_scan_threads: Option<u8>,
     #[serde(default)]
     pub transition: TransitionConfig,
     #[serde(default)]
@@ -522,6 +529,9 @@ impl Default for Config {
             behavior: BehaviorConfig::default(),
             catalog: CatalogConfig::default(),
             slideshow: SlideshowConfig::default(),
+            cache_max_mib: None,
+            poster_decode_threads: None,
+            catalog_scan_threads: None,
             transition: TransitionConfig::default(),
             excluded_wallpapers: excluded,
             disabled_wallpapers: disabled,
@@ -629,6 +639,8 @@ pub struct ConfigSaveError {
     pub stage: ConfigSaveStage,
     pub primary: ConfigFileStatus,
     pub backup: ConfigBackupStatus,
+    pub(crate) os_code: Option<i32>,
+    pub(crate) primary_committed: bool,
     recovery_paths: Vec<PathBuf>,
     message: String,
 }
@@ -644,8 +656,23 @@ impl ConfigSaveError {
             stage,
             primary,
             backup,
+            os_code: None,
+            primary_committed: false,
             recovery_paths: Vec::new(),
             message: error.to_string(),
+        }
+    }
+
+    fn io(
+        stage: ConfigSaveStage,
+        primary: ConfigFileStatus,
+        backup: ConfigBackupStatus,
+        error: io::Error,
+    ) -> Self {
+        let os_code = error.raw_os_error();
+        Self {
+            os_code,
+            ..Self::new(stage, primary, backup, error)
         }
     }
 
@@ -660,6 +687,8 @@ impl ConfigSaveError {
             stage,
             primary,
             backup,
+            os_code: None,
+            primary_committed: false,
             recovery_paths,
             message: message.to_string(),
         }
@@ -1185,6 +1214,16 @@ impl Config {
             }
         }
 
+        if let Some(cap) = val.get("cache_max_mib") {
+            cfg.cache_max_mib = cache_max_mib(cap);
+        }
+        if let Some(threads) = val.get("poster_decode_threads") {
+            cfg.poster_decode_threads = poster_decode_threads(threads);
+        }
+        if let Some(threads) = val.get("catalog_scan_threads") {
+            cfg.catalog_scan_threads = catalog_scan_threads(threads);
+        }
+
         if let Some(transition_val) = val.get("transition") {
             apply_transition_section(&mut cfg, transition_val, &mut |message| log_debug(&message));
         }
@@ -1248,7 +1287,7 @@ impl Config {
             )
         })?;
         if let Err(error) = fs::create_dir_all(parent) {
-            return Err(ConfigSaveError::new(
+            return Err(ConfigSaveError::io(
                 ConfigSaveStage::CreateDirectory,
                 ConfigFileStatus::Missing,
                 ConfigBackupStatus::Unavailable,
@@ -1517,6 +1556,24 @@ fn config_section_load_diagnostic(path: &Path, base: Option<String>) -> Option<S
     (!messages.is_empty()).then(|| messages.join(" "))
 }
 
+fn cache_max_mib(value: &toml::Value) -> Option<u32> {
+    u32::try_from(value.as_integer()?)
+        .ok()
+        .filter(|&mib| mib > 0)
+}
+
+fn poster_decode_threads(value: &toml::Value) -> Option<u8> {
+    u8::try_from(value.as_integer()?)
+        .ok()
+        .filter(|threads| (1..=4).contains(threads))
+}
+
+fn catalog_scan_threads(value: &toml::Value) -> Option<u8> {
+    u8::try_from(value.as_integer()?)
+        .ok()
+        .filter(|threads| (1..=8).contains(threads))
+}
+
 fn config_section_diagnostics(path: &Path) -> Vec<String> {
     let Ok(contents) = fs::read_to_string(path) else {
         return Vec::new();
@@ -1564,6 +1621,25 @@ fn config_section_diagnostics(path: &Path) -> Vec<String> {
                 "Failed to deserialize [slideshow] section: {error}"
             ));
         }
+    }
+    if value
+        .get("cache_max_mib")
+        .is_some_and(|cap| cache_max_mib(cap).is_none())
+    {
+        diagnostics
+            .push("cache_max_mib must be a positive integer; using the automatic cap".into());
+    }
+    if value
+        .get("poster_decode_threads")
+        .is_some_and(|threads| poster_decode_threads(threads).is_none())
+    {
+        diagnostics.push("poster_decode_threads must be an integer from 1 to 4".into());
+    }
+    if value
+        .get("catalog_scan_threads")
+        .is_some_and(|threads| catalog_scan_threads(threads).is_none())
+    {
+        diagnostics.push("catalog_scan_threads must be an integer from 1 to 8".into());
     }
     if let Some(transition) = value.get("transition") {
         let mut defaults = Config::default();
@@ -1624,12 +1700,12 @@ fn write_complete_config_file(
         .write(true)
         .create_new(true)
         .open(path)
-        .map_err(|error| ConfigSaveError::new(stage, primary, backup, error))?;
+        .map_err(|error| ConfigSaveError::io(stage, primary, backup, error))?;
     file.write_all(contents)
-        .map_err(|error| ConfigSaveError::new(stage, primary, backup, error))?;
+        .map_err(|error| ConfigSaveError::io(stage, primary, backup, error))?;
     file.flush()
         .and_then(|()| file.sync_all())
-        .map_err(|error| ConfigSaveError::new(stage, primary, backup, error))?;
+        .map_err(|error| ConfigSaveError::io(stage, primary, backup, error))?;
     Ok(())
 }
 
@@ -1696,13 +1772,19 @@ fn config_publication_save_error(
     } else {
         publication.error.to_string()
     };
-    ConfigSaveError::observed(
-        stage,
-        primary.status(),
-        config_backup_status(&backup),
-        recovery_paths,
-        message,
-    )
+    ConfigSaveError {
+        os_code: publication.error.raw_os_error(),
+        primary_committed: stage == ConfigSaveStage::PublishPrimary
+            && publication.publication_succeeded
+            && primary.status() == ConfigFileStatus::Valid,
+        ..ConfigSaveError::observed(
+            stage,
+            primary.status(),
+            config_backup_status(&backup),
+            recovery_paths,
+            message,
+        )
+    }
 }
 
 fn observed_config_save_error(
@@ -2201,6 +2283,68 @@ mod tests {
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn disk_cache_override_survives_save_and_invalid_values_use_automatic_budget() {
+        let fixture = TestDirectory::new("disk-cache-cap");
+        let path = fixture.config_path();
+        fs::write(&path, "cache_max_mib = 32\n[theme]\npreset = 'nord'\n").unwrap();
+        let config = Config::load_from_path(path.clone(), false);
+        assert_eq!(config.cache_max_mib, Some(32));
+        config.save_to_path(&path).unwrap();
+        assert_eq!(
+            Config::load_from_path(path.clone(), false).cache_max_mib,
+            Some(32)
+        );
+        fs::write(&path, "cache_max_mib = -1\n[theme]\npreset = 'nord'\n").unwrap();
+        let outcome = Config::load_with_diagnostics_from_path(path, false);
+        assert_eq!(outcome.config.cache_max_mib, None);
+        assert_eq!(outcome.config.theme.preset, "nord");
+        assert!(outcome.diagnostic.unwrap().contains("cache_max_mib"));
+    }
+
+    #[test]
+    fn poster_decode_thread_override_survives_save_and_rejects_out_of_range_values() {
+        let fixture = TestDirectory::new("poster-decode-threads");
+        let path = fixture.config_path();
+        fs::write(&path, "poster_decode_threads = 1\n").unwrap();
+        let config = Config::load_from_path(path.clone(), false);
+        assert_eq!(config.poster_decode_threads, Some(1));
+        config.save_to_path(&path).unwrap();
+        assert_eq!(
+            Config::load_from_path(path.clone(), false).poster_decode_threads,
+            Some(1)
+        );
+        fs::write(&path, "poster_decode_threads = 5\n").unwrap();
+        let outcome = Config::load_with_diagnostics_from_path(path, false);
+        assert_eq!(outcome.config.poster_decode_threads, None);
+        assert!(outcome
+            .diagnostic
+            .unwrap()
+            .contains("poster_decode_threads"));
+    }
+
+    #[test]
+    fn p54_catalog_scan_override_roundtrips_and_invalid_values_keep_auto_policy() {
+        let fixture = TestDirectory::new("catalog-scan-threads");
+        let path = fixture.config_path();
+        for threads in [1, 2, 8] {
+            fs::write(&path, format!("catalog_scan_threads = {threads}\n")).unwrap();
+            let config = Config::load_from_path(path.clone(), false);
+            assert_eq!(config.catalog_scan_threads, Some(threads));
+            config.save_to_path(&path).unwrap();
+            assert_eq!(
+                Config::load_from_path(path.clone(), false).catalog_scan_threads,
+                Some(threads)
+            );
+        }
+        for value in ["0", "9", "-1", "1.5", "'2'"] {
+            fs::write(&path, format!("catalog_scan_threads = {value}\n")).unwrap();
+            let outcome = Config::load_with_diagnostics_from_path(path.clone(), false);
+            assert_eq!(outcome.config.catalog_scan_threads, None);
+            assert!(outcome.diagnostic.unwrap().contains("catalog_scan_threads"));
         }
     }
 

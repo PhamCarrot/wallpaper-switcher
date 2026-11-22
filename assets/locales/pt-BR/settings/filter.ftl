@@ -1,7 +1,7 @@
 settings-filter-appearance-card = Aparência
 settings-filter-appearance-card-desc = Combine a barra de filtros com cada layout do seletor ou force um único estilo em todos.
 settings-filter-visual-style-label = Estilo visual
-settings-filter-visual-style-desc = Igual ao seletor usa a barra inclinada em Fatias e Areia, a barra geométrica em Geométrico e a barra reta em Mural.
+settings-filter-visual-style-desc = Igual ao seletor usa a barra inclinada em Fatias, a barra geométrica em Geométrico e a barra reta em Mural.
 settings-filter-visual-style-match = Igual ao seletor
 settings-filter-visual-style-slices = Fatias
 settings-filter-visual-style-hex = Geométrico

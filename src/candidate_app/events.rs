@@ -13,6 +13,67 @@ use crate::{
     gpu_gallery, poster_worker,
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct PresetWheelBinding {
+    mode: GalleryMode,
+    visibility: u64,
+    motion: u64,
+    settings: u64,
+    action: view::settings::composed::input::InputAction,
+    spec: view::settings::composed::input::WheelSpec,
+}
+
+fn dispatch_preset_wheel(
+    app: &mut GpuCandidate,
+    vertical: f32,
+    modifiers: view::settings::composed::input::Mods,
+    sequence: Option<u64>,
+) -> Option<Task<Message>> {
+    use candidate_state::preferences::BindingAction;
+    use view::settings::composed::input::{ActiveScopes, WheelDirection, WheelSpec};
+
+    let direction = WheelDirection::from_delta(vertical)?;
+    let bindings = &app.state.frontend_preferences.bindings;
+    if ![BindingAction::PresetNext, BindingAction::PresetPrev]
+        .iter()
+        .any(|action| bindings.contains_key(action))
+    {
+        return None;
+    }
+    let spec = WheelSpec {
+        mods: modifiers,
+        direction,
+    };
+    let action = super::lifecycle::effective_input_bindings(app)
+        .lookup_preset_wheel(spec, ActiveScopes::default())?;
+    let key = PresetWheelBinding {
+        mode: app.gallery_mode,
+        visibility: app.visibility_generation,
+        motion: app.motion_generation.load(Ordering::Acquire),
+        settings: app.settings_workbench.generation,
+        action,
+        spec,
+    };
+    let previous = app.preset_wheel.filter(|(previous, _)| *previous == key);
+    let mut remainder = previous.map_or(0.0, |(_, remainder)| remainder);
+    let steps = depth_wheel_steps(&mut remainder, vertical);
+    app.preset_wheel = Some((key, remainder));
+    Some(if steps == 0 {
+        Task::none()
+    } else {
+        dispatch_local_input(app, action, None, sequence)
+    })
+}
+
+fn delayed_poster_wake(delay: std::time::Duration, wake: Wake) -> Task<Message> {
+    let (send, receive) = futures_channel::oneshot::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        let _ = send.send(());
+    });
+    Task::perform(receive, move |_| Message::Wake(wake))
+}
+
 fn vertical_selection_offset(app: &GpuCandidate, down: bool) -> Option<isize> {
     let count = app.filtered_indices.len();
     if count == 0 {
@@ -90,30 +151,22 @@ fn dispatch_local_input(
         return Task::none();
     }
     let message = match action {
+        A::PresetNext | A::PresetPrev => {
+            let mode = super::gallery::gallery_kind(app.gallery_mode);
+            app.state
+                .mode_profiles
+                .cycle_id(mode, action == A::PresetPrev)
+                .map(|id| Message::ApplyGalleryPreset(mode, id))
+        }
         A::Select => app.selected.map(|index| Message::CardClicked {
             index,
             mouse_sequence: sequence,
         }),
         A::Apply => Some(Message::ApplySelected),
         A::Favourite => Some(Message::ToggleFavorite),
-        A::Effects => {
-            let task = update(
-                app,
-                Message::SetSettingsCategory(SettingsCategory::WallpapersDisplays),
-            );
-            if app.theme_workflow.prompt.is_some() || !app.panel_state.settings_open {
-                return task;
-            }
-            let child = update(
-                app,
-                Message::SettingsWindowsOpen {
-                    window: app.window,
-                    generation: app.settings_workbench.generation,
-                    category: SettingsCategory::WallpapersDisplays,
-                },
-            );
-            return Task::batch([task, child]);
-        }
+        A::Effects => Some(Message::SetSettingsCategory(
+            SettingsCategory::WallpapersDisplays,
+        )),
         A::SceneProperties => Some(Message::ToggleEngineProperties),
         A::RandomRotate => Some(Message::ToggleRandomRotation),
         A::Playlists => Some(Message::TogglePlaylistPanel),
@@ -174,7 +227,7 @@ fn dispatch_local_input(
                 .iter()
                 .position(|m| *m == app.gallery_mode)
                 .unwrap_or(0);
-            Some(Message::SetGalleryMode(
+            Some(Message::CyclePickerMode(
                 modes[(index + if action == A::ModePrev { 3 } else { 1 }) % 4],
             ))
         }
@@ -256,45 +309,23 @@ pub(super) fn update(app: &mut GpuCandidate, message: Message) -> Task<Message> 
         _ => None,
     };
     view::settings::controller::reconcile(app);
-    let geometry_edit = matches!(
-        &message,
-        Message::DepthDefault
-            | Message::SetGalleryMode(_)
-            | Message::CycleGalleryVariant
-            | Message::CycleGalleryGeometry
-            | Message::SetGeometricCurve(_)
-            | Message::SetGeometricShape(_)
-            | Message::SetGalleryNumber(_, _)
-            | Message::SetDepthFrame(_)
-            | Message::SetDepthShadows(_)
-            | Message::SetSliceWobble(_)
-            | Message::SetWallLayout(_)
-            | Message::CycleGalleryVariation
-            | Message::SaveGalleryPreset
-            | Message::ApplyGalleryPreset(_, _)
-            | Message::DeleteGalleryPreset(_, _)
-    );
-    let pending_edit = if geometry_edit
-        && (!app.settings_workbench.draft.raw_inputs.is_empty()
-            || app.settings_workbench.geometry_preview_baseline.is_some())
-    {
-        match view::settings::controller::finish_pointer_edit(app) {
-            Ok(task) => task,
-            Err(task) => return Task::batch([task]),
-        }
-    } else {
-        Task::none()
-    };
     let selection_before = app.selected;
     let search_under_settings = app.panel_state.settings_open && app.panel_state.search_open;
     let animation_frame = matches!(
         &message,
-        Message::Wake(Wake::RailFrame { .. } | Wake::MotionFrame { .. } | Wake::DetailFrame { .. })
-            | Message::SettingsIntent {
-                intent: view::settings::folio::intent::Message::Frame(_),
-                ..
-            }
+        Message::Wake(
+            Wake::RailFrame { .. }
+                | Wake::MotionReady
+                | Wake::MotionFrame { .. }
+                | Wake::DetailFrame { .. }
+        ) | Message::SettingsIntent {
+            intent: view::settings::folio::intent::Message::Frame(_),
+            ..
+        }
     );
+    let playlist_before = (!animation_frame)
+        .then(|| app.playlist_departure())
+        .flatten();
     let task = update_inner(app, message);
     app.reconcile_tag_editor();
     app.reconcile_playlist_editor();
@@ -304,6 +335,12 @@ pub(super) fn update(app: &mut GpuCandidate, message: Message) -> Task<Message> 
     if !animation_frame {
         app.sync_scene_motion();
     }
+    if !app.visible || app.playlist_panel_open || app.scene_motion.playlist_opacity() == 0.0 {
+        app.retiring_playlist = None;
+    } else if let Some(playlist) = playlist_before {
+        app.retiring_playlist = Some(playlist);
+    }
+    view::settings::bridge::sync_overlay_palette(app);
     let focus = if search_under_settings
         && app.visible
         && top_owned_sheet(
@@ -328,9 +365,36 @@ pub(super) fn update(app: &mut GpuCandidate, message: Message) -> Task<Message> 
     } else {
         view::settings::bridge::sync_preview(app)
     };
-    Task::batch([pending_edit, task, exit, preview, focus])
+    Task::batch([task, exit, preview, focus])
 }
 pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Message> {
+    if !matches!(
+        &message,
+        Message::DepthDefault
+            | Message::SetGalleryMode(_)
+            | Message::CyclePickerMode(_)
+            | Message::CycleGalleryVariant
+            | Message::CycleGalleryGeometry
+            | Message::SetGeometricCurve(_)
+            | Message::SetGeometricShape(_)
+            | Message::SetGalleryNumber(_, _)
+            | Message::SetDepthFrame(_)
+            | Message::SetDepthShadows(_)
+            | Message::SetSliceWobble(_)
+            | Message::SetWallLayout(_)
+            | Message::CycleGalleryVariation
+            | Message::SaveGalleryPreset
+            | Message::DeleteGalleryPreset(_, _)
+    ) {
+        return reduce(app, message);
+    }
+    match view::settings::controller::finish_geometry_owner_edit(app) {
+        Ok(task) => Task::batch([task, reduce(app, message)]),
+        Err(task) => task,
+    }
+}
+
+fn reduce(app: &mut GpuCandidate, message: Message) -> Task<Message> {
     if app.playlist_delete.is_some()
         && matches!(
             &message,
@@ -381,6 +445,12 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             generation,
             intent,
         } => {
+            if matches!(&intent, view::settings::folio::intent::Message::Backdrop)
+                && view::settings::gateway::frame_valid(app, window, generation)
+                && view::settings::gateway::folder_owns_input(app)
+            {
+                return view::settings::gateway::outside_click(app).unwrap_or_else(Task::none);
+            }
             let allowed = if matches!(&intent, view::settings::folio::intent::Message::Frame(_)) {
                 view::settings::gateway::frame_valid(app, window, generation)
             } else {
@@ -394,18 +464,16 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
         Message::SettingsPreviewReady { generation, image } => {
             app.settings_workbench.finish_preview(generation, image);
         }
-        Message::SettingsLegacy {
+        Message::SettingsPageAction {
             window,
             generation,
             message,
         } => {
-            if view::settings::gateway::legacy_valid(app, window, generation, &message)
-                && app.settings_workbench.windows_panel.is_some()
-            {
+            if view::settings::gateway::page_valid(app, window, generation, &message) {
                 return update_inner(app, *message);
             }
         }
-        Message::SettingsWindowsOpen {
+        Message::SettingsOpenPage {
             window,
             generation,
             category,
@@ -416,7 +484,23 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                 return view::settings::gateway::open(app, category);
             }
         }
-        Message::SettingsWindowsClose { window, generation } => {
+        Message::SettingsRecheckProvider {
+            window,
+            generation,
+            recovery,
+        } => {
+            if view::settings::gateway::valid(app, window, generation)
+                && app.settings_workbench.tab == "displays"
+                && app.settings_workbench.windows_panel.is_none()
+                && app.launch_policy.allows_provider()
+                && !app.apply_pending
+                && app.provider_recoveries.contains(&recovery)
+                && coordinator::provider_recheck_available(&recovery)
+            {
+                app.submit_engine_command(EngineCommand::ReconcileProvider { recovery });
+            }
+        }
+        Message::SettingsThemeClose { window, generation } => {
             if view::settings::gateway::valid(app, window, generation)
                 && app.settings_workbench.windows_panel.is_some()
             {
@@ -501,11 +585,17 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             return update(app, Message::ResumeRandomRotation)
         }
         Message::Wake(Wake::CatalogDirty { generation }) => {
-            if !app.exit_requested && generation == app.catalog_generation.load(Ordering::Acquire) {
+            if !app.exit_requested
+                && generation == app.catalog_scan_generation.load(Ordering::Acquire)
+            {
                 app.refresh_catalog();
             }
         }
         Message::Wake(Wake::ColourReady(c)) => app.install_colour(c),
+        Message::Wake(Wake::CatalogSnapshotSaved(result)) => {
+            apply_trace::event_lazy("catalog-snapshot-saved", || format!("result={result:?}"));
+            app.catalog_snapshot_issue = result.err();
+        }
         Message::Colour(action) => app.colour_action(action),
         Message::Wake(Wake::CacheAcknowledged(report)) => {
             apply_trace::event_lazy("ui-cache-operation-ack", || {
@@ -525,10 +615,12 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             mut wallpapers,
             mut entries,
         }) => {
-            if let Some(owner) = &app.catalog_watch {
-                owner.acknowledge();
-            }
-            if app.exit_requested || generation != app.catalog_generation.load(Ordering::Acquire) {
+            if app.exit_requested
+                || generation != app.catalog_scan_generation.load(Ordering::Acquire)
+            {
+                if let Some(owner) = &app.catalog_watch {
+                    owner.acknowledge();
+                }
                 return Task::none();
             }
             if let Some(benchmark) = &mut app.benchmark {
@@ -548,18 +640,43 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     }
                 }
             }
+            for entry in &mut entries {
+                entry.tags = app
+                    .state
+                    .local_library
+                    .effective_tags(&entry.id, &entry.source_tags);
+            }
+            if app.catalog_loaded && wallpapers == app.wallpapers && entries == app.catalog {
+                let first_fresh = !app.catalog_fresh;
+                app.accept_fresh_catalog(generation);
+                app.revoke_catalog_tag_callbacks();
+                app.update_catalog_status();
+                if first_fresh {
+                    app.schedule_poster_pregeneration();
+                }
+                apply_trace::event_lazy("catalog-unchanged", || {
+                    format!(
+                        "scan={generation} revision={}",
+                        app.catalog_generation.load(Ordering::Acquire)
+                    )
+                });
+                return Task::none();
+            }
             // Capture before resource/catalog invalidation. A new catalog
             // revision invalidates outgoing ownership even for reused ID/path;
             // omit those old bodies truthfully, retain incoming roll presentation.
             let catalog_roll = app.capture_depth_roll().is_some();
-            app.clear_posters();
-            app.depth_frame = None;
+            let revision = app.catalog_generation.fetch_add(1, Ordering::AcqRel) + 1;
+            app.retain_catalog_posters(&wallpapers, revision);
             app.clear_engine_properties();
             let selected_id = app
                 .selected
                 .and_then(|index| app.wallpapers.get(index))
                 .map(|wallpaper| wallpaper.id.clone());
             app.invalidate_tag_editor();
+            // Never capture outgoing geometry using old indices against the new vectors.
+            app.filtered_indices.clear();
+            app.presentation_inputs = None;
             app.wallpapers = wallpapers;
             app.catalog = entries;
             app.project_local_tags();
@@ -583,7 +700,7 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                 )
             });
             app.catalog_loaded = true;
-            app.prepare_startup_reapply();
+            app.accept_fresh_catalog(generation);
             app.start_colours(false);
             app.poster_failure = false;
             app.refresh_filter();
@@ -615,7 +732,7 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     &app.wallpapers,
                     Config::config_dir(),
                     app.catalog_loaded,
-                    generation,
+                    revision,
                 );
                 let snapshot_json = serde_json::to_string(&snapshot)
                     .unwrap_or_else(|_| "{\"snapshot_serialization\":\"failed\"}".into());
@@ -708,6 +825,7 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                 app.schedule_posters();
                 app.refresh_backdrop();
             }
+            app.schedule_poster_pregeneration();
         }
         Message::PendingForms {
             window,
@@ -716,6 +834,102 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
         } => {
             if view::settings::gateway::valid(app, window, generation) {
                 view::settings::pending_forms::dispatch(app, action);
+            }
+        }
+        Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Restore {
+            mut posters,
+            near_order,
+            depth,
+        })) => {
+            if app.visible && app.cache_operation.is_none() {
+                posters.retain(|(poster, _)| app.posters.iter().any(|p| p.same_resource(poster)));
+                if posters.is_empty() || app.ensure_preview_worker() {
+                    if let Some(worker) = &app.poster_worker {
+                        let depth = depth && app.gallery_mode == GalleryMode::Depth;
+                        worker.restore(&app.posters, &near_order, posters, depth, || {
+                            super::images::publish_poster_feedback(
+                                gpu_gallery::PosterFeedback::Redraw,
+                            );
+                        });
+                    }
+                }
+            }
+            return Task::none();
+        }
+        Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Redraw)) => return Task::none(),
+        Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Prewarmed { key, posters })) => {
+            if app.visible
+                && !app.poster_loading
+                && app.cache_operation.is_none()
+                && key == app.atlas_prewarm_key()
+                && Arc::ptr_eq(&posters, &app.posters)
+            {
+                if app.atlas_entry == Some(app.gallery_mode) {
+                    app.atlas_entry = None;
+                    apply_trace::event_lazy("atlas-prewarm-released", || {
+                        format!(
+                            "mode={:?} generation={} resources={}",
+                            app.gallery_mode,
+                            key.generation,
+                            posters.len()
+                        )
+                    });
+                    app.reveal_gallery_layout();
+                } else {
+                    app.release_wall_colour_roll("posters-resident");
+                }
+            }
+            return Task::none();
+        }
+        Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::MaintenanceAfter(delay))) => {
+            return delayed_poster_wake(
+                delay,
+                Wake::PosterGpu(gpu_gallery::PosterFeedback::Redraw),
+            );
+        }
+        Message::Wake(Wake::RetryPosters(generation)) => {
+            if generation == app.poster_generation.load(Ordering::Acquire)
+                && app.poster_retry == PosterRetry::Waiting
+                && app.visible
+                && !app.poster_loading
+                && app.cache_operation.is_none()
+            {
+                app.schedule_posters_with_still_selector(
+                    true,
+                    library::media_still::MediaStill::select,
+                );
+            }
+        }
+        Message::Wake(Wake::PosterWorkerExited(exit)) => {
+            if let Some(worker) = app
+                .poster_worker
+                .as_ref()
+                .filter(|worker| worker.id() == exit.worker_id)
+            {
+                debug_assert!(worker.can_replace());
+                let generation = app.poster_generation.load(Ordering::Acquire);
+                let was_loading = app.poster_loading;
+                let request_key = app.poster_request_key.take();
+                let assignment_key = app.poster_assignment_key.take();
+                app.poster_worker = None;
+                app.invalidate_poster_work();
+                // Motion ticks may repeat the failed demand. A new request or
+                // explicit invalidation can retry through the normal scheduler.
+                app.poster_request_key = request_key;
+                app.poster_assignment_key = assignment_key;
+                if app.cache_operation.take().is_some() {
+                    app.cache_status =
+                        "Poster worker stopped before the cache operation was acknowledged.".into();
+                }
+                app.poster_failure = true;
+                let message = format!("Poster preview worker stopped: {}", exit.failure);
+                app.status = Some(app.status_with_persistence_issue(&message));
+                apply_trace::event_lazy("poster-worker-stopped", || {
+                    format!(
+                        "worker={} generation={generation} loading={was_loading}->{} failure={:?} status={message:?}",
+                        exit.worker_id, app.poster_loading, exit.failure
+                    )
+                });
             }
         }
         Message::Wake(Wake::PostersReady) => {
@@ -730,7 +944,10 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             };
             let Some(poster_worker::PosterCompletion {
                 generation,
+                cursor,
+                finished,
                 posters,
+                failures,
             }) = completion
             else {
                 return Task::none();
@@ -740,7 +957,21 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                 app.poster_generation.load(Ordering::Acquire),
                 app.visible,
             ) {
-                if !posters.is_empty() {
+                let pins = app.gallery_pins();
+                let valid_posters: Vec<_> = posters
+                    .into_iter()
+                    .filter(|decoded| {
+                        app.wallpapers
+                            .get(decoded.source.index)
+                            .is_some_and(|wallpaper| poster_completion_matches(decoded, wallpaper))
+                            && !pins.iter().any(|pin| {
+                                pin.index == decoded.source.index
+                                    || pin.slot.layer == decoded.source.layer
+                            })
+                    })
+                    .collect();
+                if !valid_posters.is_empty() {
+                    app.poster_failure = false;
                     if let Some(benchmark) = &mut app.benchmark {
                         if benchmark.cold_open_ms.is_none() {
                             benchmark.cold_open_ms =
@@ -752,50 +983,112 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                         }
                     }
                 }
-                let valid_posters = posters
-                    .into_iter()
-                    .filter(|decoded| {
-                        app.wallpapers
-                            .get(decoded.source.index)
-                            .is_some_and(|wallpaper| poster_completion_matches(decoded, wallpaper))
-                    })
-                    .collect::<Vec<_>>();
-                let pins = app.gallery_pins();
-                let valid_posters: Vec<_> = valid_posters
-                    .into_iter()
-                    .filter(|decoded| {
-                        !pins
-                            .iter()
-                            .any(|pin| pin.slot.layer == decoded.source.layer)
-                    })
-                    .collect();
-                let live_pin = pins.iter().any(|pin| {
-                    (app.gallery_mode != GalleryMode::Depth
-                        && app.filtered_indices.contains(&pin.index))
-                        || app
-                            .depth_frame
-                            .as_ref()
-                            .is_some_and(|frame| frame.live_poster_indices.contains(&pin.index))
-                });
-                app.poster_failure =
-                    valid_posters.is_empty() && !live_pin && !app.filtered_indices.is_empty();
-                app.poster_slots = valid_posters
+                let catalog_generation = app.catalog_generation.load(Ordering::Acquire);
+                let mut failed = 0;
+                for failure in failures {
+                    let source = &failure.source;
+                    if app.wallpapers.get(source.index).is_some_and(|wallpaper| {
+                        gallery::poster_source_matches(source, wallpaper)
+                            && source
+                                .still
+                                .as_ref()
+                                .is_none_or(|still| still.catalog_revision == catalog_generation)
+                    }) && !pins
+                        .iter()
+                        .any(|pin| pin.index == source.index || pin.slot.layer == source.layer)
+                    {
+                        app.poster_failed_indices.insert(source.index);
+                        if app.poster_retry == PosterRetry::Available
+                            && source.kind == poster_worker::PosterKind::Still
+                            && failure.error.is_file_lock()
+                            && source.still.as_ref().is_some_and(|still| {
+                                still.item_id == source.item_id
+                                    && still.path == source.path
+                                    && still.is_current()
+                            })
+                        {
+                            app.poster_retry = PosterRetry::SawLock;
+                        }
+                        failed += 1;
+                        apply_trace::event_lazy("poster-item-failed", || {
+                            let [far, near] = failure.tiers;
+                            format!(
+                                "generation={generation} index={} layer={} tiers={far:?},{near:?} item={:?} source={:?} error={}",
+                                source.index, source.layer, source.item_id, source.path, failure.error,
+                            )
+                        });
+                    }
+                }
+                let incoming_indices: HashSet<_> = valid_posters
                     .iter()
-                    .map(|decoded| {
-                        (
-                            decoded.source.index,
-                            PosterSlot {
-                                layer: decoded.source.layer,
-                                is_video: decoded.source.is_video,
-                                generation,
-                                catalog_generation: app.catalog_generation.load(Ordering::Acquire),
-                                item_id: decoded.source.item_id.clone(),
-                                source: decoded.source.path.clone(),
-                            },
-                        )
-                    })
+                    .map(|decoded| decoded.source.index)
                     .collect();
-                let mut resident = Vec::with_capacity(gpu_gallery::MAX_POSTERS);
+                let incoming_layers: HashSet<_> = valid_posters
+                    .iter()
+                    .map(|decoded| decoded.source.layer)
+                    .collect();
+                app.poster_failed_indices
+                    .retain(|index| !incoming_indices.contains(index));
+                let retain_recent = app.gallery_mode != GalleryMode::Depth;
+                // Either kind of collision retires the old slot. Depth also retires
+                // unused layers when the generation settles.
+                app.poster_slots.retain(|index, slot| {
+                    let current_item = !retain_recent
+                        || (slot.layer < gpu_gallery::ordinary_poster_limit() as u32
+                            && app
+                                .wallpapers
+                                .get(*index)
+                                .is_some_and(|item| item.id == slot.item_id));
+                    slot.catalog_generation == catalog_generation
+                        && (retain_recent || !finished || slot.generation == generation)
+                        && current_item
+                        && !incoming_indices.contains(index)
+                        && !app.poster_failed_indices.contains(index)
+                        && !incoming_layers.contains(&slot.layer)
+                        && !pins
+                            .iter()
+                            .any(|pin| pin.index == *index || pin.slot.layer == slot.layer)
+                });
+                let retained_layers: HashSet<_> =
+                    app.poster_slots.values().map(|slot| slot.layer).collect();
+                let resident = Arc::make_mut(&mut app.posters);
+                resident.retain(|poster| retained_layers.contains(&poster.layer));
+                let installed = valid_posters.len();
+                for decoded in valid_posters {
+                    let source = decoded.source;
+                    app.poster_slots.insert(
+                        source.index,
+                        PosterSlot {
+                            layer: source.layer,
+                            kind: source.kind,
+                            generation,
+                            last_requested: generation,
+                            catalog_generation,
+                            item_id: source.item_id,
+                            source: source.path,
+                        },
+                    );
+                    resident.push(decoded.poster);
+                }
+                if finished {
+                    let live_pin = pins.iter().any(|pin| {
+                        (app.gallery_mode != GalleryMode::Depth
+                            && app.filtered_indices.contains(&pin.index))
+                            || app
+                                .depth_frame
+                                .as_ref()
+                                .is_some_and(|frame| frame.live_poster_indices.contains(&pin.index))
+                    });
+                    let ready = if retain_recent {
+                        app.poster_slots
+                            .values()
+                            .any(|slot| slot.generation == generation)
+                    } else {
+                        !resident.is_empty()
+                    };
+                    app.poster_failure = !ready && !live_pin && !app.filtered_indices.is_empty();
+                    app.poster_loading = false;
+                }
                 for pin in pins {
                     app.poster_slots.insert(pin.index, pin.slot);
                     if !resident
@@ -805,13 +1098,25 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                         resident.push(pin.poster);
                     }
                 }
-                resident.extend(valid_posters.into_iter().map(|decoded| decoded.poster));
-                app.posters = Arc::new(resident);
-                app.poster_loading = false;
+                apply_trace::event_lazy("poster-gallery-merge", || {
+                    format!(
+                        "generation={generation} cursor={cursor} finished={finished} installed={installed} slots={} failed={failed}",
+                        resident.len()
+                    )
+                });
                 app.rebuild_depth_frame();
                 app.update_catalog_status();
-                app.maybe_schedule_screenshot();
-                app.scenario_ready_after_posters();
+                if finished {
+                    app.maybe_schedule_screenshot();
+                    app.scenario_ready_after_posters();
+                    if app.poster_retry == PosterRetry::SawLock && app.cache_operation.is_none() {
+                        app.poster_retry = PosterRetry::Waiting;
+                        return delayed_poster_wake(
+                            std::time::Duration::from_millis(250),
+                            Wake::RetryPosters(generation),
+                        );
+                    }
+                }
             }
         }
         Message::Wake(Wake::BackdropLoaded {
@@ -834,6 +1139,9 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
         }
         Message::Wake(Wake::CaptureScreenshot) => {
             if let Some(id) = app.window {
+                apply_trace::event_lazy("gallery-screenshot-request", || {
+                    format!("phase=window-capture window={id:?}")
+                });
                 return window::screenshot(id).map(Message::ScreenshotCaptured);
             }
         }
@@ -865,6 +1173,15 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             let Some(path) = app.screenshot_path.as_ref() else {
                 return Task::none();
             };
+            apply_trace::event_lazy("gallery-screenshot-captured", || {
+                format!(
+                    "phase=window-result path={} width={} height={} bytes={}",
+                    path.display(),
+                    screenshot.size.width,
+                    screenshot.size.height,
+                    screenshot.as_ref().len(),
+                )
+            });
             if let Some(parent) = path
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
@@ -903,9 +1220,12 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     .iter()
                     .any(|outcome| outcome.state == coordinator::ApplyOperationState::Unknown);
                 format!(
-                    "active_operation_match={operation_matches} success={} provider_unknown={provider_unknown} hide_after_apply={} error={:?} {}",
+                    "active_operation_match={operation_matches} success={} provider_unknown={provider_unknown} hide_after_apply={} picker_window={:?} picker_generation={} picker_visible={} error={:?} {}",
                     result.is_success(),
                     app.hide_after_apply,
+                    app.window,
+                    app.visibility_generation,
+                    app.visible,
                     result.error_message(),
                     app.selected_item_trace_fields()
                 )
@@ -916,6 +1236,9 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     result.operation_id.get()
                 ));
                 return Task::none();
+            }
+            if let Some(detail) = result.error_message() {
+                log_debug(&format!("Wallpaper Apply completion diagnostics: {detail}"));
             }
             if app
                 .wallpaper_change
@@ -995,15 +1318,15 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                         "Wallpaper provider state remains unresolved; further provider changes remain blocked."
                     }
                 };
-                app.status = Some(app.status_with_persistence_issue(message));
+                app.status = Some(app.status_with_persistence_issue(&message));
                 return Task::none();
             }
             if result.is_success() {
                 let message = match result.transition.warning_message() {
-                    Some(warning) => format!(
-                        "Automatic wallpaper change completed. Transition warning: {warning}"
-                    ),
-                    None => "Automatic wallpaper change completed.".to_string(),
+                    Some(warning) => {
+                        format!("Wallpaper change completed. Transition warning: {warning}")
+                    }
+                    None => "Wallpaper change completed.".to_string(),
                 };
                 app.status = Some(app.status_with_persistence_issue(&message));
                 if close_after
@@ -1014,12 +1337,24 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     })
                 {
                     app.hide_after_apply = false;
+                    apply_trace::event_for_lazy(
+                        result.operation_id.get(),
+                        "ui-apply-picker-hide",
+                        || {
+                            format!(
+                                "picker_window={:?} picker_generation={} transition={}",
+                                app.window,
+                                app.visibility_generation,
+                                result.transition.status_name()
+                            )
+                        },
+                    );
                     return app.set_visible(false, "apply-confirmed-hide");
                 }
             } else {
                 app.status = result
-                    .error_message()
-                    .map(|message| app.status_with_persistence_issue(&message));
+                    .user_message()
+                    .map(|message| app.status_with_persistence_issue(message));
             }
             if !app.startup_queue.is_empty() {
                 app.advance_startup_reapply();
@@ -1037,6 +1372,12 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     result.operation_id.get()
                 ));
                 return Task::none();
+            }
+            if let Some(detail) = result.error_message() {
+                log_debug(&format!(
+                    "Wallpaper Engine completion diagnostics for operation {}: {detail}",
+                    result.operation_id.get()
+                ));
             }
             app.wallpaper_change = None;
             app.active_operation = None;
@@ -1127,8 +1468,13 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                 });
             } else {
                 app.status = result
-                    .error_message()
-                    .map(|message| app.status_with_persistence_issue(&message));
+                    .user_message()
+                    .map(|message| app.status_with_persistence_issue(message));
+            }
+        }
+        Message::Wake(Wake::MotionReady) => {
+            if let Some(frame) = app.motion_mailbox.take() {
+                return update_inner(app, Message::Wake(frame));
             }
         }
         Message::Wake(Wake::MotionFrame {
@@ -1168,7 +1514,9 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     }
                 }
                 if let (Some(roll), Some(wave)) = (&mut app.ordinary_roll, filter_wave) {
-                    roll.advance_to(wave);
+                    if roll.poster_wait_deadline.is_none() {
+                        roll.advance_to(wave);
+                    }
                 }
                 app.motion = value;
                 app.motion_velocity = velocity;
@@ -1192,6 +1540,12 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     }
                     app.wall_presentation = Some(p);
                 }
+                if app.ordinary_roll.as_ref().is_some_and(|roll| {
+                    roll.poster_wait_deadline
+                        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                }) {
+                    app.release_wall_colour_roll("poster-wait-expired");
+                }
                 if matches!(
                     app.gallery_mode,
                     GalleryMode::Wall
@@ -1201,6 +1555,7 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                 ) {
                     app.schedule_posters();
                 }
+                app.schedule_colour();
             }
         }
         Message::Wake(Wake::RailFrame { generation, value }) => {
@@ -1286,7 +1641,7 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     app.stop_gallery_transients("benchmark-gallery-mode-changed");
                     app.invalidate_poster_work();
                     app.wall_scroll_offset = 0.0;
-                    app.gallery_mode = mode;
+                    app.assign_gallery_mode(mode);
                     if mode == GalleryMode::Depth {
                         app.reset_depth_transients();
                     }
@@ -1327,11 +1682,10 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             if app.window != Some(id) {
                 return Task::none();
             }
-            let caption_task = super::native_caption::install(id);
             if !app.visible {
                 // A hide can overtake the asynchronous open request. The late
                 // completion must honor that intent after native creation too.
-                return caption_task.chain(GpuCandidate::hide_window_task(id));
+                return app.native_visibility.apply(id, false, None);
             }
             if app.viewport != [width, height] {
                 app.depth_roll = None;
@@ -1361,10 +1715,12 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             );
             app.schedule_posters();
             app.resolve_depth_detail();
-            return caption_task;
+            app.restart_gallery_entrance();
+            app.start_motion(0.0);
+            return app.native_visibility.apply(id, true, None);
         }
         Message::WindowResized { id, width, height } => {
-            if app.window == Some(id) {
+            if app.visible && app.window == Some(id) {
                 app.depth_roll = None;
                 app.viewport = [width, height];
                 apply_gallery_viewport_policy(
@@ -1416,7 +1772,7 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             }
         }
         Message::WindowFocused(id) => {
-            if app.window == Some(id) {
+            if app.visible && app.window == Some(id) {
                 app.window_focused = Some(true);
             }
             if app.scenario.is_some() {
@@ -1438,7 +1794,8 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             }
         }
         Message::WindowUnfocused(id) => {
-            if app.window == Some(id) {
+            let current = app.visible && app.window == Some(id);
+            if current {
                 app.window_focused = Some(false);
             }
             if app.scenario.is_some() {
@@ -1450,8 +1807,7 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     app.visibility_generation
                 ));
             }
-            if app.window == Some(id)
-                && app.visible
+            if current
                 && !app.launch_policy.is_preview()
                 && app.theme_workflow.prompt.is_none()
                 && app.theme_workflow.exit.is_none()
@@ -1536,20 +1892,19 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
         Message::DonorDetail(identity, intent) => {
             use donor_back_layout::DetailIntent;
             let controls_active = detail_controls_active(app);
-            let selected_identity_matches = controls_active
-                && app
-                    .selected
-                    .and_then(|i| app.wallpapers.get(i))
-                    .is_some_and(|wallpaper| wallpaper.id == identity);
+            let bound_item = app
+                .selected
+                .and_then(|i| app.wallpapers.get(i))
+                .filter(|wallpaper| controls_active && wallpaper.id == identity);
             if matches!(&intent, DetailIntent::Apply) {
-                let outcome = if selected_identity_matches {
+                let outcome = if bound_item.is_some() {
                     "dispatched"
                 } else {
                     "rejected"
                 };
                 let reason = if !controls_active {
                     "detail_controls_inactive"
-                } else if !selected_identity_matches {
+                } else if bound_item.is_none() {
                     "detail_identity_mismatch"
                 } else {
                     "selected_identity_verified"
@@ -1561,20 +1916,16 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     )
                 });
             }
-            if !controls_active || !selected_identity_matches {
+            let Some(item) = bound_item else {
                 return Task::none();
-            }
+            };
             let message = match intent {
                 DetailIntent::Apply => Message::ApplySelected,
                 DetailIntent::Hide => Message::ToggleExcluded,
                 DetailIntent::Playlists => Message::OpenPlaylistPicker,
                 DetailIntent::LocalTags => Message::OpenLocalTags(identity),
-                DetailIntent::OpenFolder => Message::OpenFolder,
+                DetailIntent::OpenFolder => return detail_files::show_source_folder(app, item),
                 DetailIntent::CopyImage => {
-                    let Some(item) = app.selected.and_then(|index| app.wallpapers.get(index))
-                    else {
-                        return Task::none();
-                    };
                     if item.source != WallpaperSource::LocalImage {
                         return Task::none();
                     }
@@ -1622,14 +1973,13 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     );
                 }
                 DetailIntent::CopyPath => {
-                    return app
-                        .selected
-                        .and_then(|index| app.wallpapers.get(index))
-                        .filter(|item| item.file_target.is_absolute())
-                        .map_or_else(Task::none, |item| {
+                    return detail_files::copy_absolute_path(&item.file_target).map_or_else(
+                        Task::none,
+                        |path| {
                             app.detail_copy_generation.fetch_add(1, Ordering::AcqRel);
-                            iced::clipboard::write(item.file_target.display().to_string())
-                        });
+                            iced::clipboard::write(path)
+                        },
+                    );
                 }
                 DetailIntent::Properties => Message::ToggleEngineProperties,
                 DetailIntent::Favorite => Message::ToggleFavorite,
@@ -1697,6 +2047,33 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                     != selected
             {
                 return Task::none();
+            }
+            if let GalleryMessage::BoundWheel {
+                amount,
+                vertical,
+                modifiers,
+                sequence,
+            } = message
+            {
+                if !app.detail_open
+                    && app.theme_workflow.prompt.is_none()
+                    && !sheet_owns_keyboard(
+                        app.panel_state,
+                        app.playlist_panel_open,
+                        app.engine_properties_open,
+                        app.controls_panel_open,
+                        app.folder_menu_open,
+                    )
+                {
+                    if let Some(task) = dispatch_preset_wheel(app, vertical, modifiers, sequence) {
+                        return task;
+                    }
+                }
+                app.preset_wheel = None;
+                return update(
+                    app,
+                    Message::Gallery(GalleryMessage::Wheel(amount, sequence)),
+                );
             }
             if let GalleryMessage::Pointer {
                 index,
@@ -1808,7 +2185,7 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             }
             return update(app, Message::Gallery(message));
         }
-        Message::Gallery(GalleryMessage::Pointer { .. }) => {
+        Message::Gallery(GalleryMessage::Pointer { .. } | GalleryMessage::BoundWheel { .. }) => {
             return Task::none();
         }
         Message::Gallery(message @ GalleryMessage::DepthPointer { .. }) => {
@@ -1888,11 +2265,18 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
                 }
             }
             if app.gallery_mode == GalleryMode::Wall {
-                if let Some(p) = &mut app.wall_presentation {
-                    p.hover = hovered;
-                    p.keyboard = false;
+                let needs_motion = match &mut app.wall_presentation {
+                    Some(p) => {
+                        let changed = p.hover != hovered;
+                        p.hover = hovered;
+                        p.keyboard = false;
+                        changed
+                    }
+                    None => true,
+                };
+                if needs_motion {
+                    app.start_motion(0.0);
                 }
-                app.start_motion(0.0);
             }
             let hover_selects =
                 (view::settings::bridge::Source { app }).flag("general.hoverSelects");
@@ -2049,6 +2433,9 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             }
             if !app.filtered_indices.is_empty() {
                 if app.gallery_mode == GalleryMode::Wall {
+                    if app.wall_colour_roll_held() {
+                        app.ordinary_roll = None;
+                    }
                     let step = app.state.gallery.wall.card_height + app.state.gallery.wall.gap_y;
                     app.sync_wall_presentation();
                     if let Some(p) = &mut app.wall_presentation {
@@ -2149,6 +2536,9 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
         Message::SetGalleryMode(mode) => {
             app.set_gallery_mode(mode);
         }
+        Message::CyclePickerMode(mode) => {
+            app.cycle_picker_mode(mode);
+        }
         Message::OpenSearch => {
             if sheet_owns_keyboard(
                 app.panel_state,
@@ -2213,15 +2603,11 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             app.schedule_posters();
         }
         Message::SetWallLayout(layout) => {
-            let changed = app.state.gallery.wall.layout != layout;
             app.state.gallery.wall.layout = layout;
             app.state.gallery.variant = None;
             app.wall_scroll_offset = 0.0;
             app.persist_state();
             app.schedule_posters();
-            if changed {
-                app.reveal_gallery_layout();
-            }
         }
         Message::CycleGalleryMotionSpeed => {
             app.state.gallery_motion_speed = app.state.gallery_motion_speed.next();
@@ -2239,14 +2625,19 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             }
             Err(error) => app.settings_workbench.message = error,
         },
-        Message::ApplyGalleryPreset(mode, id) => match app.apply_gallery_preset(mode, id) {
-            Ok(()) => {
-                app.settings_workbench.preset_name_raw = None;
-                app.settings_workbench.message = "Current-mode profile saved and restored.".into();
-                view::settings::controller::rotate(app);
+        Message::ApplyGalleryPreset(mode, id) => {
+            let (task, result) = app.apply_gallery_preset(mode, id);
+            match result {
+                Ok(()) => {
+                    app.settings_workbench.preset_name_raw = None;
+                    app.settings_workbench.message =
+                        "Current-mode profile saved and restored.".into();
+                    view::settings::controller::rotate(app);
+                }
+                Err(error) => app.settings_workbench.message = error,
             }
-            Err(error) => app.settings_workbench.message = error,
-        },
+            return task;
+        }
         Message::DeleteGalleryPreset(mode, id) => match app.delete_gallery_preset(mode, id) {
             Ok(true) => {
                 app.settings_workbench.preset_name_raw = None;
@@ -2262,9 +2653,9 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             if let Some(wallpaper) = app.selected.and_then(|index| app.wallpapers.get(index)) {
                 let favorite = app.state.toggle_favorite(&wallpaper.id);
                 app.status = Some(if favorite {
-                    "Added to favorites".into()
+                    "Added to favourites".into()
                 } else {
-                    "Removed from favorites".into()
+                    "Removed from favourites".into()
                 });
                 app.persist_state();
                 if app.filter_rule.favorites_only || app.browse_playlist_id.is_some() {
@@ -2324,18 +2715,12 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
         }
         Message::OpenFolder => {
             if let Some(wallpaper) = app.selected.and_then(|index| app.wallpapers.get(index)) {
-                let target = if wallpaper.file_target.exists() {
-                    &wallpaper.file_target
-                } else {
-                    &wallpaper.folder_path
-                };
-                if let Err(error) = std::process::Command::new("explorer.exe")
-                    .arg("/select,")
-                    .arg(target)
-                    .spawn()
-                {
-                    app.status = Some(format!("Could not open source folder: {error}"));
-                }
+                return detail_files::show_source_folder(app, wallpaper);
+            }
+        }
+        Message::SourceFolderError(owner, error) => {
+            if owner.current(app) {
+                app.status = Some(format!("Could not open source folder. {error}"));
             }
         }
         Message::ToggleEngineProperties => {
@@ -2874,61 +3259,14 @@ pub(super) fn update_inner(app: &mut GpuCandidate, message: Message) -> Task<Mes
             }
         }
         Message::ToggleMonitorLock(device_id) => {
-            if !app.state.locked_monitors.remove(&device_id) {
-                app.state.locked_monitors.insert(device_id);
+            let mut proposed = app.state.clone();
+            if !proposed.locked_monitors.remove(&device_id) {
+                proposed.locked_monitors.insert(device_id);
             }
-            app.persist_state();
+            let _ = app.commit_local_state_change(proposed);
         }
-        Message::CreateSchedule => {
-            let name = app.schedule_name.trim().to_string();
-            let playlist_id = app.state.active_playlist_id.clone();
-            let minute = parse_schedule_time(&app.schedule_time);
-            match (name.is_empty(), playlist_id, minute, app.schedule_days) {
-                (false, Some(playlist_id), Some(minute_of_day), days) if days != 0 => {
-                    let id = unique_schedule_id(&name, &app.state.schedules);
-                    let creation_order = app
-                        .state
-                        .schedules
-                        .iter()
-                        .map(|schedule| schedule.creation_order)
-                        .max()
-                        .unwrap_or(0)
-                        .saturating_add(1);
-                    app.state.schedules.push(candidate_state::Schedule {
-                        id,
-                        name,
-                        enabled: true,
-                        days,
-                        minute_of_day,
-                        priority: 100,
-                        creation_order,
-                        playlist_id,
-                        monitor_ids: app.schedule_monitors.iter().cloned().collect(),
-                    });
-                    app.schedule_name.clear();
-                    app.persist_state();
-                    app.refresh_automation_timer();
-                }
-                _ => {
-                    app.status = Some(
-                        "A schedule needs a name, valid HH:MM time, at least one day, and an active playlist."
-                            .into(),
-                    );
-                }
-            }
-        }
-        Message::ToggleSchedule(schedule_id) => {
-            if let Some(schedule) = app
-                .state
-                .schedules
-                .iter_mut()
-                .find(|schedule| schedule.id == schedule_id)
-            {
-                schedule.enabled = !schedule.enabled;
-                app.persist_state();
-                app.refresh_automation_timer();
-            }
-        }
+        Message::CreateSchedule => app.create_schedule(),
+        Message::ToggleSchedule(schedule_id) => app.toggle_schedule(&schedule_id),
         Message::CycleTargetMonitor => app.cycle_target_monitor(),
         Message::KeyPressed {
             key,

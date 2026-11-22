@@ -373,6 +373,8 @@ impl Default for DepthDetailSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DepthSettings {
+    pub offset_x: f32,
+    pub offset_y: f32,
     pub height: f32,
     pub width: f32,
     pub spacing: f32,
@@ -767,6 +769,8 @@ pub struct SaveError {
     pub primary: Option<SaveFileStatus>,
     pub backup: BackupStatus,
     pub write_restriction: Option<StateWriteRestriction>,
+    pub(crate) os_code: Option<i32>,
+    pub(crate) primary_committed: bool,
     recovery_paths: Vec<PathBuf>,
     message: String,
 }
@@ -779,8 +783,18 @@ impl SaveError {
             backup,
             write_restriction: None,
             migration: Vec::new(),
+            os_code: None,
+            primary_committed: false,
             recovery_paths: Vec::new(),
             message: error.to_string(),
+        }
+    }
+
+    fn io(stage: SaveStage, backup: BackupStatus, error: io::Error) -> Self {
+        let os_code = error.raw_os_error();
+        Self {
+            os_code,
+            ..Self::new(stage, backup, error)
         }
     }
 
@@ -798,6 +812,8 @@ impl SaveError {
             write_restriction: None,
             recovery_paths,
             migration: Vec::new(),
+            os_code: None,
+            primary_committed: false,
             message: error.to_string(),
         }
     }
@@ -1110,6 +1126,8 @@ fn snapshot_originals(
 }
 fn sanitize_depth_geometry(settings: &mut DepthSettings) {
     let defaults = DepthSettings::default();
+    settings.offset_x = finite_or(settings.offset_x, 0.0).clamp(-1.0, 1.0);
+    settings.offset_y = finite_or(settings.offset_y, 0.0).clamp(-1.0, 1.0);
     settings.height = finite_or(settings.height, defaults.height).clamp(100.0, 1600.0);
     settings.width = finite_or(settings.width, defaults.width).clamp(40.0, 2400.0);
     settings.spacing = finite_or(settings.spacing, defaults.spacing).clamp(0.0, 4000.0);
@@ -1643,7 +1661,7 @@ impl CandidateState {
             )
         })?;
         if let Err(error) = fs::create_dir_all(parent) {
-            return Err(SaveError::new(
+            return Err(SaveError::io(
                 SaveStage::CreateDirectory,
                 BackupStatus::Unavailable,
                 error,
@@ -2073,18 +2091,18 @@ fn write_complete_file(
     stage: SaveStage,
     backup: BackupStatus,
 ) -> Result<(), SaveError> {
-    maybe_fail(fault, prepare_point).map_err(|error| SaveError::new(stage, backup, error))?;
+    maybe_fail(fault, prepare_point).map_err(|error| SaveError::io(stage, backup, error))?;
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
-        .map_err(|error| SaveError::new(stage, backup, error))?;
+        .map_err(|error| SaveError::io(stage, backup, error))?;
     file.write_all(contents)
-        .map_err(|error| SaveError::new(stage, backup, error))?;
-    maybe_fail(fault, flush_point).map_err(|error| SaveError::new(stage, backup, error))?;
+        .map_err(|error| SaveError::io(stage, backup, error))?;
+    maybe_fail(fault, flush_point).map_err(|error| SaveError::io(stage, backup, error))?;
     file.flush()
         .and_then(|()| file.sync_all())
-        .map_err(|error| SaveError::new(stage, backup, error))?;
+        .map_err(|error| SaveError::io(stage, backup, error))?;
     Ok(())
 }
 
@@ -2205,13 +2223,19 @@ fn publication_save_error(
         add_valid_recovery_path(&mut recovery_paths, path, inspection);
     }
     add_valid_recovery_path(&mut recovery_paths, backup_path, &backup);
-    SaveError::observed(
-        stage,
-        save_file_status(&primary),
-        backup_status(&backup),
-        recovery_paths,
-        error,
-    )
+    SaveError {
+        os_code: error.error.raw_os_error(),
+        primary_committed: stage == SaveStage::PublishPrimary
+            && error.publication_succeeded
+            && matches!(primary, StateFileInspection::Valid(_)),
+        ..SaveError::observed(
+            stage,
+            save_file_status(&primary),
+            backup_status(&backup),
+            recovery_paths,
+            error,
+        )
+    }
 }
 
 fn observed_save_error(
@@ -2613,6 +2637,8 @@ mod tests {
             state.gallery.mode = GalleryKind::Wall;
             state.gallery.variant = None;
             state.gallery.depth = DepthSettings {
+                offset_x: 0.0,
+                offset_y: 0.0,
                 height: 640.0,
                 width: 380.0,
                 spacing: 700.0,
@@ -2680,6 +2706,8 @@ mod tests {
             3.5
         );
         let mut low = DepthSettings {
+            offset_x: f32::NAN,
+            offset_y: 2.0,
             height: f32::NAN,
             width: 0.0,
             spacing: f32::NEG_INFINITY,
@@ -2696,6 +2724,7 @@ mod tests {
             },
         };
         sanitize_depth(&mut low, &mut Vec::new());
+        assert_eq!([low.offset_x, low.offset_y], [0.0, 1.0]);
         assert_eq!(
             (
                 low.height,

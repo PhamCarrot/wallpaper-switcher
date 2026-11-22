@@ -233,7 +233,7 @@ impl GpuCandidate {
             .pending_forms
             .rebase_after_reload(&self.state);
         self.settings_locale = next_locale;
-        self.gallery_mode = gallery_mode(self.state.gallery.mode);
+        self.assign_gallery_mode(gallery_mode(self.state.gallery.mode));
         self.wall_scroll_offset = 0.0;
         self.reset_depth_transients();
         self.invalidate_poster_work();
@@ -316,6 +316,9 @@ impl GpuCandidate {
                     self.state.gallery = preview;
                 }
                 self.record_save_outcome(&outcome);
+                self.settings_workbench.announce_save(
+                    view::settings::bridge::SaveNotice::local_result(Ok(&outcome)),
+                );
                 Ok(outcome)
             }
             Err(error) => {
@@ -329,6 +332,9 @@ impl GpuCandidate {
                     ""
                 };
                 let message=format!("Could not save local state: the proposal was not installed in the live saved state: {error}.{recovery} {}.", error.backup_description(&self.state_path.with_extension("toml.bak")));
+                self.settings_workbench.announce_save(
+                    view::settings::bridge::SaveNotice::local_result(Err(&error)),
+                );
                 self.save_failure = Some(message.clone());
                 self.status = Some(message);
                 Err(error)

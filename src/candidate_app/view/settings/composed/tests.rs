@@ -3,8 +3,8 @@ use std::collections::HashSet;
 
 #[test]
 fn source_descriptor_inventory_binds_retained_actions_to_distinct_editable_paths() {
-    assert_eq!(KEY_BINDINGS.len(), 33);
-    assert_eq!(input::InputAction::ALL.len(), 45);
+    assert_eq!(KEY_BINDINGS.len(), 42);
+    assert_eq!(input::InputAction::ALL.len(), 54);
     assert!(KEY_BINDINGS.iter().all(|entry| entry.path != "keys.studio"));
     assert!(schema::find("keys.studio").is_none());
     let mut paths = HashSet::new();
@@ -13,7 +13,7 @@ fn source_descriptor_inventory_binds_retained_actions_to_distinct_editable_paths
         assert!(!entry.title_key.is_empty());
         assert!(input::parse_binding(entry.action.default_binding()).is_some());
     }
-    assert_eq!(KeyBindingGroup::ALL.len(), 6);
+    assert_eq!(KeyBindingGroup::ALL.len(), 7);
 }
 
 #[test]

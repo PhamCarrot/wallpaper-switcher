@@ -1,0 +1,3 @@
+Owned generated JPEG fixtures:24x8 three8-pixel-wide constant stripes16/128/240. Pillow/libjpeg quality100/subsampling0, baseline RGB, progressive RGB, EXIF6 grayscale; CMYK negative. Expected decoded RGB for supported files is [v,v,v] and alpha255. Effects and gallery keep encoded24x8 raster; EXIF6 is not applied. No external media. Original files remain immutable.
+
+Additional32x32 RGB color quadrants, JPEG quality95/chroma4:2:0: rgb-color-420.jpg; independently decoded Pillow/libjpeg RGBA bytes are rgb-color-420.rgba. This checks actual color conversion/upsampling and opaque alpha, not only grey stripes.

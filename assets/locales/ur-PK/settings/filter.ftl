@@ -1,7 +1,7 @@
 settings-filter-appearance-card = ظاہری شکل
 settings-filter-appearance-card-desc = فلٹر بار کو ہر پکر ترتیب سے ملائیں، یا ہر جگہ ایک ہی انداز نافذ کریں۔
 settings-filter-visual-style-label = بصری انداز
-settings-filter-visual-style-desc = پکر سے ملائیں Slices اور Sandy میں ترچھی بار، Geometric میں جیومیٹرک بار اور Wall میں سیدھی بار استعمال کرتا ہے۔
+settings-filter-visual-style-desc = پکر سے ملائیں Slices میں ترچھی بار، Geometric میں جیومیٹرک بار اور Wall میں سیدھی بار استعمال کرتا ہے۔
 settings-filter-visual-style-match = پکر سے ملائیں
 settings-filter-visual-style-slices = Slices
 settings-filter-visual-style-hex = Geometric

@@ -69,6 +69,8 @@ pub enum InputAction {
     JumpLast,
     ModePrev,
     ModeNext,
+    PresetNext,
+    PresetPrev,
     Autocomplete,
     TypePrev,
     TypeNext,
@@ -84,9 +86,42 @@ pub enum InputAction {
     SourcePexels,
     SourceYoutube,
     SourceBing,
+    ConfigApplyToAll,
+    ConfigClose,
+    ConfigSwitchMonitor,
+    ConfigToggleExclude,
+    ConfigToggleHidden,
+    ConfigOpenExplorer,
+    ConfigReload,
 }
 
 impl InputAction {
+    pub const fn is_config_global(self) -> bool {
+        matches!(
+            self,
+            Self::ConfigApplyToAll
+                | Self::ConfigClose
+                | Self::ConfigSwitchMonitor
+                | Self::ConfigToggleExclude
+                | Self::ConfigToggleHidden
+                | Self::ConfigOpenExplorer
+                | Self::ConfigReload
+        )
+    }
+
+    pub const fn config_reserved_label(self) -> Option<&'static str> {
+        match self {
+            Self::ConfigApplyToAll => Some("Config: apply to all"),
+            Self::ConfigClose => Some("Config: close"),
+            Self::ConfigSwitchMonitor => Some("Config: monitor"),
+            Self::ConfigToggleExclude => Some("Config: exclude"),
+            Self::ConfigToggleHidden => Some("Config: hidden"),
+            Self::ConfigOpenExplorer => Some("Config: Explorer"),
+            Self::ConfigReload => Some("Config: reload"),
+            _ => None,
+        }
+    }
+
     pub const fn local_available(self) -> bool {
         matches!(
             self,
@@ -114,13 +149,15 @@ impl InputAction {
                 | Self::JumpLast
                 | Self::ModePrev
                 | Self::ModeNext
+                | Self::PresetNext
+                | Self::PresetPrev
                 | Self::TypePrev
                 | Self::TypeNext
                 | Self::SortPrev
                 | Self::SortNext
         )
     }
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 54] = [
         Self::Select,
         Self::Apply,
         Self::Flip,
@@ -151,6 +188,8 @@ impl InputAction {
         Self::JumpLast,
         Self::ModePrev,
         Self::ModeNext,
+        Self::PresetNext,
+        Self::PresetPrev,
         Self::Autocomplete,
         Self::TypePrev,
         Self::TypeNext,
@@ -166,6 +205,13 @@ impl InputAction {
         Self::SourcePexels,
         Self::SourceYoutube,
         Self::SourceBing,
+        Self::ConfigApplyToAll,
+        Self::ConfigClose,
+        Self::ConfigSwitchMonitor,
+        Self::ConfigToggleExclude,
+        Self::ConfigToggleHidden,
+        Self::ConfigOpenExplorer,
+        Self::ConfigReload,
     ];
 
     pub const fn default_binding(self) -> &'static str {
@@ -200,6 +246,7 @@ impl InputAction {
             Self::JumpLast => "end",
             Self::ModePrev => "shift+m",
             Self::ModeNext => "m",
+            Self::PresetNext | Self::PresetPrev => "none",
             Self::Autocomplete | Self::TypeNext => "tab",
             Self::TypePrev => "shift+tab",
             Self::SortPrev => "alt+left",
@@ -214,12 +261,21 @@ impl InputAction {
             Self::SourcePexels => "4",
             Self::SourceYoutube => "5",
             Self::SourceBing => "6",
+            Self::ConfigApplyToAll => "ctrl+return",
+            Self::ConfigClose => "escape",
+            Self::ConfigSwitchMonitor => "tab",
+            Self::ConfigToggleExclude => "x",
+            Self::ConfigToggleHidden => "h",
+            Self::ConfigOpenExplorer => "e",
+            Self::ConfigReload => "f5",
         }
     }
 
     pub const fn scope(self) -> InputScope {
         match self {
-            Self::TypePrev
+            Self::PresetNext
+            | Self::PresetPrev
+            | Self::TypePrev
             | Self::TypeNext
             | Self::ModePrev
             | Self::ModeNext
@@ -234,6 +290,10 @@ impl InputAction {
             | Self::SourceBing => InputScope::Downloads,
             _ => InputScope::Everywhere,
         }
+    }
+
+    pub const fn accepts_preset_wheel(self) -> bool {
+        matches!(self, Self::PresetNext | Self::PresetPrev)
     }
 
     pub const fn targets_card(self) -> bool {

@@ -98,13 +98,31 @@ where
 }
 
 /// Disposable owners can publish a flushed stage without ever replacing a destination.
-/// Unlike rename, hard-link creation remains create-only if another file appears concurrently.
+/// The create-only rename preserves a concurrent destination without a two-link window.
 pub(crate) fn publish_staged_file_create_only(
     replacement: &Path,
     destination: &Path,
 ) -> io::Result<()> {
-    fs::hard_link(replacement, destination)?;
-    fs::remove_file(replacement)
+    rename_file_create_only(replacement, destination)
+}
+
+#[cfg(windows)]
+pub(crate) fn rename_file_create_only(source: &Path, destination: &Path) -> io::Result<()> {
+    let base = std::env::current_dir()?;
+    let source = publication_windows_path(source, &base)?;
+    let destination = publication_windows_path(destination, &base)?;
+    // No replace or cross-volume copy flags. Both paths are in the same directory.
+    if unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            0,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub(crate) fn replace_existing_file(
@@ -466,6 +484,35 @@ extern "system" {
 mod tests {
     use super::*;
     use std::os::windows::ffi::OsStrExt;
+
+    #[test]
+    fn p37_create_only_publication_is_atomic_when_stage_cannot_be_renamed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        let (_, root) = crate::poster_worker::cache::tests::fixture();
+        let stage = root.join("publication.tmp");
+        let destination = root.join("published.bin");
+        fs::write(&stage, b"complete stage").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&stage)
+            .unwrap();
+        assert!(publish_staged_file_create_only(&stage, &destination).is_err());
+        assert!(
+            !destination.exists(),
+            "a failed rename must not publish a second link"
+        );
+        assert_eq!(fs::read(&stage).unwrap(), b"complete stage");
+        drop(held);
+        publish_staged_file_create_only(&stage, &destination).unwrap();
+        assert!(!stage.exists());
+        assert_eq!(fs::read(&destination).unwrap(), b"complete stage");
+        fs::write(&stage, b"competing stage").unwrap();
+        assert!(publish_staged_file_create_only(&stage, &destination).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"complete stage");
+        assert_eq!(fs::read(&stage).unwrap(), b"competing stage");
+    }
 
     fn converted(path: &str, base: &str) -> String {
         let units = publication_windows_path(Path::new(path), Path::new(base)).unwrap();

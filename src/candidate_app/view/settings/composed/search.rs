@@ -316,6 +316,7 @@ fn control_search_text(
         Control::AppTheme { app } => format!("{} {} {}", app.name, app.state, app.detail),
         Control::Segment => String::new(),
         Control::Static => String::from(tr("settings-search-control-static")),
+        Control::PlatformForm => String::new(),
         Control::Code { snippet } => {
             format!("{snippet} {}", tr("settings-search-control-code"))
         }
@@ -382,6 +383,7 @@ fn control_value(control: &Control, cfg: &dyn SettingsSource) -> String {
         Control::Details { summary, .. } | Control::StackBar { summary, .. } => summary.clone(),
         Control::Segment => String::new(),
         Control::Static => String::from(tr("settings-control-status")),
+        Control::PlatformForm => String::new(),
         Control::Code { .. } => String::from(tr("settings-control-code")),
         Control::AppTheme { app } => app.state.clone(),
     }

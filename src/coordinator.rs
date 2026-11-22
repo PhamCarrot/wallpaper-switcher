@@ -146,6 +146,15 @@ pub enum TransitionStatus {
 pub struct TransitionResult {
     pub status: TransitionStatus,
     pub warnings: Vec<String>,
+    pub displays: Vec<DisplayTransitionOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayTransitionOutcome {
+    pub display_id: String,
+    pub status: TransitionStatus,
+    pub intermediate_submitted: bool,
+    pub error: Option<String>,
 }
 
 impl TransitionResult {
@@ -153,6 +162,7 @@ impl TransitionResult {
         Self {
             status: TransitionStatus::NotRequested,
             warnings: Vec::new(),
+            displays: Vec::new(),
         }
     }
 
@@ -160,6 +170,7 @@ impl TransitionResult {
         Self {
             status: TransitionStatus::NotAttempted,
             warnings: vec![reason.into()],
+            displays: Vec::new(),
         }
     }
 
@@ -167,6 +178,7 @@ impl TransitionResult {
         Self {
             status: TransitionStatus::DirectFallback,
             warnings: vec![reason.into()],
+            displays: Vec::new(),
         }
     }
 
@@ -174,6 +186,7 @@ impl TransitionResult {
         Self {
             status: TransitionStatus::IncomingCaptureUnavailable,
             warnings,
+            displays: Vec::new(),
         }
     }
 
@@ -181,14 +194,15 @@ impl TransitionResult {
         Self {
             status: TransitionStatus::PartialIncomingCapture,
             warnings,
+            displays: Vec::new(),
         }
     }
 
-    fn playback_failed(mut warnings: Vec<String>, error: impl Into<String>) -> Self {
-        warnings.push(format!("transition playback failed: {}", error.into()));
+    fn playback_failed(warnings: Vec<String>) -> Self {
         Self {
             status: TransitionStatus::PlaybackFailed,
             warnings,
+            displays: Vec::new(),
         }
     }
 
@@ -304,6 +318,10 @@ impl EngineControlResult {
             .collect();
         (!failures.is_empty()).then(|| failures.join("; "))
     }
+
+    pub fn user_message(&self) -> Option<&'static str> {
+        user_facing_outcome_message(&self.outcomes)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -338,6 +356,36 @@ impl ApplyResult {
             })
             .collect();
         (!failures.is_empty()).then(|| failures.join("; "))
+    }
+
+    pub fn user_message(&self) -> Option<&'static str> {
+        user_facing_outcome_message(&self.outcomes)
+    }
+}
+
+fn user_facing_outcome_message(outcomes: &[MonitorApplyOutcome]) -> Option<&'static str> {
+    if outcomes
+        .iter()
+        .any(|outcome| outcome.state == ApplyOperationState::Unknown)
+    {
+        Some("Wallpaper provider state could not be confirmed.")
+    } else if outcomes
+        .iter()
+        .any(|outcome| outcome.state == ApplyOperationState::Failed)
+    {
+        Some("Wallpaper provider rejected the request.")
+    } else if outcomes
+        .iter()
+        .any(|outcome| outcome.state == ApplyOperationState::Cancelled)
+    {
+        Some("Wallpaper request was cancelled.")
+    } else if outcomes
+        .iter()
+        .any(|outcome| outcome.state == ApplyOperationState::CommandAccepted)
+    {
+        Some("Wallpaper request is still pending.")
+    } else {
+        None
     }
 }
 
@@ -385,9 +433,40 @@ pub(crate) fn fixture_operation_id() -> OperationId {
 }
 
 static UNRESOLVED_PROVIDER_OPERATIONS: OnceLock<Mutex<Vec<ProviderRecovery>>> = OnceLock::new();
+// Keep input paths and rollback snapshots alive through Apply and recovery recording.
+static NATIVE_CACHE_USE: Mutex<()> = Mutex::new(());
 
 fn unresolved_provider_operations() -> &'static Mutex<Vec<ProviderRecovery>> {
     UNRESOLVED_PROVIDER_OPERATIONS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub(crate) fn with_native_cache_eviction<T>(
+    evict: impl FnOnce(&HashSet<String>) -> T,
+) -> Result<T, String> {
+    let _gate = NATIVE_CACHE_USE
+        .try_lock()
+        .map_err(|_| "native cache is in use or Apply state is unavailable".to_string())?;
+    let pending = unresolved_provider_operations()
+        .lock()
+        .map_err(|_| "provider recovery state is unavailable".to_string())?;
+    if pending
+        .iter()
+        .any(|record| record.provider == ProviderKind::Native)
+    {
+        return Err("native provider recovery is pending".into());
+    }
+    drop(pending);
+
+    let monitors = native_wallpaper::monitors()?;
+    if monitors.is_empty() {
+        return Err("no monitor wallpaper paths could be confirmed".into());
+    }
+    let mut protected = HashSet::with_capacity(monitors.len());
+    for monitor in monitors {
+        let path = native_wallpaper::get_wallpaper_for_device(&monitor.device_id)?;
+        protected.insert(native_wallpaper::normalized_wallpaper_path(&path));
+    }
+    Ok(evict(&protected))
 }
 
 pub(crate) fn same_recovery(left: &ProviderRecovery, right: &ProviderRecovery) -> bool {
@@ -496,9 +575,23 @@ pub(crate) fn recovery_capabilities_for(
         } else if whole_request_preflight {
             "Provider state is Unknown for the same stable display; the unstarted request is retained".into()
         } else {
-            "Only exact original provider evidence after child settlement can resolve dispatched uncertainty".into()
+            "The provider could not confirm the requested change. Restore the requested state on the original display, then use Recheck provider in display settings.".into()
         },
     }
+}
+
+pub(crate) fn provider_recheck_available(recovery: &ProviderRecovery) -> bool {
+    unresolved_provider_operations()
+        .lock()
+        .is_ok_and(|pending| {
+            pending.contains(recovery)
+                && recovery_capabilities_for(
+                    recovery,
+                    &pending,
+                    engine_ipc::ensure_mutation_allowed().is_ok(),
+                )
+                .retry_observation
+        })
 }
 
 pub(crate) fn recovery_capabilities(recovery: &ProviderRecovery) -> RecoveryCapabilities {
@@ -1599,10 +1692,13 @@ pub(crate) fn resolve_explicit_apply_target_from_device_ids(
 }
 
 fn run_operation(request: ApplyRequest) -> ApplyResult {
+    let _native_cache_use = NATIVE_CACHE_USE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let operation_id = request.operation_id;
     let wallpaper_id = request.wallpaper.id.clone();
     let context = ApplyContext::default();
-    let (outcomes, transition) = match ensure_mutation_allowed() {
+    let (outcomes, mut transition) = match ensure_mutation_allowed() {
         Ok(()) => {
             crate::apply_trace::event("monitor-resolution-start", "enumerating=true");
             match resolve_target_monitors(&request.target) {
@@ -1642,6 +1738,36 @@ fn run_operation(request: ApplyRequest) -> ApplyResult {
             )
         }
     };
+    for outcome in &outcomes {
+        if !transition
+            .displays
+            .iter()
+            .any(|display| display.display_id == outcome.target_id)
+        {
+            transition.displays.push(DisplayTransitionOutcome {
+                display_id: outcome.target_id.clone(),
+                status: transition.status,
+                intermediate_submitted: false,
+                error: transition.warnings.first().cloned(),
+            });
+        }
+        let animation = transition
+            .displays
+            .iter()
+            .find(|display| display.display_id == outcome.target_id);
+        crate::apply_trace::event_lazy("transition-display-result", || {
+            format!(
+                "display={:?} provider={:?} provider_error={:?} animation={animation:?}",
+                outcome.target_id, outcome.state, outcome.error
+            )
+        });
+    }
+    transition.displays.sort_by_key(|display| {
+        outcomes
+            .iter()
+            .position(|outcome| outcome.target_id == display.display_id)
+            .unwrap_or(usize::MAX)
+    });
     retain_apply_recoveries(operation_id, &request, &outcomes);
     let recoveries = recovery_for_outcomes(&outcomes);
     let result = ApplyResult {
@@ -1775,6 +1901,7 @@ struct ApplyContext {
     engine_monitor_map: OnceLock<Result<engine_ipc::EngineMonitorMap, String>>,
     mutation_dispatched: std::cell::Cell<bool>,
     engine_capabilities: engine_ipc::EngineCapabilities,
+    confirmed_capture_owners: std::cell::RefCell<HashMap<String, (usize, u32)>>,
 }
 
 impl ApplyContext {
@@ -1855,10 +1982,43 @@ fn apply_with_outcomes(
         });
         outcomes
     };
+    if matches!(
+        request.wallpaper.source,
+        WallpaperSource::WallpaperEngine | WallpaperSource::LocalVideo
+    ) {
+        if let Err(error) = engine_ipc::validate_project_file(request.wallpaper.engine_target()) {
+            outcomes.extend(
+                monitors
+                    .iter()
+                    .map(|monitor| failed_outcome(monitor.device_id.clone(), error.clone())),
+            );
+            return (
+                order_outcomes(outcomes),
+                TransitionResult::not_attempted("the provider target file was unavailable"),
+            );
+        }
+    }
     let effect = request.transition.effect.resolve(random_sample());
+    crate::apply_trace::event_lazy("transition-effect", || {
+        format!(
+            "configured={} effect={} duration_ms={} targets={target_order:?}",
+            request.transition.effect.key(),
+            effect.key(),
+            request.transition.duration_ms,
+        )
+    });
     if effect == TransitionEffect::Off {
         outcomes.extend(apply_direct_to_monitors(request, monitors, context));
         return (order_outcomes(outcomes), TransitionResult::not_requested());
+    }
+
+    // A missing display has no outgoing frame and cannot confirm a target.
+    if !outcomes.is_empty() {
+        outcomes.extend(apply_direct_to_monitors(request, monitors, context));
+        return (
+            order_outcomes(outcomes),
+            TransitionResult::not_attempted("an outgoing target display was unavailable"),
+        );
     }
 
     match prepare_transition(request, monitors.clone(), context) {
@@ -1874,63 +2034,43 @@ fn apply_with_outcomes(
                     .collect(),
                 context,
             );
-            let all_applied = applied
-                .iter()
-                .all(|outcome| outcome.state == ApplyOperationState::ProviderConfirmed);
             outcomes.extend(applied);
-            if !all_applied {
-                return (
-                    order_outcomes(outcomes),
-                    TransitionResult::not_attempted(
-                        "transition playback was not started because the provider did not confirm every target",
-                    ),
-                );
-            }
-
-            let mut playable = Vec::with_capacity(prepared.outputs.len());
-            let mut capture_warnings = Vec::new();
-            for mut output in prepared.outputs.drain(..) {
-                let incoming = match output.incoming.take() {
-                    Some(frame) => Some(frame),
-                    None => match engine_capture::capture_frame(output.monitor.rect) {
-                        Ok(frame) => Some(frame),
-                        Err(error) => {
-                            let warning = format!(
-                                "{}: incoming frame unavailable ({error})",
-                                output.monitor.device_id
-                            );
-                            crate::log_debug(&format!(
-                                "Wallpaper changed on {} without animation because its rendered frame was unavailable: {error}",
-                                output.monitor.device_id
-                            ));
-                            capture_warnings.push(warning);
-                            None
-                        }
-                    },
-                };
-                if let Some(incoming) = incoming {
-                    output.incoming = Some(incoming);
-                    playable.push(output);
-                }
-            }
-            #[cfg(test)]
-            eprintln!("trace: playing synchronized transition");
             let duration = std::time::Duration::from_millis(request.transition.duration_ms);
-            let transition = if playable.is_empty() {
-                TransitionResult::incoming_capture_unavailable(capture_warnings)
-            } else if let Err(error) = play_synchronized(&mut playable, effect, duration) {
-                crate::log_debug(&format!(
-                    "Wallpaper changed without completing its transition: {error}"
-                ));
-                TransitionResult::playback_failed(capture_warnings, error)
-            } else if capture_warnings.is_empty() {
-                TransitionResult {
-                    status: TransitionStatus::Completed,
-                    warnings: Vec::new(),
-                }
-            } else {
-                TransitionResult::partial_incoming_capture(capture_warnings)
-            };
+            let overlay_windows: Vec<_> = prepared
+                .outputs
+                .iter()
+                .map(|output| output.session.window_identity())
+                .collect();
+            let transition = settle_incoming_transitions(
+                &outcomes,
+                prepared
+                    .outputs
+                    .drain(..)
+                    .map(|output| (output.monitor.device_id.clone(), output)),
+                |mut output| {
+                    let display = &output.monitor.device_id;
+                    if output.incoming.is_none() {
+                        let endpoint = context
+                            .confirmed_capture_owners
+                            .borrow()
+                            .get(display)
+                            .copied()
+                            .ok_or(
+                                "Wallpaper Engine did not confirm a capture owner for this display",
+                            )?;
+                        output.incoming = Some(engine_capture::capture_for_apply(
+                            output.monitor.rect,
+                            request.operation_id.get(),
+                            display,
+                            "incoming",
+                            endpoint,
+                            &overlay_windows,
+                        )?);
+                    }
+                    Ok(output)
+                },
+                |playable| play_synchronized(playable, effect, duration),
+            );
             return (order_outcomes(outcomes), transition);
         }
         Ok(None) => {
@@ -1961,37 +2101,182 @@ fn apply(request: ApplyRequest) -> Result<(), String> {
     result.error_message().map_or(Ok(()), Err)
 }
 
+fn settle_incoming_transitions<T>(
+    providers: &[MonitorApplyOutcome],
+    outputs: impl IntoIterator<Item = (String, T)>,
+    mut capture: impl FnMut(T) -> Result<T, String>,
+    play: impl FnOnce(&mut [T]) -> Vec<PlaybackProgress>,
+) -> TransitionResult {
+    if providers.is_empty()
+        || providers.iter().any(|outcome| {
+            outcome.state != ApplyOperationState::ProviderConfirmed || outcome.error.is_some()
+        })
+    {
+        return TransitionResult::not_attempted(
+            "transition playback was not started because the provider did not confirm every target",
+        );
+    }
+    let mut playable = Vec::new();
+    let mut targets = Vec::new();
+    let mut displays = Vec::new();
+    let mut warnings = Vec::new();
+    for (display_id, output) in outputs {
+        match capture(output) {
+            Ok(output) => {
+                targets.push(display_id);
+                playable.push(output);
+            }
+            Err(error) => {
+                let text = format!("{display_id}: incoming frame unavailable ({error})");
+                crate::log_debug(&text);
+                warnings.push(text);
+                displays.push(DisplayTransitionOutcome {
+                    display_id,
+                    status: TransitionStatus::IncomingCaptureUnavailable,
+                    intermediate_submitted: false,
+                    error: Some(error),
+                });
+            }
+        }
+    }
+
+    let incoming_missing = warnings.len();
+    let playback = if playable.is_empty() {
+        Vec::new()
+    } else {
+        play(&mut playable)
+    };
+    assert_eq!(playback.len(), targets.len());
+    let mut playback_failed = false;
+    for (display_id, progress) in targets.into_iter().zip(playback) {
+        let status = if let Some(error) = &progress.error {
+            playback_failed = true;
+            warnings.push(format!("{display_id}: {error}"));
+            TransitionStatus::PlaybackFailed
+        } else {
+            TransitionStatus::Completed
+        };
+        displays.push(DisplayTransitionOutcome {
+            display_id,
+            status,
+            intermediate_submitted: progress.intermediate_submitted,
+            error: progress.error,
+        });
+    }
+
+    let mut result = if playable.is_empty() {
+        TransitionResult::incoming_capture_unavailable(warnings)
+    } else if playback_failed {
+        TransitionResult::playback_failed(warnings)
+    } else if incoming_missing > 0 {
+        TransitionResult::partial_incoming_capture(warnings)
+    } else {
+        TransitionResult {
+            status: TransitionStatus::Completed,
+            warnings,
+            displays: Vec::new(),
+        }
+    };
+    result.displays = displays;
+    result
+}
+
+#[derive(Debug, Default)]
+struct PlaybackProgress {
+    intermediate_submitted: bool,
+    final_submitted: bool,
+    error: Option<String>,
+}
+
 fn play_synchronized(
     outputs: &mut [PreparedOutput],
     effect: TransitionEffect,
     duration: std::time::Duration,
-) -> Result<(), String> {
-    let started = std::time::Instant::now();
+) -> Vec<PlaybackProgress> {
     let frame_interval = std::time::Duration::from_millis(16);
-    loop {
-        let frame_started = std::time::Instant::now();
-        let elapsed = started.elapsed();
-        let progress = if duration.is_zero() {
-            1.0
-        } else {
-            (elapsed.as_secs_f32() / duration.as_secs_f32()).min(1.0)
-        };
-
-        for output in outputs.iter_mut() {
-            let incoming = output
-                .incoming
-                .as_ref()
-                .ok_or_else(|| "A prepared transition output has no incoming frame".to_string())?;
-            output.session.render(incoming, effect, progress)?;
-        }
-        for output in outputs.iter() {
-            output.session.present()?;
-        }
-        if progress >= 1.0 {
-            return Ok(());
-        }
-        std::thread::sleep(frame_interval.saturating_sub(frame_started.elapsed()));
+    let mut results: Vec<_> = outputs
+        .iter()
+        .map(|_| PlaybackProgress::default())
+        .collect();
+    for output in outputs.iter() {
+        crate::apply_trace::event_lazy("transition-playback-start", || {
+            format!(
+                "display={:?} effect={} duration_ms={} {}",
+                output.monitor.device_id,
+                effect.key(),
+                duration.as_millis(),
+                output.session.placement_trace()
+            )
+        });
     }
+    let started = std::time::Instant::now();
+    let playback = (|| -> Result<(), (usize, String)> {
+        loop {
+            let frame_started = std::time::Instant::now();
+            let elapsed = started.elapsed();
+            let progress = if duration.is_zero() {
+                1.0
+            } else {
+                (elapsed.as_secs_f32() / duration.as_secs_f32()).min(1.0)
+            };
+            for (index, output) in outputs.iter_mut().enumerate() {
+                let incoming = output.incoming.as_ref().ok_or_else(|| {
+                    (
+                        index,
+                        "A prepared transition output has no incoming frame".into(),
+                    )
+                })?;
+                output
+                    .session
+                    .render(incoming, effect, progress)
+                    .map_err(|error| (index, error))?;
+            }
+            for (index, output) in outputs.iter().enumerate() {
+                output.session.present().map_err(|error| (index, error))?;
+                let result = &mut results[index];
+                result.final_submitted = progress >= 1.0;
+                if !result.intermediate_submitted && progress > 0.0 && progress < 1.0 {
+                    result.intermediate_submitted = true;
+                    crate::apply_trace::event_lazy("transition-intermediate-submitted", || {
+                        format!(
+                            "display={:?} progress={progress:.3} elapsed_ms={} {}",
+                            output.monitor.device_id,
+                            elapsed.as_millis(),
+                            output.session.placement_trace()
+                        )
+                    });
+                }
+            }
+            if progress >= 1.0 {
+                return Ok(());
+            }
+            std::thread::sleep(frame_interval.saturating_sub(frame_started.elapsed()));
+        }
+    })();
+    if let Err((failed, error)) = playback {
+        let failed_display = &outputs[failed].monitor.device_id;
+        crate::log_debug(&format!(
+            "Transition playback failed for {failed_display}: {error}"
+        ));
+        for (index, result) in results.iter_mut().enumerate() {
+            if index == failed {
+                result.error = Some(error.clone());
+            } else if !result.final_submitted {
+                result.error = Some(format!(
+                    "Playback stopped before the final frame after display {failed_display} failed"
+                ));
+            }
+        }
+    }
+    for result in &mut results {
+        if result.error.is_none() && !duration.is_zero() && !result.intermediate_submitted {
+            result.error = Some(
+                "The transition reached the final frame before submitting an intermediate frame"
+                    .into(),
+            );
+        }
+    }
+    results
 }
 
 fn random_sample() -> u64 {
@@ -2034,8 +2319,10 @@ struct PreparedOutput {
 }
 
 fn outgoing_frame(
+    operation_id: OperationId,
     monitor: &native_wallpaper::NativeMonitor,
     context: &ApplyContext,
+    overlay_windows: &[usize],
 ) -> Result<FrozenFrame, String> {
     crate::apply_trace::event(
         "outgoing-capture-start",
@@ -2046,35 +2333,51 @@ fn outgoing_frame(
             monitor.rect.height()
         ),
     );
-    let result = outgoing_frame_inner(monitor, context);
+    let result = outgoing_frame_inner(operation_id, monitor, context, overlay_windows);
     match &result {
         Ok(frame) => crate::apply_trace::event(
             "outgoing-capture-complete",
-            format!("width={} height={}", frame.width, frame.height),
+            format!(
+                "display={:?} width={} height={}",
+                monitor.device_id, frame.width, frame.height
+            ),
         ),
-        Err(error) => {
-            crate::apply_trace::event("outgoing-capture-failure", format!("error={error:?}"))
-        }
+        Err(error) => crate::apply_trace::event(
+            "outgoing-capture-failure",
+            format!("display={:?} error={error:?}", monitor.device_id),
+        ),
     }
     result
 }
 
 fn outgoing_frame_inner(
+    operation_id: OperationId,
     monitor: &native_wallpaper::NativeMonitor,
     context: &ApplyContext,
+    overlay_windows: &[usize],
 ) -> Result<FrozenFrame, String> {
     match engine_ipc::availability() {
         engine_ipc::EngineAvailability::ControlAvailable => {
             let location = context.engine_location_for_device(&monitor.device_id)?;
-            let observation =
-                engine_ipc::observe_wallpaper(&EngineTarget::bound(&monitor.device_id, &location));
+            let (observation, endpoint) = engine_ipc::observe_wallpaper_with_identity(
+                &EngineTarget::bound(&monitor.device_id, &location),
+            );
             match observation.state {
                 EngineObservationState::Present(_)
                     if observation
                         .adequate_for(&EngineTarget::bound(&monitor.device_id, &location))
                         .is_ok() =>
                 {
-                    return engine_capture::capture_frame(monitor.rect)
+                    let endpoint = endpoint
+                        .ok_or("Wallpaper Engine did not confirm an outgoing capture owner")?;
+                    return engine_capture::capture_for_apply(
+                        monitor.rect,
+                        operation_id.get(),
+                        &monitor.device_id,
+                        "outgoing",
+                        endpoint,
+                        overlay_windows,
+                    );
                 }
                 EngineObservationState::ConfirmedAbsent
                     if observation
@@ -2107,16 +2410,24 @@ fn prepare_transition(
     context: &ApplyContext,
 ) -> Result<Option<PreparedTransition>, String> {
     let mut outputs = Vec::with_capacity(targets.len());
+    let mut overlay_windows = Vec::with_capacity(targets.len());
     for monitor in targets {
         #[cfg(test)]
         eprintln!("trace: capturing outgoing frame");
-        let outgoing = outgoing_frame(&monitor, context)?;
+        let outgoing = outgoing_frame(request.operation_id, &monitor, context, &overlay_windows)
+            .map_err(|error| {
+                format!(
+                    "{}: outgoing frame unavailable ({error})",
+                    monitor.device_id
+                )
+            })?;
         let incoming = match request.wallpaper.source {
             WallpaperSource::LocalImage => {
                 crate::apply_trace::event(
                     "incoming-decode-start",
                     format!(
-                        "path={:?} bytes={} width={} height={}",
+                        "display={:?} path={:?} bytes={} width={} height={}",
+                        monitor.device_id,
                         request.wallpaper.file_target,
                         request
                             .wallpaper
@@ -2135,16 +2446,22 @@ fn prepare_transition(
                     Ok(frame) => {
                         crate::apply_trace::event(
                             "incoming-decode-complete",
-                            format!("width={} height={}", frame.width, frame.height),
+                            format!(
+                                "display={:?} width={} height={}",
+                                monitor.device_id, frame.width, frame.height
+                            ),
                         );
                         Some(frame)
                     }
                     Err(error) => {
                         crate::apply_trace::event(
                             "incoming-decode-failure",
-                            format!("error={error:?}"),
+                            format!("display={:?} error={error:?}", monitor.device_id),
                         );
-                        return Err(error);
+                        return Err(format!(
+                            "{}: incoming image unavailable ({error})",
+                            monitor.device_id
+                        ));
                     }
                 }
             }
@@ -2152,7 +2469,17 @@ fn prepare_transition(
         };
         #[cfg(test)]
         eprintln!("trace: showing desktop transition surface");
-        let session = DesktopTransitionSession::show(outgoing, monitor.rect)?;
+        let session = DesktopTransitionSession::show(outgoing, monitor.rect)
+            .map_err(|error| format!("{}: {error}", monitor.device_id))?;
+        crate::apply_trace::event_lazy("transition-display-host", || {
+            format!(
+                "display={:?} target={:?} {}",
+                monitor.device_id,
+                monitor.rect,
+                session.placement_trace()
+            )
+        });
+        overlay_windows.push(session.window_identity());
         outputs.push(PreparedOutput {
             monitor,
             session,
@@ -2295,46 +2622,49 @@ fn apply_direct_to_monitors_with(
                 return unsettled_outcomes(&target_ids, index, error.message);
             }
             let mut attempted_restore_indices = HashSet::new();
-            let rollback_errors = restore_touched_monitors(&target_ids, index, |rollback_index| {
-                attempted_restore_indices.insert(rollback_index);
-                match restore(
-                    &monitors[rollback_index],
-                    &previous[rollback_index],
-                    context,
-                ) {
-                    Ok(()) => Ok(()),
-                    Err(RestorationFailure::EngineClose { location, message }) => {
-                        retain(close_recovery(
-                            request.operation_id,
-                            request.wallpaper.id.clone(),
-                            &monitors[rollback_index].device_id,
-                            &location,
-                            message.clone(),
-                        ));
-                        Err(message)
+            let touched = index + usize::from(!error.before_dispatch);
+            let rollback_errors = touched.checked_sub(1).map_or_else(HashMap::new, |last| {
+                restore_touched_monitors(&target_ids, last, |rollback_index| {
+                    attempted_restore_indices.insert(rollback_index);
+                    match restore(
+                        &monitors[rollback_index],
+                        &previous[rollback_index],
+                        context,
+                    ) {
+                        Ok(()) => Ok(()),
+                        Err(RestorationFailure::EngineClose { location, message }) => {
+                            retain(close_recovery(
+                                request.operation_id,
+                                request.wallpaper.id.clone(),
+                                &monitors[rollback_index].device_id,
+                                &location,
+                                message.clone(),
+                            ));
+                            Err(message)
+                        }
+                        Err(RestorationFailure::EngineState { message }) => {
+                            retain(engine_state_unavailable_recovery(
+                                request.operation_id,
+                                Some(request.wallpaper.id.clone()),
+                                &monitors[rollback_index].device_id,
+                                message.clone(),
+                            ));
+                            Err(message)
+                        }
+                        Err(RestorationFailure::Other(message)) => {
+                            retain(recovery_for_provider_state(
+                                request.operation_id,
+                                Some(request.wallpaper.id.clone()),
+                                &monitors[rollback_index],
+                                &previous[rollback_index],
+                                message.clone(),
+                            ));
+                            Err(message)
+                        }
                     }
-                    Err(RestorationFailure::EngineState { message }) => {
-                        retain(engine_state_unavailable_recovery(
-                            request.operation_id,
-                            Some(request.wallpaper.id.clone()),
-                            &monitors[rollback_index].device_id,
-                            message.clone(),
-                        ));
-                        Err(message)
-                    }
-                    Err(RestorationFailure::Other(message)) => {
-                        retain(recovery_for_provider_state(
-                            request.operation_id,
-                            Some(request.wallpaper.id.clone()),
-                            &monitors[rollback_index],
-                            &previous[rollback_index],
-                            message.clone(),
-                        ));
-                        Err(message)
-                    }
-                }
+                })
             });
-            for rollback_index in 0..=index {
+            for rollback_index in 0..touched {
                 if !attempted_restore_indices.contains(&rollback_index) {
                     let reason = rollback_errors
                         .get(&rollback_index)
@@ -2451,6 +2781,7 @@ fn unsupported_provider_failure(message: String) -> ProviderFailure {
         message,
         recovery: None,
         unsupported_capability: true,
+        before_dispatch: true,
     }
 }
 
@@ -2633,13 +2964,13 @@ fn restore_monitor_provider_state(
             wallpaper,
             location,
         } => {
-            engine_ipc::open_wallpaper(
+            let (observed, _) = engine_ipc::open_wallpaper(
                 wallpaper,
+                None, // A rollback snapshot has no independently captured project manifest.
                 &EngineTarget::bound(&monitor.device_id, location),
+                || context.mark_mutation_dispatched(),
             )
-            .map_err(RestorationFailure::Other)?;
-            let observed =
-                engine_ipc::observe_wallpaper(&EngineTarget::bound(&monitor.device_id, location));
+            .map_err(|error| RestorationFailure::Other(error.into_message()))?;
             readback_satisfies(
                 &ProviderPostcondition::EngineProject {
                     location: location.clone(),
@@ -2730,6 +3061,7 @@ struct ProviderFailure {
     message: String,
     recovery: Option<ProviderRecovery>,
     unsupported_capability: bool,
+    before_dispatch: bool,
 }
 
 impl From<String> for ProviderFailure {
@@ -2738,6 +3070,7 @@ impl From<String> for ProviderFailure {
             message,
             recovery: None,
             unsupported_capability: false,
+            before_dispatch: false,
         }
     }
 }
@@ -2751,6 +3084,7 @@ fn unknown_provider_failure(message: String, recovery: ProviderRecovery) -> Prov
         },
         recovery: Some(recovery),
         unsupported_capability: false,
+        before_dispatch: false,
     }
 }
 
@@ -2983,26 +3317,31 @@ fn apply_direct_to_monitor(
                 &location,
                 "Engine project/media target did not reach independent confirmation".into(),
             );
-            context.mark_mutation_dispatched();
-            engine_ipc::open_wallpaper(
+            let (observed, endpoint) = engine_ipc::open_wallpaper(
                 wallpaper.engine_target(),
+                (wallpaper.source == WallpaperSource::WallpaperEngine)
+                    .then_some(wallpaper.project_json_path.as_path()),
                 &EngineTarget::bound(&monitor.device_id, &location),
+                || context.mark_mutation_dispatched(),
             )
-            .map_err(|error| {
-                if provider_state_is_unknown(&error) {
-                    unknown_provider_failure(error, recovery.clone())
-                } else {
-                    error.into()
-                }
+            .map_err(|error| match error {
+                engine_ipc::EngineControlFailure::BeforeDispatch(message) => ProviderFailure {
+                    before_dispatch: true,
+                    ..ProviderFailure::from(message)
+                },
+                other => unknown_provider_failure(other.into_message(), recovery.clone()),
             })?;
-            let observed =
-                engine_ipc::observe_wallpaper(&EngineTarget::bound(&monitor.device_id, &location));
             readback_satisfies(
                 &recovery.expected,
                 &ProviderReadback::Engine(observed),
                 Some(&EngineTarget::bound(&monitor.device_id, &location)),
             )
-            .map_err(|error| unknown_provider_failure(error, recovery))
+            .map_err(|error| unknown_provider_failure(error, recovery))?;
+            context
+                .confirmed_capture_owners
+                .borrow_mut()
+                .insert(monitor.device_id.clone(), endpoint);
+            Ok(())
         }
     }
 }
@@ -3035,9 +3374,116 @@ fn apply_engine_location(
 }
 
 #[cfg(test)]
+pub(crate) use contract_tests::RecheckFixture;
+
+#[cfg(test)]
 mod contract_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    pub(crate) struct RecheckFixture {
+        pub(crate) record: ProviderRecovery,
+        receiver: mpsc::Receiver<CoordinatorRequest>,
+        pending_requests: Arc<AtomicUsize>,
+    }
+
+    impl RecheckFixture {
+        pub(crate) fn new(phase: RecoveryPhase) -> (Self, WallpaperCoordinator) {
+            let mut record = r12_preflight();
+            record
+                .reason
+                .push_str(" C:/private-fixture/provider-output.txt");
+            record.operation_id = fixture_operation_id().get();
+            record.phase = phase;
+            if phase == RecoveryPhase::DispatchedOrUnknown {
+                record.expected = ProviderPostcondition::EngineProject {
+                    location: "Monitor0".into(),
+                    path: "C:/fixture/project.json".into(),
+                };
+            }
+
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let pending_requests = Arc::new(AtomicUsize::new(0));
+            let owner = WallpaperCoordinator {
+                sender,
+                pending_requests: pending_requests.clone(),
+            };
+            retain_provider_recovery(record.clone());
+            (
+                Self {
+                    record,
+                    receiver,
+                    pending_requests,
+                },
+                owner,
+            )
+        }
+
+        pub(crate) fn take(&self) -> Option<(OperationId, EngineCommand)> {
+            let request = match self.receiver.try_recv() {
+                Ok(request) => request,
+                Err(mpsc::TryRecvError::Empty) => return None,
+                Err(mpsc::TryRecvError::Disconnected) => panic!("fixture coordinator disconnected"),
+            };
+            let _owned = PendingRequest(self.pending_requests.clone());
+            match request {
+                CoordinatorRequest::Engine(request) => {
+                    Some((request.operation_id, request.command))
+                }
+                CoordinatorRequest::Apply(_) => panic!("Recheck provider queued an Apply"),
+            }
+        }
+
+        pub(crate) fn finish(
+            &self,
+            queued: (OperationId, EngineCommand),
+            saved_only: bool,
+        ) -> EngineControlResult {
+            let (operation_id, command) = queued;
+            assert_eq!(
+                command,
+                EngineCommand::ReconcileProvider {
+                    recovery: self.record.clone(),
+                }
+            );
+
+            let readback = reconcile_provider_readback_with(
+                &self.record,
+                true,
+                || Ok(vec!["display-a".into(), "display-b".into()]),
+                || Ok(r12_mapping(0, 1)),
+                |target| {
+                    assert_eq!(target, &EngineTarget::bound("display-a", "Monitor0"));
+                    if saved_only {
+                        s1_saved_selection(target)
+                    } else {
+                        engine_ipc::control_query_observation(target, "C:/fixture/project.json")
+                    }
+                },
+                |_| panic!("Engine recheck attempted native wallpaper readback"),
+            );
+            let outcomes = {
+                let mut pending = unresolved_provider_operations().lock().unwrap();
+                finish_reconciliation(&mut pending, &self.record, readback)
+            };
+            let recoveries = recovery_for_outcomes(&outcomes);
+            EngineControlResult {
+                operation_id,
+                command,
+                outcomes,
+                recoveries,
+            }
+        }
+    }
+
+    impl Drop for RecheckFixture {
+        fn drop(&mut self) {
+            let mut pending = unresolved_provider_operations()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            settle_matching_recovery(&mut pending, &self.record);
+        }
+    }
 
     fn s1_saved_selection(target: &EngineTarget) -> EngineObservation {
         let json = serde_json::json!({"account":{"general":{
@@ -3580,6 +4026,7 @@ mod contract_tests {
         ApplyRequest {
             operation_id: OperationId(1201),
             wallpaper: WallpaperItem {
+                scan_metadata: None,
                 id: "item-a".into(),
                 title: "Fixture".into(),
                 folder_path: "C:/fixture".into(),
@@ -4311,6 +4758,35 @@ mod contract_tests {
             result.error_message().as_deref(),
             Some("display-a: operation was cancelled; display-b: provider state is unknown")
         );
+        assert_eq!(
+            result.user_message(),
+            Some("Wallpaper provider state could not be confirmed.")
+        );
+    }
+
+    #[test]
+    fn user_message_hides_provider_diagnostics_but_error_message_keeps_them() {
+        let result = ApplyResult {
+            operation_id: OperationId(22),
+            wallpaper_id: "wallpaper-3".into(),
+            outcomes: vec![MonitorApplyOutcome {
+                target_id: "DISPLAY-A".into(),
+                state: ApplyOperationState::Unknown,
+                error: Some(
+                    "provider-state-unknown: persisted path C:/private/project.json was not a live readback"
+                        .into(),
+                ),
+            }],
+            recoveries: Vec::new(),
+            transition: TransitionResult::not_requested(),
+        };
+        assert!(result
+            .error_message()
+            .is_some_and(|message| message.contains("C:/private/project.json")));
+        assert_eq!(
+            result.user_message(),
+            Some("Wallpaper provider state could not be confirmed.")
+        );
     }
 
     #[test]
@@ -4337,6 +4813,96 @@ mod contract_tests {
     }
 
     #[test]
+    fn mixed_incoming_capture_keeps_both_provider_confirmations_and_one_playback() {
+        let context = ApplyContext::default();
+        let mut dispatches = Vec::new();
+        let providers = apply_direct_to_monitors_with(
+            &r12_request(),
+            vec![r12_monitor("display-a"), r12_monitor("display-b")],
+            &context,
+            |_, _| {
+                Ok(MonitorProviderState::Native {
+                    wallpaper: "C:/owned-baseline.jpg".into(),
+                    position: native_wallpaper::FILL_POSITION,
+                })
+            },
+            |_, _, display, _, _| {
+                dispatches.push(display.device_id.clone());
+                Ok(())
+            },
+            |_, _, _| panic!("both distinct mock providers confirmed"),
+            |_| panic!("no mock recovery necessary"),
+            || true,
+        );
+        assert_eq!(dispatches, ["display-a", "display-b"]);
+        let slots = providers
+            .iter()
+            .enumerate()
+            .map(|(index, outcome)| (outcome.target_id.clone(), index));
+        let mut presented = Vec::new();
+        let receipt = settle_incoming_transitions(
+            &providers,
+            slots,
+            |slot| {
+                if slot == 1 {
+                    Err("rendered frame unavailable".into())
+                } else {
+                    Ok(slot)
+                }
+            },
+            |outputs| {
+                presented.extend_from_slice(outputs);
+                vec![PlaybackProgress {
+                    intermediate_submitted: true,
+                    final_submitted: true,
+                    error: None,
+                }]
+            },
+        );
+        assert_eq!(receipt.status, TransitionStatus::PartialIncomingCapture);
+        assert_eq!(presented, [0]);
+        for outcome in providers {
+            assert_eq!(outcome.state, ApplyOperationState::ProviderConfirmed);
+            let animation = receipt
+                .displays
+                .iter()
+                .find(|item| item.display_id == outcome.target_id)
+                .unwrap();
+            if outcome.target_id == "display-a" {
+                assert_eq!(animation.status, TransitionStatus::Completed);
+                assert!(animation.intermediate_submitted);
+                assert!(animation.error.is_none());
+            } else {
+                assert_eq!(
+                    animation.status,
+                    TransitionStatus::IncomingCaptureUnavailable
+                );
+                assert!(!animation.intermediate_submitted);
+                assert_eq!(
+                    animation.error.as_deref(),
+                    Some("rendered frame unavailable")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_incoming_capture_requires_confirmation_on_every_display() {
+        let providers = [
+            confirmed_outcome("display-a".into()),
+            unknown_outcome("display-b".into(), "no independent confirmation".into()),
+        ];
+        let receipt = settle_incoming_transitions(
+            &providers,
+            [("display-a".into(), 0), ("display-b".into(), 1)],
+            |_| panic!("unconfirmed provider must stop incoming capture"),
+            |_| panic!("unconfirmed provider must stop playback"),
+        );
+        assert_eq!(receipt.status, TransitionStatus::NotAttempted);
+        assert_eq!(providers[1].state, ApplyOperationState::Unknown);
+    }
+
+    #[test]
     fn transition_result_keeps_capture_playback_and_success_paths_distinct() {
         let missing = TransitionResult::incoming_capture_unavailable(vec![
             "display-a: incoming frame unavailable".into(),
@@ -4354,7 +4920,7 @@ mod contract_tests {
             .warning_message()
             .is_some_and(|warning| warning.contains("available targets")));
 
-        let playback = TransitionResult::playback_failed(Vec::new(), "surface was destroyed");
+        let playback = TransitionResult::playback_failed(vec!["surface was destroyed".into()]);
         assert_eq!(playback.status_name(), "playback-failed");
         assert!(playback
             .warning_message()
@@ -4363,6 +4929,7 @@ mod contract_tests {
         let completed = TransitionResult {
             status: TransitionStatus::Completed,
             warnings: Vec::new(),
+            displays: Vec::new(),
         };
         assert_eq!(completed.status_name(), "completed");
         assert_eq!(completed.warning_message(), None);
@@ -4577,6 +5144,7 @@ mod contract_tests {
     #[test]
     fn engine_recovery_uses_the_actual_scene_media_or_local_video_identity() {
         let scene = WallpaperItem {
+            scan_metadata: None,
             id: "scene".into(),
             title: "Scene".into(),
             folder_path: std::path::PathBuf::from(r"C:\scene"),
@@ -4742,6 +5310,7 @@ mod runtime_tests {
 
     fn local_item(path: &Path) -> WallpaperItem {
         WallpaperItem {
+            scan_metadata: None,
             id: format!("runtime-local:{}", path.display()),
             title: "Runtime local image".to_string(),
             folder_path: path.parent().unwrap_or(Path::new("")).to_path_buf(),
@@ -4769,6 +5338,7 @@ mod runtime_tests {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("scene.pkg");
         WallpaperItem {
+            scan_metadata: None,
             id: format!("runtime-engine:{}", path.display()),
             title: value
                 .get("title")

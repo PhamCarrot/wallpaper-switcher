@@ -780,7 +780,13 @@ impl GpuCandidate {
                 apply_trace::event_for_lazy(
                     submission.operation_id.get(),
                     "ui-apply-submission",
-                    || trace_submission.unwrap_or_else(|| "item_identity=not_captured".into()),
+                    || {
+                        format!("{} picker_window={:?} picker_generation={} picker_visible={} close_on_selection={}",
+                        trace_submission.unwrap_or_else(|| "item_identity=not_captured".into()),
+                        self.window, self.visibility_generation, self.visible,
+                        (view::settings::bridge::Source { app: self }).flag("general.closeOnSelection"),
+                    )
+                    },
                 );
                 self.apply_pending = true;
                 self.active_operation = Some(submission.operation_id);

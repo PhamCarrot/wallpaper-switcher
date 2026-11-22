@@ -946,6 +946,16 @@ impl GpuCandidate {
             return;
         };
         self.screenshot_requested = true;
+        crate::apply_trace::event_lazy("gallery-screenshot-request", || {
+            format!(
+                "phase=scheduled path={} posters={} depth={}",
+                self.screenshot_path
+                    .as_deref()
+                    .map_or_else(|| "<none>".into(), |path| path.display().to_string()),
+                self.posters.len(),
+                self.depth_frame.is_some(),
+            )
+        });
         std::thread::Builder::new()
             .name("gpu-candidate-screenshot".into())
             .spawn(move || {

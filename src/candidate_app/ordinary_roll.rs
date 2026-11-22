@@ -14,6 +14,7 @@ pub(super) struct OrdinaryRoll {
     pub wave: f32,
     pub old: Vec<OrdinaryGhost>,
     pub incoming: HashMap<(i32, i32), f32>,
+    pub poster_wait_deadline: Option<std::time::Instant>,
 }
 impl OrdinaryRoll {
     pub fn advance_to(&mut self, wave: f32) {
@@ -48,6 +49,21 @@ fn phase(mode: GalleryMode, c: [f32; 2], viewport: [f32; 2], center: f32) -> f32
 }
 
 impl GpuCandidate {
+    pub(super) fn wall_colour_roll_held(&self) -> bool {
+        self.ordinary_roll
+            .as_ref()
+            .is_some_and(|roll| roll.poster_wait_deadline.is_some())
+    }
+
+    pub(super) fn release_wall_colour_roll(&mut self, reason: &'static str) {
+        if let Some(roll) = &mut self.ordinary_roll {
+            if roll.poster_wait_deadline.take().is_some() {
+                apply_trace::event_lazy("wall-colour-roll-released", || format!("reason={reason}"));
+                self.start_motion(0.0);
+            }
+        }
+    }
+
     /// User-approved ordinary incoming/outgoing union shares the device/256 MiB atlas bound.
     pub(super) fn ordinary_union_limit(&self) -> usize {
         gpu_gallery::ordinary_poster_limit()
@@ -161,6 +177,7 @@ impl GpuCandidate {
             wave: 0.0,
             old,
             incoming: HashMap::new(),
+            poster_wait_deadline: None,
         }))
     }
 

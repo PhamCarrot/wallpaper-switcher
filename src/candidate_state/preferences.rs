@@ -224,6 +224,8 @@ pub enum BindingAction {
     JumpLast,
     ModePrev,
     ModeNext,
+    PresetNext,
+    PresetPrev,
     Autocomplete,
     TypePrev,
     TypeNext,

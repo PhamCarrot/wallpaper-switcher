@@ -40,8 +40,8 @@ pub(super) fn tab_general(
     builder.action(
         tr("r5-windows-target-title"),
         tr("r5-windows-target-help"),
-        ActionId::OpenWindowsDisplays,
-        tr("r5-windows-controls"),
+        ActionId::OpenDisplays,
+        tr("settings-tab-displays"),
     );
     builder.num_setting(
         tr("settings-general-ui-scale-label"),
@@ -170,12 +170,6 @@ pub(super) fn tab_schedule(builder: &mut Builder<'_>) {
         tr("settings-schedule-apply-on-start-label"),
         tr("settings-schedule-apply-on-start-desc"),
         keys::schedule::APPLY_ON_START,
-    );
-    builder.action(
-        tr("settings-schedule-editor-label"),
-        tr("settings-schedule-editor-desc"),
-        ActionId::OpenScheduleEditor,
-        tr("settings-schedule-editor-action"),
     );
     builder.card(
         tr("settings-schedule-location-card"),
@@ -446,7 +440,11 @@ pub(super) fn tab_keybinds(builder: &mut Builder<'_>) {
         }
         for descriptor in crate::candidate_app::view::settings::composed::KEY_BINDINGS
             .into_iter()
-            .filter(|entry| entry.group == group && entry.action.local_available())
+            .filter(|entry| {
+                entry.group == group
+                    && (entry.action.local_available()
+                        || group == crate::candidate_app::view::settings::composed::KeyBindingGroup::Global)
+            })
         {
             builder.key_binding(
                 tr(descriptor.title_key),
@@ -486,7 +484,7 @@ pub(super) fn tab_keybinds(builder: &mut Builder<'_>) {
             crate::candidate_app::view::settings::composed::KEY_BINDINGS
                 .into_iter()
                 .find(|entry| entry.action == action)
-                .map_or("", |entry| tr(entry.title_key))
+                .map_or_else(String::new, |entry| tr(entry.title_key).to_string())
         };
         let msg = tr_args!(catalog, "settings-keybinds-conflict-desc", first => title(first), second => title(second), binding => bindings.label(first));
         builder.row(

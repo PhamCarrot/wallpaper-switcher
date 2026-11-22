@@ -1,7 +1,7 @@
 settings-filter-appearance-card = Внешний вид
 settings-filter-appearance-card-desc = Подстраивайте панель фильтров под каждую раскладку окна выбора или используйте один стиль везде.
 settings-filter-visual-style-label = Визуальный стиль
-settings-filter-visual-style-desc = «Как у окна выбора» использует наклонную панель для полос и песка, геометрическую для геометрического выбора и прямую для стены.
+settings-filter-visual-style-desc = «Как у окна выбора» использует наклонную панель для полос, геометрическую для геометрического выбора и прямую для стены.
 settings-filter-visual-style-match = Как у окна выбора
 settings-filter-visual-style-slices = Полосы
 settings-filter-visual-style-hex = Геометрический

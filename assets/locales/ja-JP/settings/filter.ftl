@@ -1,7 +1,7 @@
 settings-filter-appearance-card = 外観
 settings-filter-appearance-card-desc = フィルターバーを各ピッカーレイアウトに合わせるか、すべてで 1 つのスタイルを使います。
 settings-filter-visual-style-label = 表示スタイル
-settings-filter-visual-style-desc = 「ピッカーに合わせる」は、スライスとサンドでは斜めのバー、ジオメトリックでは幾何学的なバー、ウォールではまっすぐなバーを使います。
+settings-filter-visual-style-desc = 「ピッカーに合わせる」は、スライスでは斜めのバー、ジオメトリックでは幾何学的なバー、ウォールではまっすぐなバーを使います。
 settings-filter-visual-style-match = ピッカーに合わせる
 settings-filter-visual-style-slices = スライス
 settings-filter-visual-style-hex = ジオメトリック

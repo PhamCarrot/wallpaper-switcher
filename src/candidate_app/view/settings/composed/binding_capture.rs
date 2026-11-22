@@ -59,7 +59,9 @@ impl Capture {
     pub fn proposal(&self, current_generation: u64, map: &InputMap) -> Option<Vec<Change>> {
         if self.generation != current_generation
             || !self.edited
-            || !map.reserved_conflicts(&self.triggers).is_empty()
+            || !map
+                .reserved_conflicts_except(self.action, &self.triggers)
+                .is_empty()
         {
             return None;
         }

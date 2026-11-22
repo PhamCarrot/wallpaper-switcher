@@ -13,7 +13,7 @@ pub(in crate::candidate_app) fn category_key(category: SettingsCategory) -> &'st
         SettingsCategory::Picker => "picker",
         SettingsCategory::CatalogFilters => "filter",
         SettingsCategory::Position => "position",
-        SettingsCategory::WallpapersDisplays => "automation",
+        SettingsCategory::WallpapersDisplays => "displays",
         SettingsCategory::Motion => "motion",
         SettingsCategory::Playback => "playback",
         SettingsCategory::Library => "library",
@@ -49,9 +49,12 @@ pub(in crate::candidate_app) fn reconcile(app: &mut GpuCandidate) {
         if active {
             if entering {
                 app.settings_workbench.clear_preview();
-                let mut tween = Tween::for_duration_ms(0.0, Source { app }.motion_standard_ms());
-                tween.retarget(1.0);
-                app.settings_workbench.folio_entrance = Some(tween);
+                if app.scene_motion.settings_opacity() == 0.0 {
+                    let mut tween =
+                        Tween::for_duration_ms(0.0, Source { app }.motion_standard_ms());
+                    tween.retarget(1.0);
+                    app.settings_workbench.folio_entrance = Some(tween);
+                }
                 app.settings_workbench.tab_reveal =
                     Some(Tween::for_duration_ms(1.0, Source { app }.motion_fast_ms()));
                 app.settings_workbench.last_frame = None;
@@ -63,6 +66,9 @@ pub(in crate::candidate_app) fn reconcile(app: &mut GpuCandidate) {
             }
             if changed || app.settings_workbench.tab.is_empty() {
                 app.settings_workbench.tab = category_key(app.panel_state.settings_category).into();
+                app.settings_workbench.navigation.section = 0;
+                app.settings_workbench.navigation.row = 0;
+                app.settings_workbench.navigation.choice = None;
                 app.settings_workbench.windows_panel = (app.panel_state.settings_category
                     == SettingsCategory::Theme)
                     .then_some(SettingsCategory::Theme);
@@ -85,7 +91,12 @@ pub(in crate::candidate_app) fn reconcile(app: &mut GpuCandidate) {
                 .cloned();
         } else {
             let session = &mut app.settings_workbench;
+            if app.visible && app.scene_motion.settings_opacity() > 0.0 {
+                session.keep_outgoing_visuals();
+            }
             session.clear_preview();
+            session.save_notice = None;
+            session.save_details_open = false;
             session.draft.depart();
             session.generation = session.generation.wrapping_add(1);
             session.capture = None;
@@ -95,6 +106,7 @@ pub(in crate::candidate_app) fn reconcile(app: &mut GpuCandidate) {
         }
     }
     if !active {
+        app.settings_workbench.visible_layout_options.clear();
         return;
     }
     app.settings_workbench.folders = app
@@ -105,6 +117,27 @@ pub(in crate::candidate_app) fn reconcile(app: &mut GpuCandidate) {
         .map(|path| path.to_string_lossy().into_owned())
         .collect();
     let model = cards(app);
+    if app.settings_workbench.layout_studio() {
+        let options: HashSet<_> = model
+            .get(composed::PICKER_LAYOUT_SECTION)
+            .into_iter()
+            .flat_map(|(_, rows)| rows)
+            .filter_map(|row| super::folio::workbench::layout_option_reveal_key(&row.control))
+            .collect();
+        if options != app.settings_workbench.visible_layout_options {
+            let duration = Source { app }.motion_fast_ms();
+            let session = &mut app.settings_workbench;
+            for id in options.difference(&session.visible_layout_options) {
+                let mut tween = Tween::for_duration_ms(0.0, duration);
+                tween.retarget(1.0);
+                session.bar_reveals.insert(id.clone(), tween);
+            }
+            session.visible_layout_options = options;
+            session.last_frame = None;
+        }
+    } else {
+        app.settings_workbench.visible_layout_options.clear();
+    }
     let mut values = HashMap::new();
     fn collect(rows: &[composed::Row], source: &Source<'_>, values: &mut HashMap<String, String>) {
         for row in rows {
@@ -164,8 +197,285 @@ fn retired_source_transition_path(path: &str) -> bool {
     ) || path.starts_with("transition.shaderScopes.")
 }
 
+fn persist_wallpaper_transition(
+    app: &mut GpuCandidate,
+    path: &str,
+    value: &Value,
+) -> Result<bool, String> {
+    use crate::transition::TransitionEffect;
+    use composed::keys::wallpaper_transition as T;
+    use composed::transitions::{native_default_effect_for_family, Family};
+
+    if !matches!(path, T::ENABLED | T::EFFECT | T::FAMILY | T::DURATION_MS) {
+        return Ok(false);
+    }
+
+    let mut proposed = app.config.clone();
+    match (path, value) {
+        (T::ENABLED, Value::Boolean(enabled)) => {
+            proposed.transition.effect = if *enabled {
+                (proposed.transition.effect == TransitionEffect::Off)
+                    .then_some(TransitionEffect::Crossfade)
+                    .unwrap_or(proposed.transition.effect)
+            } else {
+                TransitionEffect::Off
+            };
+        }
+        (T::EFFECT, Value::Text(effect)) => {
+            proposed.transition.effect = TransitionEffect::parse_saved(effect)
+                .map_err(|error| error.to_string())?
+                .effect;
+        }
+        (T::FAMILY, Value::Text(family)) => {
+            let family = match family.as_str() {
+                "random" => Family::Random,
+                "fade" => Family::Fade,
+                "wipe" => Family::Wipe,
+                "warp" => Family::Warp,
+                "break" => Family::Break,
+                "sand" => {
+                    return Err("Sand transitions are unavailable in this Windows build.".into())
+                }
+                _ => return Err("Choose a listed transition family.".into()),
+            };
+            proposed.transition.effect = if family == Family::Random {
+                TransitionEffect::Random
+            } else {
+                native_default_effect_for_family(family).ok_or_else(|| {
+                    "The selected transition family has no native effects.".to_string()
+                })?
+            };
+        }
+        (T::DURATION_MS, Value::Number(duration_ms)) if duration_ms.is_finite() => {
+            proposed.transition.duration_ms = duration_ms.round().clamp(100.0, 10_000.0) as u64;
+        }
+        (T::DURATION_MS, Value::Number(_)) => {
+            return Err("Enter a finite transition duration.".into());
+        }
+        _ => return Err("The wallpaper transition value has the wrong type.".into()),
+    }
+
+    let backup_path = crate::config::Config::config_path().with_extension("toml.bak");
+    let result = proposed.save_with_diagnostics();
+    app.settings_workbench
+        .announce_save(super::bridge::SaveNotice::config_result(
+            "Wallpaper transition",
+            result.as_ref(),
+        ));
+    match result {
+        Ok(outcome) => {
+            app.config = proposed;
+            let effect = app.config.transition.effect;
+            app.settings_workbench.draft.values.insert(
+                T::ENABLED.to_string(),
+                Value::Boolean(effect != TransitionEffect::Off),
+            );
+            app.settings_workbench
+                .draft
+                .values
+                .insert(T::EFFECT.to_string(), Value::Text(effect.key().to_string()));
+            app.settings_workbench.draft.values.insert(
+                T::FAMILY.to_string(),
+                Value::Text(
+                    composed::transitions::native_family_of(effect)
+                        .key()
+                        .to_string(),
+                ),
+            );
+            app.settings_workbench.draft.values.insert(
+                T::DURATION_MS.to_string(),
+                Value::Number(app.config.transition.duration_ms as f64),
+            );
+            app.config_save_failure = (!outcome.backup.is_available()).then(|| {
+                format!(
+                    "Wallpaper transition saved, but {}",
+                    outcome.backup_description(&backup_path)
+                )
+            });
+            app.settings_workbench.message = format!(
+                "Wallpaper transition saved. {}",
+                outcome.backup_description(&backup_path)
+            );
+            Ok(true)
+        }
+        Err(error) => {
+            let failure = format!(
+                "Wallpaper transition was not fully saved: {error}. {}",
+                error.backup_description(&backup_path)
+            );
+            app.config_save_failure = Some(failure.clone());
+            Err(failure)
+        }
+    }
+}
+
+fn edit_config_keybind(
+    config: &mut crate::config::Config,
+    path: &str,
+    value: &Value,
+) -> Result<Option<bool>, String> {
+    use composed::keys::keybind as K;
+    let slot = match path {
+        K::CONFIG_APPLY_TO_ALL => &mut config.keybinds.apply_to_all,
+        K::CONFIG_CLOSE => &mut config.keybinds.close,
+        K::CONFIG_SWITCH_MONITOR => &mut config.keybinds.switch_monitor,
+        K::CONFIG_TOGGLE_EXCLUDE => &mut config.keybinds.toggle_exclude,
+        K::CONFIG_TOGGLE_HIDDEN => &mut config.keybinds.toggle_hidden,
+        K::CONFIG_OPEN_EXPLORER => &mut config.keybinds.open_in_explorer,
+        K::CONFIG_RELOAD => &mut config.keybinds.reload_config,
+        _ => return Ok(None),
+    };
+    let Value::Text(binding) = value else {
+        return Err("Application shortcuts require a text binding.".into());
+    };
+    let changed = *slot != *binding;
+    slot.clone_from(binding);
+    Ok(Some(changed))
+}
+
+fn publish_config_keybinds(
+    app: &mut GpuCandidate,
+    proposed: crate::config::Config,
+) -> Result<super::bridge::SaveNotice, String> {
+    use super::bridge::SaveNotice;
+    if app.launch_policy.is_preview() {
+        app.settings_workbench.announce_save(SaveNotice::Rejected);
+        return Err("Application shortcuts cannot be saved in Preview.".into());
+    }
+    let backup_path = crate::config::Config::config_path().with_extension("toml.bak");
+    let result = proposed.save_with_diagnostics();
+    let notice = SaveNotice::config_result("Config", result.as_ref());
+    app.settings_workbench.announce_save(notice);
+    match result {
+        Ok(outcome) => {
+            app.config = proposed;
+            app.config_save_failure = (!outcome.backup.is_available()).then(|| {
+                format!(
+                    "Application shortcuts saved, but {}",
+                    outcome.backup_description(&backup_path)
+                )
+            });
+            Ok(notice)
+        }
+        Err(error) => {
+            let failure = format!(
+                "Application shortcut publication needs attention. {error}. {}",
+                error.backup_description(&backup_path)
+            );
+            app.config_save_failure = Some(failure.clone());
+            if error.primary_committed {
+                app.config = proposed;
+                Ok(notice)
+            } else {
+                Err(failure)
+            }
+        }
+    }
+}
+
+fn persist_config_keybind(
+    app: &mut GpuCandidate,
+    path: &str,
+    value: &Value,
+) -> Result<bool, String> {
+    let mut proposed = app.config.clone();
+    let Some(changed) = edit_config_keybind(&mut proposed, path, value)? else {
+        return Ok(false);
+    };
+    if changed {
+        publish_config_keybinds(app, proposed)?;
+    }
+    app.settings_workbench
+        .draft
+        .values
+        .insert(path.into(), value.clone());
+    Ok(true)
+}
+
+fn save_captured_bindings(
+    app: &mut GpuCandidate,
+    changes: Vec<composed::binding_capture::Change>,
+) -> Result<(), String> {
+    use super::bridge::SaveNotice;
+    let mut proposed_config = app.config.clone();
+    let mut proposed = app.state.clone();
+    let mut config_changed = false;
+    for change in &changes {
+        let value = Value::Text(change.binding.clone());
+        if let Some(changed) = edit_config_keybind(&mut proposed_config, change.path, &value)? {
+            config_changed |= changed;
+        } else {
+            super::preference_projection::write(
+                &mut proposed.frontend_preferences,
+                change.path,
+                &value,
+            )?;
+        }
+    }
+    proposed.frontend_preferences.validate()?;
+    let local_changed = proposed.frontend_preferences != app.state.frontend_preferences;
+    let config_notice = if config_changed {
+        let notice = publish_config_keybinds(app, proposed_config)?;
+        for change in changes
+            .iter()
+            .filter(|change| change.action.is_config_global())
+        {
+            app.settings_workbench
+                .draft
+                .values
+                .insert(change.path.into(), Value::Text(change.binding.clone()));
+        }
+        Some(notice)
+    } else {
+        None
+    };
+    if local_changed {
+        if let Err(error) = app.commit_local_state_change(proposed) {
+            if config_changed || error.primary_committed {
+                app.settings_workbench
+                    .announce_save(if error.primary_committed {
+                        SaveNotice::RecoveryWarning("Shortcuts")
+                    } else {
+                        SaveNotice::Partial
+                    });
+                rotate(app);
+            }
+            return Err(app
+                .save_failure
+                .clone()
+                .unwrap_or_else(|| error.to_string()));
+        }
+    }
+    if matches!(config_notice, Some(SaveNotice::RecoveryWarning(_))) {
+        app.settings_workbench
+            .announce_save(SaveNotice::RecoveryWarning("Shortcuts"));
+    } else if (local_changed && app.backup_warning.is_some())
+        || (config_changed && app.config_save_failure.is_some())
+    {
+        app.settings_workbench
+            .announce_save(SaveNotice::BackupWarning("Shortcuts"));
+    } else if config_changed || local_changed {
+        app.settings_workbench
+            .announce_save(SaveNotice::Saved("Shortcuts"));
+    }
+    for change in changes {
+        app.settings_workbench
+            .draft
+            .values
+            .insert(change.path.into(), Value::Text(change.binding));
+    }
+    rotate(app);
+    Ok(())
+}
+
 /// A single narrow adapter into CandidateState's existing publication owner.
 fn persist_preference(app: &mut GpuCandidate, path: &str, value: &Value) -> Result<bool, String> {
+    if persist_config_keybind(app, path, value)? {
+        return Ok(true);
+    }
+    if persist_wallpaper_transition(app, path, value)? {
+        return Ok(true);
+    }
     let mut proposed = app.state.clone();
     if matches!(
         path,
@@ -411,7 +721,8 @@ fn persist_pending(app: &mut GpuCandidate, path: &str, value: &Value) -> Result<
     if !super::pending_projection::write(&mut proposed, path, value)? {
         return Ok(false);
     }
-    if proposed.pending_frontend != app.state.pending_frontend {
+    let changed = proposed.pending_frontend != app.state.pending_frontend;
+    if changed {
         app.commit_local_state_change(proposed).map_err(|error| {
             app.save_failure
                 .clone()
@@ -452,6 +763,15 @@ fn persist_pending(app: &mut GpuCandidate, path: &str, value: &Value) -> Result<
         reason
     };
     app.settings_workbench.message = format!("Saved pending. {reason}");
+    if changed
+        && matches!(
+            app.settings_workbench.save_notice,
+            Some(super::bridge::SaveNotice::Saved(_))
+        )
+    {
+        app.settings_workbench
+            .announce_save(super::bridge::SaveNotice::Pending("Settings"));
+    }
     Ok(true)
 }
 
@@ -507,7 +827,7 @@ fn commit_path(app: &mut GpuCandidate, path: &str) -> Result<Task<Message>, Stri
     let value = app.settings_workbench.draft.commit_input(path)?;
     Ok(value.map_or_else(Task::none, |value| apply_value(app, path, value)))
 }
-fn commit(app: &mut GpuCandidate) -> Result<Task<Message>, String> {
+fn commit(app: &mut GpuCandidate) -> Result<Task<Message>, (Task<Message>, String)> {
     let errors = &app.settings_workbench.draft.errors;
     if let Some(error) = app
         .settings_workbench
@@ -522,18 +842,22 @@ fn commit(app: &mut GpuCandidate) -> Result<Task<Message>, String> {
                 .map(|(_, error)| error)
         })
     {
-        return Err(error.clone());
+        return Err((Task::none(), error.clone()));
     }
-    let paths: Vec<_> = app
+    let mut paths: Vec<_> = app
         .settings_workbench
         .draft
         .raw_inputs
         .keys()
         .cloned()
         .collect();
+    paths.sort_unstable();
     let mut tasks = Vec::new();
     for path in paths {
-        tasks.push(commit_path(app, &path)?);
+        match commit_path(app, &path) {
+            Ok(task) => tasks.push(task),
+            Err(error) => return Err((Task::batch(tasks), error)),
+        }
     }
     Ok(Task::batch(tasks))
 }
@@ -585,7 +909,7 @@ fn input(
                     }
                 }
                 session.draft.errors.insert(path, error);
-                return Task::none();
+                return prior_task;
             }
         }
     }
@@ -830,7 +1154,7 @@ fn restart_tab_reveal(app: &mut GpuCandidate) {
     app.settings_workbench.tab_reveal = Some(tween);
     app.settings_workbench.last_frame = None;
 }
-fn select_tab(app: &mut GpuCandidate, tab: String) {
+pub(super) fn select_tab(app: &mut GpuCandidate, tab: String) {
     let tabs = composed::visible_tabs(&Source { app });
     let Some(index) = tabs.iter().position(|(key, _)| *key == tab) else {
         return;
@@ -851,6 +1175,11 @@ fn select_tab(app: &mut GpuCandidate, tab: String) {
     if app.settings_workbench.tab != tab {
         restart_tab_reveal(app);
     }
+    if app.settings_workbench.tab == "library" && tab != "library" {
+        app.folder_menu_open = false;
+    }
+    app.settings_workbench.save_notice = None;
+    app.settings_workbench.save_details_open = false;
     app.settings_workbench.tab = tab;
     app.settings_workbench.legacy_category = Some(app.panel_state.settings_category);
     app.settings_workbench.windows_panel = None;
@@ -968,6 +1297,11 @@ fn edit_process(app: &mut GpuCandidate, name: &str, add: bool) -> bool {
     let name = name.trim();
     if name.is_empty() || name.contains([',', '\n', '\r']) {
         app.settings_workbench.message = "Enter a single process name.".into();
+        if let Some(picker) = &mut app.settings_workbench.process_picker {
+            picker.manual_error = Some(app.settings_workbench.message.clone());
+        }
+        app.settings_workbench
+            .announce_save(super::bridge::SaveNotice::Rejected);
         return false;
     }
     let mut names = processes(app);
@@ -979,20 +1313,27 @@ fn edit_process(app: &mut GpuCandidate, name: &str, add: bool) -> bool {
         names.retain(|existing| existing != name);
     }
     let value = Value::Text(names.join(", "));
-    app.settings_workbench
-        .draft
-        .values
-        .insert(composed::keys::playback::PROCESSES.into(), value.clone());
-    if let Some(picker) = &mut app.settings_workbench.process_picker {
-        picker.targets = names;
-    }
     match persist_pending(app, composed::keys::playback::PROCESSES, &value) {
-        Ok(true) => true,
+        Ok(true) => {
+            app.settings_workbench
+                .draft
+                .values
+                .insert(composed::keys::playback::PROCESSES.into(), value);
+            if let Some(picker) = &mut app.settings_workbench.process_picker {
+                picker.targets = names;
+                picker.manual_error = None;
+            }
+            true
+        }
         Ok(false) => {
             app.settings_workbench.message = "This process form has no saved pending owner.".into();
             false
         }
         Err(error) => {
+            app.settings_workbench
+                .draft
+                .values
+                .insert(composed::keys::playback::PROCESSES.into(), value);
             app.settings_workbench.message = error;
             false
         }
@@ -1029,6 +1370,10 @@ fn retire_indexed_buffers(app: &mut GpuCandidate) {
 }
 fn blocked_edit_task(app: &mut GpuCandidate, error: String) -> Task<Message> {
     app.settings_workbench.message = error;
+    if !app.settings_workbench.draft.errors.is_empty() {
+        app.settings_workbench
+            .announce_save(super::bridge::SaveNotice::Rejected);
+    }
     let Some(path) = &app.settings_workbench.navigation.input_edit else {
         return Task::none();
     };
@@ -1048,14 +1393,13 @@ fn blocked_edit_task(app: &mut GpuCandidate, error: String) -> Task<Message> {
 }
 pub(in crate::candidate_app) fn finish_geometry_owner_edit(
     app: &mut GpuCandidate,
-) -> Result<(), String> {
+) -> Result<Task<Message>, Task<Message>> {
     if app.settings_workbench.geometry_preview_baseline.is_some()
         || !app.settings_workbench.draft.raw_inputs.is_empty()
     {
-        commit(app)?;
-        app.settings_workbench.navigation.input_edit = None;
+        return finish_pointer_edit(app);
     }
-    Ok(())
+    Ok(Task::none())
 }
 
 pub(in crate::candidate_app) fn finish_pointer_edit(
@@ -1066,7 +1410,7 @@ pub(in crate::candidate_app) fn finish_pointer_edit(
             app.settings_workbench.navigation.input_edit = None;
             Ok(task)
         }
-        Err(error) => Err(blocked_edit_task(app, error)),
+        Err((task, error)) => Err(Task::batch([task, blocked_edit_task(app, error)])),
     }
 }
 fn row_has_id(control: &Control, id: &str, details: bool) -> bool {
@@ -1167,11 +1511,8 @@ pub(in crate::candidate_app) fn dispatch(
                     "This legacy profile has no available geometry snapshot.".into();
                 return Task::none();
             };
-            let task = match finish_pointer_edit(app) {
-                Ok(task) => task,
-                Err(task) => return task,
-            };
-            match app.apply_gallery_preset(mode, id) {
+            let (task, result) = app.apply_gallery_preset(mode, id);
+            match result {
                 Ok(()) => {
                     app.settings_workbench.preset_name_raw = None;
                     app.settings_workbench.message = "Current-mode layout restored.".into();
@@ -1258,10 +1599,11 @@ pub(in crate::candidate_app) fn dispatch(
             }
             return app.set_visible(false, "settings-stash");
         }
-        intent::Message::ToggleSettings => {
+        intent::Message::ToggleSettings | intent::Message::Backdrop => {
             if app.settings_workbench.draft.errors.is_empty() {
-                let Ok(task) = commit(app) else {
-                    return Task::none();
+                let task = match commit(app) {
+                    Ok(task) => task,
+                    Err((task, _)) => return task,
                 };
                 app.panel_state.settings_open = false;
                 return task;
@@ -1350,6 +1692,25 @@ pub(in crate::candidate_app) fn dispatch(
                     ));
                 }
             }
+            SettingsMsg::KeybindCaptureWheel(direction) => {
+                if let Some(capture) = app
+                    .settings_workbench
+                    .capture
+                    .as_mut()
+                    .filter(|capture| capture.action.accepts_preset_wheel())
+                {
+                    capture.replace(composed::input::Trigger::Wheel(
+                        composed::input::WheelSpec {
+                            mods: app.settings_workbench.capture_modifiers,
+                            direction,
+                        },
+                    ));
+                }
+            }
+            SettingsMsg::ToggleSaveDetails => {
+                app.settings_workbench.save_details_open =
+                    !app.settings_workbench.save_details_open;
+            }
             SettingsMsg::KeybindCaptureApply => {
                 let map = Source { app }.bindings();
                 let changes = app
@@ -1358,41 +1719,25 @@ pub(in crate::candidate_app) fn dispatch(
                     .as_ref()
                     .and_then(|capture| capture.proposal(generation, &map));
                 if changes.is_none()
-                    && app
-                        .settings_workbench
-                        .capture
-                        .as_ref()
-                        .is_some_and(|c| !map.reserved_conflicts(&c.triggers).is_empty())
+                    && app.settings_workbench.capture.as_ref().is_some_and(|c| {
+                        !map.reserved_conflicts_except(c.action, &c.triggers)
+                            .is_empty()
+                    })
                 {
-                    app.settings_workbench.message = "Reserved Config/Escape binding: use the Windows controls editor; local capture cannot replace it.".into();
+                    app.settings_workbench.message = "Reserved shortcut. Edit application shortcuts in Controls or open config.toml from Displays.".into();
                 }
                 if let Some(changes) = changes {
-                    let mut proposed = app.state.clone();
-                    for change in &changes {
-                        if let Err(error) = super::preference_projection::write(
-                            &mut proposed.frontend_preferences,
-                            change.path,
-                            &Value::Text(change.binding.clone()),
-                        ) {
-                            app.settings_workbench.message = error;
-                            return Task::none();
-                        }
+                    if let Err(error) = save_captured_bindings(app, changes) {
+                        app.settings_workbench.message = error;
                     }
-                    if let Err(error) = app.commit_local_state_change(proposed) {
-                        app.settings_workbench.message = app
-                            .save_failure
-                            .clone()
-                            .unwrap_or_else(|| error.to_string());
-                        return Task::none();
-                    }
-                    for change in changes {
-                        app.settings_workbench
-                            .draft
-                            .values
-                            .insert(change.path.into(), Value::Text(change.binding));
-                    }
-                    app.settings_workbench.capture = None;
-                    rotate(app);
+                } else if app
+                    .settings_workbench
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.edited)
+                {
+                    app.settings_workbench
+                        .announce_save(super::bridge::SaveNotice::Rejected);
                 }
             }
             SettingsMsg::BackgroundPicker(output) => {
@@ -1499,6 +1844,7 @@ pub(in crate::candidate_app) fn dispatch(
             SettingsMsg::ProcessPickerManualInput(raw) => {
                 if let Some(picker) = &mut app.settings_workbench.process_picker {
                     picker.manual = raw;
+                    picker.manual_error = None;
                 }
             }
             SettingsMsg::ProcessPickerManualAdd => {
@@ -1542,11 +1888,15 @@ pub(in crate::candidate_app) fn dispatch(
                     app.settings_workbench.navigation.input_edit = None;
                     return task;
                 }
-                Err(error) => app.settings_workbench.message = error,
+                Err((task, error)) => {
+                    app.settings_workbench.message = error;
+                    return task;
+                }
             },
             SettingsMsg::Toggle(path, value) => {
-                let Ok(commit_task) = commit(app) else {
-                    return Task::none();
+                let commit_task = match commit(app) {
+                    Ok(task) => task,
+                    Err((task, _)) => return task,
                 };
                 if let Some(value) = app.settings_workbench.draft.choose(
                     generation,
@@ -1560,8 +1910,9 @@ pub(in crate::candidate_app) fn dispatch(
                 return commit_task;
             }
             SettingsMsg::Pick(path, text) => {
-                let Ok(commit_task) = commit(app) else {
-                    return Task::none();
+                let commit_task = match commit(app) {
+                    Ok(task) => task,
+                    Err((task, _)) => return task,
                 };
                 let previous = app.settings_workbench.draft.values.get(&path).cloned();
                 if let Some(value) = app.settings_workbench.draft.choose(
@@ -1613,8 +1964,9 @@ pub(in crate::candidate_app) fn dispatch(
             }
             SettingsMsg::SelectTab(tab) => {
                 if app.settings_workbench.draft.errors.is_empty() {
-                    let Ok(task) = commit(app) else {
-                        return Task::none();
+                    let task = match commit(app) {
+                        Ok(task) => task,
+                        Err((task, _)) => return task,
                     };
                     select_tab(app, tab);
                     return task;
@@ -1625,8 +1977,9 @@ pub(in crate::candidate_app) fn dispatch(
                     return Task::none();
                 }
                 if app.settings_workbench.draft.errors.is_empty() {
-                    let Ok(task) = commit(app) else {
-                        return Task::none();
+                    let task = match commit(app) {
+                        Ok(task) => task,
+                        Err((task, _)) => return task,
                     };
                     app.settings_workbench
                         .navigation
@@ -1725,8 +2078,9 @@ pub(in crate::candidate_app) fn dispatch(
                     return Task::none();
                 }
                 if app.settings_workbench.draft.errors.is_empty() {
-                    let Ok(task) = commit(app) else {
-                        return Task::none();
+                    let task = match commit(app) {
+                        Ok(task) => task,
+                        Err((task, _)) => return task,
                     };
                     select_tab(app, tab);
                     let model = cards(app);
@@ -1778,8 +2132,9 @@ pub(in crate::candidate_app) fn dispatch(
                     rotate(app);
                     return next;
                 }
-                let Ok(task) = commit(app) else {
-                    return Task::none();
+                let task = match commit(app) {
+                    Ok(task) => task,
+                    Err((task, _)) => return task,
                 };
                 if let ActionId::SetThemeTarget(provider, enabled) = action {
                     if let Err(error) = set_theme_target(app, provider, enabled) {
@@ -1901,9 +2256,8 @@ pub(in crate::candidate_app) fn dispatch(
                         app.settings_workbench.message="Running-process discovery and automatic pause execution are unavailable; enter process names manually.".into();
                         rotate(app);
                     },
-                    ActionId::OpenLibraryTools=>return Task::batch([task,super::gateway::open(app,SettingsCategory::Library)]),
-                    ActionId::OpenWindowsDisplays=>return Task::batch([task,super::gateway::open(app,SettingsCategory::WallpapersDisplays)]),
-                    ActionId::OpenScheduleEditor=>return Task::batch([task,super::gateway::open(app,SettingsCategory::Automation)]),
+                    ActionId::OpenDisplays=>return Task::batch([task,super::gateway::open(app,SettingsCategory::WallpapersDisplays)]),
+                    ActionId::ShowExcluded=>return Task::batch([task,crate::candidate_app::events::update(app,Message::ToggleShowExcluded)]),
                     ActionId::OpenThemeDesigner=>return Task::batch([task,super::gateway::open(app,SettingsCategory::Theme)]),
                     ActionId::CycleBackgroundOpacity=>{
                         let background_task=crate::candidate_app::events::update(app,Message::CycleAppearanceOpacity);
@@ -1915,9 +2269,6 @@ pub(in crate::candidate_app) fn dispatch(
                 }
                 }
                 return task;
-            }
-            _ => {
-                app.settings_workbench.message = "This editor is not connected yet.".into();
             }
         },
         _ => {
@@ -2183,7 +2534,7 @@ fn activate_control(
                 "Per-display execution is unavailable; global Engine controls remain separate."
                     .into();
         }
-        Control::Static | Control::Segment | Control::Code { .. } => {}
+        Control::Static | Control::Segment | Control::PlatformForm | Control::Code { .. } => {}
     }
     if let Some(intent) = intent {
         app.settings_workbench.navigation.choice = None;

@@ -40,6 +40,8 @@ impl Default for LegacyDepthSettings {
 impl LegacyDepthSettings {
     pub(crate) fn current_projection(&self) -> DepthSettings {
         DepthSettings {
+            offset_x: 0.0,
+            offset_y: 0.0,
             height: self.height,
             width: self.width,
             spacing: self.spacing,

@@ -17,16 +17,18 @@ pub enum KeyBindingGroup {
     Folders,
     Navigation,
     Downloads,
+    Global,
 }
 
 impl KeyBindingGroup {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Wallpaper,
         Self::Panels,
         Self::Filters,
         Self::Folders,
         Self::Navigation,
         Self::Downloads,
+        Self::Global,
     ];
 
     pub const fn title_key(self) -> &'static str {
@@ -37,6 +39,7 @@ impl KeyBindingGroup {
             Self::Folders => "settings-keybinds-folders-card",
             Self::Navigation => "settings-keybinds-navigation-card",
             Self::Downloads => "settings-keybinds-downloads-card",
+            Self::Global => "settings-keybinds-global-card",
         }
     }
 
@@ -48,11 +51,12 @@ impl KeyBindingGroup {
             Self::Folders => "settings-keybinds-folders-card-desc",
             Self::Navigation => "settings-keybinds-navigation-card-desc",
             Self::Downloads => "settings-keybinds-downloads-card-desc",
+            Self::Global => "settings-keybinds-global-card-desc",
         }
     }
 }
 
-pub const KEY_BINDINGS: [KeyBindingDescriptor; 33] = [
+pub const KEY_BINDINGS: [KeyBindingDescriptor; 42] = [
     KeyBindingDescriptor {
         action: InputAction::TagCloud,
         path: super::keys::keybind::TAG_CLOUD,
@@ -124,12 +128,6 @@ pub const KEY_BINDINGS: [KeyBindingDescriptor; 33] = [
         path: super::keys::keybind::HELP,
         title_key: "keybind-help",
         group: KeyBindingGroup::Panels,
-    },
-    KeyBindingDescriptor {
-        action: InputAction::FilterBar,
-        path: super::keys::keybind::FILTER_BAR,
-        title_key: "keybind-filter-bar",
-        group: KeyBindingGroup::Filters,
     },
     KeyBindingDescriptor {
         action: InputAction::FolderPrev,
@@ -222,6 +220,24 @@ pub const KEY_BINDINGS: [KeyBindingDescriptor; 33] = [
         group: KeyBindingGroup::Navigation,
     },
     KeyBindingDescriptor {
+        action: InputAction::PresetNext,
+        path: super::keys::keybind::PRESET_NEXT,
+        title_key: "keybind-preset-next",
+        group: KeyBindingGroup::Navigation,
+    },
+    KeyBindingDescriptor {
+        action: InputAction::PresetPrev,
+        path: super::keys::keybind::PRESET_PREV,
+        title_key: "keybind-preset-prev",
+        group: KeyBindingGroup::Navigation,
+    },
+    KeyBindingDescriptor {
+        action: InputAction::FilterBar,
+        path: super::keys::keybind::FILTER_BAR,
+        title_key: "keybind-show-toolbar",
+        group: KeyBindingGroup::Navigation,
+    },
+    KeyBindingDescriptor {
         action: InputAction::TypePrev,
         path: super::keys::keybind::TYPE_PREV,
         title_key: "keybind-type-prev",
@@ -250,5 +266,47 @@ pub const KEY_BINDINGS: [KeyBindingDescriptor; 33] = [
         path: super::keys::keybind::RANDOM_ROTATE,
         title_key: "keybind-random-rotate",
         group: KeyBindingGroup::Filters,
+    },
+    KeyBindingDescriptor {
+        action: InputAction::ConfigApplyToAll,
+        path: super::keys::keybind::CONFIG_APPLY_TO_ALL,
+        title_key: "keybind-apply-to-all",
+        group: KeyBindingGroup::Global,
+    },
+    KeyBindingDescriptor {
+        action: InputAction::ConfigClose,
+        path: super::keys::keybind::CONFIG_CLOSE,
+        title_key: "keybind-close",
+        group: KeyBindingGroup::Global,
+    },
+    KeyBindingDescriptor {
+        action: InputAction::ConfigSwitchMonitor,
+        path: super::keys::keybind::CONFIG_SWITCH_MONITOR,
+        title_key: "keybind-switch-monitor",
+        group: KeyBindingGroup::Global,
+    },
+    KeyBindingDescriptor {
+        action: InputAction::ConfigToggleExclude,
+        path: super::keys::keybind::CONFIG_TOGGLE_EXCLUDE,
+        title_key: "keybind-toggle-exclude",
+        group: KeyBindingGroup::Global,
+    },
+    KeyBindingDescriptor {
+        action: InputAction::ConfigToggleHidden,
+        path: super::keys::keybind::CONFIG_TOGGLE_HIDDEN,
+        title_key: "keybind-toggle-hidden",
+        group: KeyBindingGroup::Global,
+    },
+    KeyBindingDescriptor {
+        action: InputAction::ConfigOpenExplorer,
+        path: super::keys::keybind::CONFIG_OPEN_EXPLORER,
+        title_key: "keybind-open-explorer",
+        group: KeyBindingGroup::Global,
+    },
+    KeyBindingDescriptor {
+        action: InputAction::ConfigReload,
+        path: super::keys::keybind::CONFIG_RELOAD,
+        title_key: "keybind-reload-config",
+        group: KeyBindingGroup::Global,
     },
 ];

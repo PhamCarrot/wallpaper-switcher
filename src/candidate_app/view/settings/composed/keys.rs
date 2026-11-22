@@ -375,6 +375,8 @@ pub mod keys {
             "components.wallpaperSelector.sliceSearchPanelOffsetX";
         pub const SLICE_SEARCH_PANEL_OFFSET_Y: &str =
             "components.wallpaperSelector.sliceSearchPanelOffsetY";
+        pub const DEPTH_STAGE_X: &str = "components.wallpaperSelector.depthStageX";
+        pub const DEPTH_STAGE_Y: &str = "components.wallpaperSelector.depthStageY";
         pub const SLICE_STAGE_X: &str = "components.wallpaperSelector.sliceStageX";
         pub const SLICE_STAGE_Y: &str = "components.wallpaperSelector.sliceStageY";
         pub const SLICE_SPACING: &str = "components.wallpaperSelector.sliceSpacing";
@@ -508,6 +510,12 @@ pub mod keys {
         pub const SHADER: &str = "transition.shader";
         pub const SHADER_SCOPES: &str = "transition.shaderScopes";
     }
+    pub mod wallpaper_transition {
+        pub const EFFECT: &str = "wallpaperTransition.effect";
+        pub const FAMILY: &str = "wallpaperTransition.family";
+        pub const ENABLED: &str = "wallpaperTransition.enabled";
+        pub const DURATION_MS: &str = "wallpaperTransition.durationMs";
+    }
     pub mod video_optimize {
         pub const CODEC: &str = "videoOptimize.codec";
         pub const ENABLED: &str = "videoOptimize.enabled";
@@ -577,6 +585,8 @@ pub mod keys {
         pub const REVEAL: &str = "keys.reveal";
         pub const HELP: &str = "keys.help";
         pub const MODE_NEXT: &str = "keys.modeNext";
+        pub const PRESET_NEXT: &str = "keys.presetNext";
+        pub const PRESET_PREV: &str = "keys.presetPrev";
         pub const MODE_PREV: &str = "keys.modePrev";
         pub const SCENE_PROPERTIES: &str = "keys.sceneProperties";
         pub const SELECT: &str = "keys.select";
@@ -605,6 +615,13 @@ pub mod keys {
         pub const SOURCE_YOUTUBE: &str = "keys.sourceYoutube";
         pub const TYPE_NEXT: &str = "keys.typeNext";
         pub const TYPE_PREV: &str = "keys.typePrev";
+        pub const CONFIG_APPLY_TO_ALL: &str = "config.keybinds.applyToAll";
+        pub const CONFIG_CLOSE: &str = "config.keybinds.close";
+        pub const CONFIG_SWITCH_MONITOR: &str = "config.keybinds.switchMonitor";
+        pub const CONFIG_TOGGLE_EXCLUDE: &str = "config.keybinds.toggleExclude";
+        pub const CONFIG_TOGGLE_HIDDEN: &str = "config.keybinds.toggleHidden";
+        pub const CONFIG_OPEN_EXPLORER: &str = "config.keybinds.openInExplorer";
+        pub const CONFIG_RELOAD: &str = "config.keybinds.reloadConfig";
     }
     pub mod performance {
         pub const AUTO_DELETE_IMAGE_TRASH: &str = "performance.autoDeleteImageTrash";

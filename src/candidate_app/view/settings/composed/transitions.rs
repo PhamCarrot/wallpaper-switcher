@@ -238,3 +238,55 @@ pub fn keys_in_family(family: Family) -> impl Iterator<Item = &'static str> {
         .filter(move |spec| spec.family == family)
         .map(|spec| spec.key)
 }
+
+/// Maps the native Windows transition catalog into the family menu used by
+/// the Settings UI. The family is a presentation grouping, while the native
+/// effect remains the persisted value.
+pub fn native_family_of(effect: crate::transition::TransitionEffect) -> Family {
+    use crate::transition::TransitionEffect as Effect;
+
+    match effect {
+        Effect::Off | Effect::Random => Family::Random,
+        Effect::Crossfade | Effect::NoiseDissolve | Effect::Luma | Effect::Film => Family::Fade,
+        Effect::WipeLeft
+        | Effect::WipeRight
+        | Effect::WipeUp
+        | Effect::WipeDown
+        | Effect::Iris
+        | Effect::Ring
+        | Effect::Diamond
+        | Effect::Circle => Family::Wipe,
+        Effect::Kaleidoscope
+        | Effect::ChromaticRipple
+        | Effect::Warp
+        | Effect::ZoomBlur
+        | Effect::RadialBlur
+        | Effect::Swirl
+        | Effect::Displacement
+        | Effect::Wave => Family::Warp,
+        Effect::Slices
+        | Effect::Blinds
+        | Effect::Checker
+        | Effect::Pixelate
+        | Effect::Mosaic
+        | Effect::Voronoi
+        | Effect::Glitch
+        | Effect::Ink
+        | Effect::Smoke
+        | Effect::Burn => Family::Break,
+    }
+}
+
+pub fn native_effects_in_family(
+    family: Family,
+) -> impl Iterator<Item = crate::transition::TransitionEffect> {
+    crate::transition::TRANSITION_CATALOG
+        .into_iter()
+        .filter(move |effect| native_family_of(*effect) == family)
+}
+
+pub fn native_default_effect_for_family(
+    family: Family,
+) -> Option<crate::transition::TransitionEffect> {
+    native_effects_in_family(family).next()
+}

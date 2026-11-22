@@ -1012,3 +1012,152 @@ fn pk03_public_saved_settings_reload_accepts_selected_legacy_or_new_intent_read_
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 }
+
+#[test]
+fn stable_schedule_editor_publishes_before_changing_timer_authority() {
+    use crate::candidate_app::automation_integration::automation_timer_enabled;
+    use view::settings::folio::intent::{Message as Intent, SettingsMsg};
+
+    let (mut app, calls) = fixture();
+    app.launch_policy = p1_preview_policy();
+    app.apply_enabled = false;
+    app.catalog_fresh = true;
+    app.state.active_playlist_id = Some("owned".into());
+    app.persist_state_outcome().unwrap();
+    let state_path = app.state_path.clone();
+    let original = std::fs::read(&state_path).unwrap();
+
+    app.panel_state.open_settings(SettingsCategory::Automation);
+    view::settings::controller::reconcile(&mut app);
+    let window = app.window;
+    let section = view::settings::controller::cards(&app)
+        .iter()
+        .position(|(_, rows)| {
+            rows.iter().any(|row| {
+                matches!(
+                    &row.control,
+                    view::settings::composed::Control::PlatformForm
+                )
+            })
+        })
+        .expect("Schedule settings section");
+    let generation = app.settings_workbench.generation;
+    let _ = update(
+        &mut app,
+        Message::SettingsIntent {
+            window,
+            generation,
+            intent: Intent::Settings(SettingsMsg::SelectSection(section)),
+        },
+    );
+    let owner = generation;
+    let child = app.settings_workbench.generation;
+    assert_ne!(child, owner);
+    assert_eq!(app.settings_workbench.tab, "automation");
+    assert!(app.settings_workbench.windows_panel.is_none());
+    let invoke = |app: &mut GpuCandidate, message| {
+        let _ = update(
+            app,
+            Message::SettingsPageAction {
+                window,
+                generation: child,
+                message: Box::new(message),
+            },
+        );
+    };
+    let generation = |app: &GpuCandidate| app.automation_generation.load(Ordering::Acquire);
+    let initial_generation = generation(&app);
+
+    invoke(&mut app, Message::ScheduleNameChanged("  Morning  ".into()));
+    invoke(&mut app, Message::ScheduleTimeChanged("24:00".into()));
+    for day in 0..7 {
+        if ((app.schedule_days >> day) & 1 != 0) != (day == 2) {
+            invoke(&mut app, Message::ToggleScheduleDay(day));
+        }
+    }
+    invoke(&mut app, Message::ToggleScheduleMonitor("DISPLAY-A".into()));
+    invoke(&mut app, Message::CreateSchedule);
+    assert!(app.state.schedules.is_empty());
+    assert_eq!(app.schedule_name, "  Morning  ");
+    assert_eq!(generation(&app), initial_generation);
+    assert_eq!(std::fs::read(&state_path).unwrap(), original);
+    assert!(app.status.as_deref().unwrap().contains("HH:MM"));
+
+    invoke(&mut app, Message::ScheduleTimeChanged("08:30".into()));
+    let _ = update(
+        &mut app,
+        Message::SettingsPageAction {
+            window,
+            generation: owner,
+            message: Box::new(Message::CreateSchedule),
+        },
+    );
+    assert!(app.state.schedules.is_empty());
+    let blocked_parent = state_path.with_file_name("owned-file-instead-of-parent");
+    std::fs::write(&blocked_parent, b"disposable").unwrap();
+    app.state_path = blocked_parent.join("state.toml");
+    invoke(&mut app, Message::CreateSchedule);
+    assert!(app.save_failure.is_some());
+    assert!(
+        app.state.schedules.is_empty(),
+        "a refused create must not become eligible"
+    );
+    assert_eq!(app.schedule_name, "  Morning  ");
+    assert_eq!(generation(&app), initial_generation);
+    assert_eq!(std::fs::read(&state_path).unwrap(), original);
+
+    app.state_path = state_path.clone();
+    invoke(&mut app, Message::CreateSchedule);
+    let [schedule] = app.state.schedules.as_slice() else {
+        panic!("one schedule after valid create")
+    };
+    let id = schedule.id.clone();
+    assert_eq!(schedule.name, "Morning");
+    assert_eq!(schedule.minute_of_day, 510);
+    assert_eq!(schedule.days, 1 << 2);
+    assert_eq!(schedule.playlist_id, "owned");
+    assert_eq!(schedule.monitor_ids, ["DISPLAY-A"]);
+    assert!(schedule.enabled && app.schedule_name.is_empty());
+    assert_eq!(generation(&app), initial_generation + 1);
+    let load = |app: &GpuCandidate| {
+        let disk = CandidateState::load_with_diagnostics(&state_path);
+        assert_eq!(disk.source, candidate_state::StateLoadSource::Primary);
+        assert_eq!(disk.state.schedules, app.state.schedules);
+        disk.state
+    };
+    load(&app);
+
+    invoke(&mut app, Message::ToggleSchedule(id.clone()));
+    let disabled = load(&app);
+    assert!(!disabled.schedules[0].enabled);
+    assert_eq!(generation(&app), initial_generation + 2);
+    app.state_path = blocked_parent.join("state.toml");
+    invoke(&mut app, Message::ToggleSchedule(id.clone()));
+    assert!(!app.state.schedules[0].enabled);
+    assert_eq!(generation(&app), initial_generation + 2);
+    load(&app);
+    app.state_path = state_path.clone();
+    invoke(&mut app, Message::ToggleSchedule(id));
+    let enabled = load(&app);
+    assert!(enabled.schedules[0].enabled);
+    let current = generation(&app);
+    assert_eq!(current, initial_generation + 3);
+    let normal = runtime::parse_launch_policy(&["candidate.exe".into()]).unwrap();
+    assert!(!automation_timer_enabled(normal, &disabled));
+    assert!(automation_timer_enabled(normal, &enabled));
+    assert!(!automation_timer_enabled(app.launch_policy, &enabled));
+    for clock in [current - 1, current] {
+        let _ = update(
+            &mut app,
+            Message::Wake(Wake::AutomationTick {
+                generation: clock,
+                now_unix: 3600,
+                weekday: 2,
+                minute_of_day: 510,
+            }),
+        );
+    }
+    assert!(app.last_automation_minute.is_none());
+    assert!(!app.apply_pending);
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+}

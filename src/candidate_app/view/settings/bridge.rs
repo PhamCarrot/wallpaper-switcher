@@ -20,6 +20,8 @@ pub(in crate::candidate_app) struct Session {
     pub capture_modifiers: composed::input::Mods,
     pub generation: u64,
     pub message: String,
+    pub save_notice: Option<SaveNotice>,
+    pub save_details_open: bool,
     pub active: bool,
     pub windows_panel: Option<SettingsCategory>,
     pub legacy_category: Option<SettingsCategory>,
@@ -32,8 +34,12 @@ pub(in crate::candidate_app) struct Session {
     pub output_previews: std::collections::HashMap<String, String>,
     pub results: Vec<composed::search::SettingsSearchResult>,
     pub palette: Option<crate::donor_ui::Palette>,
+    overlay_palette: Option<crate::donor_ui::Palette>,
+    outgoing_preview: Option<iced_image::Handle>,
+    outgoing_search: bool,
     pub bar_reveals:
         std::collections::HashMap<String, crate::donor_folio::source_ui::motion::Tween>,
+    pub(super) visible_layout_options: std::collections::HashSet<String>,
     pub armed: Option<composed::ActionId>,
     pub process_picker: Option<super::folio::workbench::ProcessPickerView>,
     pub last_frame: Option<std::time::Instant>,
@@ -45,7 +51,98 @@ pub(in crate::candidate_app) struct Session {
     preview_loading: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::candidate_app) enum SaveNotice {
+    Saved(&'static str),
+    BackupWarning(&'static str),
+    RecoveryWarning(&'static str),
+    Pending(&'static str),
+    Rejected,
+    Partial,
+    Failed(Option<i32>),
+}
+
+impl SaveNotice {
+    pub(super) fn label(self) -> String {
+        match self {
+            Self::Saved(operation) => format!("{operation} saved"),
+            Self::BackupWarning(operation) => format!("{operation} saved (backup unavailable)"),
+            Self::RecoveryWarning(operation) => format!("{operation} saved (recovery required)"),
+            Self::Pending(operation) => format!("{operation} saved (execution pending)"),
+            Self::Rejected => "Edit rejected".into(),
+            Self::Partial => "Settings partially saved".into(),
+            Self::Failed(Some(5)) => "Save failed (access denied, code 5)".into(),
+            Self::Failed(Some(code)) => format!("Save failed (code {code})"),
+            Self::Failed(None) => "Save failed".into(),
+        }
+    }
+
+    pub(in crate::candidate_app) fn local_result(
+        result: Result<&candidate_state::SaveOutcome, &candidate_state::SaveError>,
+    ) -> Self {
+        match result {
+            Ok(outcome) if outcome.backup.is_available() => Self::Saved("Settings"),
+            Ok(_) => Self::BackupWarning("Settings"),
+            Err(error) if error.primary_committed => Self::RecoveryWarning("Settings"),
+            Err(error) if error.write_restriction.is_some() => Self::Rejected,
+            Err(error) => Self::Failed(error.os_code),
+        }
+    }
+
+    pub(in crate::candidate_app) fn config_result(
+        operation: &'static str,
+        result: Result<&crate::config::ConfigSaveOutcome, &crate::config::ConfigSaveError>,
+    ) -> Self {
+        match result {
+            Ok(outcome) if outcome.backup.is_available() => Self::Saved(operation),
+            Ok(_) => Self::BackupWarning(operation),
+            Err(error) if error.primary_committed => Self::RecoveryWarning(operation),
+            Err(error) => Self::Failed(error.os_code),
+        }
+    }
+
+    pub(super) fn status(app: &GpuCandidate) -> super::folio::workbench::SaveStatus {
+        let session = &app.settings_workbench;
+        let notice = session.save_notice.map(Self::label);
+        let details = match session.save_notice {
+            Some(Self::Pending(_) | Self::Rejected) => Some(session.message.clone()),
+            Some(
+                Self::Partial | Self::Failed(_) | Self::BackupWarning(_) | Self::RecoveryWarning(_),
+            ) => {
+                let details = [
+                    app.config_save_failure.as_deref(),
+                    app.save_failure.as_deref(),
+                    app.backup_warning.as_deref(),
+                    Some(session.message.as_str()),
+                ];
+                Some(
+                    details
+                        .into_iter()
+                        .flatten()
+                        .filter(|message| !message.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            }
+            _ => None,
+        }
+        .filter(|details| !details.is_empty());
+        super::folio::workbench::SaveStatus {
+            notice,
+            details,
+            expanded: session.save_details_open,
+        }
+    }
+}
+
 impl Session {
+    pub(in crate::candidate_app) fn announce_save(&mut self, notice: SaveNotice) {
+        if self.active {
+            self.save_notice = Some(notice);
+            self.save_details_open = false;
+        }
+    }
+
     pub(in crate::candidate_app) fn layout_studio(&self) -> bool {
         self.windows_panel.is_none()
             && composed::is_picker_layout_section(&self.tab, self.navigation.section)
@@ -56,6 +153,11 @@ impl Session {
             self.preview_generation = self.preview_generation.wrapping_add(1);
         }
         self.preview_image = None;
+    }
+
+    pub(super) fn keep_outgoing_visuals(&mut self) {
+        self.outgoing_preview = self.preview_image.clone();
+        self.outgoing_search = self.navigation.search_open;
     }
 
     pub(in crate::candidate_app) fn finish_preview(
@@ -192,7 +294,7 @@ pub(in crate::candidate_app) fn sync_preview(app: &mut GpuCandidate) -> Task<Mes
     let poster = selected
         .and_then(|index| app.poster_slots.get(&index))
         .filter(|slot| {
-            !slot.is_video
+            slot.kind == crate::poster_worker::PosterKind::Still
                 && slot.item_id == still.item_id
                 && slot.catalog_generation == still.catalog_revision
                 && slot.source == still.path
@@ -263,13 +365,29 @@ pub(in crate::candidate_app) fn effective_ui_scale(app: &GpuCandidate) -> f32 {
     Source { app }.number(keys::general::UI_SCALE) as f32
 }
 
+pub(in crate::candidate_app) fn sync_overlay_palette(app: &mut GpuCandidate) {
+    let opacity = app.scene_motion.settings_opacity();
+    let session = &mut app.settings_workbench;
+    session.overlay_palette = (opacity > 0.0 && opacity < 1.0)
+        .then(|| session.palette.map(|palette| palette.opacity(opacity)))
+        .flatten();
+    if !app.visible || session.active || opacity == 0.0 {
+        session.outgoing_preview = None;
+        session.outgoing_search = false;
+    }
+}
+
 /// Pure renderer input; only app-owned data outlives the temporary Source adapter.
 pub(in crate::candidate_app) fn view(
     app: &GpuCandidate,
 ) -> Element<'_, super::folio::intent::Message> {
     use super::folio::workbench::*;
     let session = &app.settings_workbench;
-    let Some(palette) = session.palette.as_ref() else {
+    let Some(palette) = session
+        .overlay_palette
+        .as_ref()
+        .or(session.palette.as_ref())
+    else {
         return iced::widget::text("Preparing Settings…").into();
     };
     let config = Source { app };
@@ -295,6 +413,7 @@ pub(in crate::candidate_app) fn view(
         expanded_details: &session.navigation.expanded,
         bar_reveals: &session.bar_reveals,
         active_input: session.navigation.input_edit.as_deref(),
+        validation: &session.draft.errors,
         armed: session.armed,
     };
     let chrome = ChromeCtx {
@@ -310,11 +429,14 @@ pub(in crate::candidate_app) fn view(
             source,
             focus,
             chrome,
-            preview_image: session.preview_image.as_ref(),
+            preview_image: session
+                .preview_image
+                .as_ref()
+                .or(session.outgoing_preview.as_ref()),
             tab_transition: session.tab_reveal.as_ref().map_or(1.0, |tween| tween.x),
             tab: &session.tab,
             selected_section: session.navigation.section,
-            search_open: session.navigation.search_open,
+            search_open: session.navigation.search_open || session.outgoing_search,
             search_query: &app.settings_search,
             search_results: &session.results,
             keybind_capture: session.capture.as_ref().map(|capture| {
@@ -324,16 +446,20 @@ pub(in crate::candidate_app) fn view(
                     .iter()
                     .map(|a| format!("{a:?}"))
                     .collect();
-                conflicts.extend(map.reserved_conflicts(&capture.triggers));
+                conflicts.extend(map.reserved_conflicts_except(capture.action, &capture.triggers));
                 KeybindCaptureView {
                     title: app.settings_locale.text(capture.title_key),
                     binding: composed::input::binding_label(&capture.triggers),
                     edited: capture.edited,
+                    wheel: capture.action.accepts_preset_wheel(),
                     conflict: (!conflicts.is_empty()).then(|| format!("{conflicts:?}")),
                 }
             }),
             process_picker: session.process_picker.clone(),
-            status: &session.message,
+            save_status: SaveNotice::status(app),
+            platform_form: super::gateway::platform_form(app).map(|element| {
+                element.map(|message| super::folio::intent::Message::PageAction(Box::new(message)))
+            }),
         })
     };
     let clock = crate::donor_folio::source_ui::clock::Clock {
@@ -411,6 +537,8 @@ impl Source<'_> {
         use keys::selector as K;
         let gallery = &self.app.state.gallery;
         Some(f64::from(match path {
+            K::DEPTH_STAGE_X => gallery.depth.offset_x * 100.0,
+            K::DEPTH_STAGE_Y => gallery.depth.offset_y * 100.0,
             K::SLICE_STAGE_X => gallery.slices.offset_x * 100.0,
             K::SLICE_STAGE_Y => gallery.slices.offset_y * 100.0,
             K::HEX_ARC_INTENSITY => gallery.geometric.curve_strength,
@@ -520,9 +648,19 @@ impl SettingsSource for Source<'_> {
         &self.app.settings_locale
     }
     fn flag(&self, path: &str) -> bool {
+        if path == "filterBar.showExcluded" {
+            return self.app.show_excluded;
+        }
+
         let app = self.app;
         if let Some(target) = path.strip_prefix(&format!("{}.", keys::display::OUTPUT_LOCKS)) {
             return app.state.locked_monitors.contains(target);
+        }
+        if path == keys::wallpaper_transition::ENABLED {
+            return match app.settings_workbench.draft.values.get(path) {
+                Some(Value::Boolean(value)) => *value,
+                _ => app.config.transition.effect != crate::transition::TransitionEffect::Off,
+            };
         }
         match path {
             keys::selector::DEPTH_SHADOWS => app.state.gallery.depth.shadows,
@@ -558,6 +696,42 @@ impl SettingsSource for Source<'_> {
         }
     }
     fn text(&self, path: &str) -> String {
+        let keybinds = &self.app.config.keybinds;
+        let config_keybind = match path {
+            keys::keybind::CONFIG_APPLY_TO_ALL => Some(keybinds.apply_to_all.clone()),
+            keys::keybind::CONFIG_CLOSE => Some(keybinds.close.clone()),
+            keys::keybind::CONFIG_SWITCH_MONITOR => Some(keybinds.switch_monitor.clone()),
+            keys::keybind::CONFIG_TOGGLE_EXCLUDE => Some(keybinds.toggle_exclude.clone()),
+            keys::keybind::CONFIG_TOGGLE_HIDDEN => Some(keybinds.toggle_hidden.clone()),
+            keys::keybind::CONFIG_OPEN_EXPLORER => Some(keybinds.open_in_explorer.clone()),
+            keys::keybind::CONFIG_RELOAD => Some(keybinds.reload_config.clone()),
+            _ => None,
+        };
+        if let Some(value) = config_keybind {
+            return value;
+        }
+        if path == keys::wallpaper_transition::EFFECT {
+            return match self.app.settings_workbench.draft.values.get(path) {
+                Some(Value::Text(value)) => value.clone(),
+                _ => self.app.config.transition.effect.key().to_string(),
+            };
+        }
+        if path == keys::wallpaper_transition::FAMILY {
+            return match self.app.settings_workbench.draft.values.get(path) {
+                Some(Value::Text(value)) => value.clone(),
+                _ => crate::candidate_app::view::settings::composed::transitions::native_family_of(
+                    self.app.config.transition.effect,
+                )
+                .key()
+                .to_string(),
+            };
+        }
+        if path == keys::wallpaper_transition::DURATION_MS {
+            return match self.app.settings_workbench.draft.values.get(path) {
+                Some(Value::Number(value)) => composed::format_config_number(*value),
+                _ => composed::format_config_number(self.app.config.transition.duration_ms as f64),
+            };
+        }
         if path == "filterBar.activeResolution" {
             return self.app.resolution_label();
         }
@@ -645,6 +819,12 @@ impl SettingsSource for Source<'_> {
         }
     }
     fn number(&self, path: &str) -> f64 {
+        if path == keys::wallpaper_transition::DURATION_MS {
+            return match self.app.settings_workbench.draft.values.get(path) {
+                Some(Value::Number(value)) => *value,
+                _ => self.app.config.transition.duration_ms as f64,
+            };
+        }
         if path == "appearance.overlayOpacity" {
             return f64::from(self.app.state.appearance.overlay_opacity);
         }

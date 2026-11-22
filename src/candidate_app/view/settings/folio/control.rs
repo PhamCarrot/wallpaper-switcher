@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use iced::widget::canvas::{self, Frame, Path, Stroke};
-use iced::widget::{button, column, container, stack, text, text_input};
+use iced::widget::{button, column, container, mouse_area, stack, text, text_input};
 use iced::{mouse, window, Alignment, Border, Color, Element, Event, Length, Point, Rectangle};
 
 use crate::candidate_app::view::settings::folio::intent::Message;
@@ -51,8 +51,16 @@ fn preset_name_label(name: &str, available_width: f32, scale: f32) -> (f32, Stri
     (width, shown)
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum FillOwner {
+    #[default]
+    Control,
+    Choice(String, String),
+}
+
 #[derive(Debug, Default)]
 struct ButtonFillState {
+    owner: FillOwner,
     mix: f32,
     target: bool,
     initialized: bool,
@@ -60,13 +68,30 @@ struct ButtonFillState {
 }
 
 impl ButtonFillState {
-    fn advance(&mut self, active: bool, now: Instant, motion: MotionProfile) -> bool {
-        if !self.initialized {
-            self.mix = if active { 1.0 } else { 0.0 };
+    fn mix_for(&self, owner: &FillOwner, active: bool) -> f32 {
+        if self.initialized && &self.owner == owner {
+            self.mix
+        } else if active && *owner == FillOwner::Control {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    fn advance(
+        &mut self,
+        owner: &FillOwner,
+        active: bool,
+        now: Instant,
+        motion: MotionProfile,
+    ) -> bool {
+        if !self.initialized || &self.owner != owner {
+            self.owner.clone_from(owner);
+            self.mix = f32::from(active && *owner == FillOwner::Control);
             self.target = active;
             self.initialized = true;
             self.last_frame = Some(now);
-            return false;
+            return active && self.mix == 0.0;
         }
         if self.target != active {
             self.target = active;
@@ -87,6 +112,7 @@ impl ButtonFillState {
 }
 
 struct ButtonFill {
+    owner: FillOwner,
     active: bool,
     destructive: bool,
     enabled: bool,
@@ -108,7 +134,7 @@ impl canvas::Program<Message> for ButtonFill {
     ) -> Option<canvas::Action<Message>> {
         match event {
             Event::Window(window::Event::RedrawRequested(now)) => state
-                .advance(self.active, *now, self.motion)
+                .advance(&self.owner, self.active && self.enabled, *now, self.motion)
                 .then(|| canvas::Action::request_redraw_at(*now + BUTTON_FRAME)),
             _ => None,
         }
@@ -124,19 +150,23 @@ impl canvas::Program<Message> for ButtonFill {
     ) -> Vec<canvas::Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
         let hovered = self.enabled && cursor.is_over(bounds);
-        frame.fill(
-            &Path::rectangle(Point::ORIGIN, bounds.size()),
-            if hovered {
-                with_alpha(self.palette.surface_variant, 0.78 * self.fade)
-            } else if !self.enabled {
-                with_alpha(self.palette.surface_container, 0.42 * self.fade)
-            } else {
-                with_alpha(self.palette.surface_container, 0.92 * self.fade)
-            },
-        );
+        {
+            frame.fill(
+                &Path::rectangle(Point::ORIGIN, bounds.size()),
+                if hovered {
+                    with_alpha(self.palette.surface_variant, 0.78 * self.fade)
+                } else if !self.enabled {
+                    with_alpha(self.palette.surface_container, 0.42 * self.fade)
+                } else {
+                    with_alpha(self.palette.surface_container, 0.92 * self.fade)
+                },
+            );
+        }
 
         let mix = if self.enabled {
-            crate::donor_folio::source_ui::motion::smoothstep(state.mix.clamp(0.0, 1.0))
+            crate::donor_folio::source_ui::motion::smoothstep(
+                state.mix_for(&self.owner, self.active).clamp(0.0, 1.0),
+            )
         } else {
             0.0
         };
@@ -284,6 +314,12 @@ fn fixed_button_content<'a>(
 
     let enabled = message.is_some();
     let backdrop: Element<'a, Message> = iced::widget::canvas(ButtonFill {
+        owner: match message.as_ref() {
+            Some(Message::Settings(SettingsMsg::Pick(path, key))) => {
+                FillOwner::Choice(path.clone(), key.clone())
+            }
+            _ => FillOwner::Control,
+        },
         rtl,
         active,
         destructive,
@@ -1031,7 +1067,7 @@ pub(super) fn widget<'a>(
             with_alpha(palette.surface_text, 0.68 * fade),
         )
         .into(),
-        Control::Segment | Control::Static => text("").into(),
+        Control::Segment | Control::Static | Control::PlatformForm => text("").into(),
         Control::Code { snippet } => label(
             snippet,
             crate::donor_folio::source_ui::TYPE_SMALL,
@@ -1064,6 +1100,40 @@ fn source_profile_selection(
     let mode = crate::candidate_state::GalleryKind::from_key(values.get("profile-owner-mode")?)?;
     let id = values.get("profile-owner-id")?.parse().ok()?;
     Some((mode, id))
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+    #[test]
+    fn w5_button_fill_reverses_and_rebinds_by_setting_and_value() {
+        let mut state = ButtonFillState::default();
+        let motion = MotionProfile::default();
+        let origin = Instant::now();
+        let at = |ms| origin + Duration::from_millis(ms);
+        let launch = FillOwner::Choice("motion.launchSpeed".into(), "fast".into());
+        let picker = FillOwner::Choice("motion.filterSwapSpeed".into(), "fast".into());
+        let slow = FillOwner::Choice("motion.filterSwapSpeed".into(), "slow".into());
+
+        assert!(!state.advance(&launch, false, at(0), motion));
+        assert!(state.advance(&launch, true, at(16), motion));
+        assert!(state.advance(&launch, true, at(48), motion));
+        let middle = state.mix_for(&launch, true);
+        assert!(0.0 < middle && middle < 1.0);
+
+        assert!(state.advance(&launch, false, at(64), motion));
+        assert_eq!(state.mix_for(&launch, false), middle);
+        assert!(state.advance(&launch, false, at(80), motion));
+        let reverse = state.mix_for(&launch, false);
+        assert!(0.0 < reverse && reverse < middle);
+
+        assert_eq!(state.mix_for(&picker, true), 0.0);
+        assert!(state.advance(&picker, true, at(96), motion));
+        assert!(state.advance(&picker, true, at(112), motion));
+        assert!((0.0..1.0).contains(&state.mix_for(&picker, true)));
+        assert!(!state.advance(&slow, false, at(128), motion));
+        assert_eq!(state.mix_for(&slow, false), 0.0);
+    }
 }
 
 #[cfg(test)]
@@ -1162,7 +1232,6 @@ mod preset_name_tests {
                         let palette = Palette::from_rgb([0.1; 3], [0.2; 3], [0.9; 3], [0.3,0.6,0.8]);
                         let values = HashMap::new();
                         let control_scale = scale * 0.94;
-                        let (name_width, shown) = preset_name_label(name, width - 41.0 * control_scale, control_scale);
                         let mut element = widget(&catalog, Control::Presets { mode: crate::candidate_state::GalleryKind::Slices, items: vec![crate::candidate_state::mode_profiles::ProfileRow {id: 730, name: name.into(), selected:true, available}, crate::candidate_state::mode_profiles::ProfileRow {id:731, name:"Following preset".into(), selected:false, available:true}] }, &values, true, false, None, width, control_scale, &palette, 1.0, None, MotionProfile::default(), None);
                         let size = iced::Size::new(width,360.0);
                         let viewport = Rectangle::with_size(size);
@@ -1170,10 +1239,12 @@ mod preset_name_tests {
                         let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(iced::Size::ZERO,size));
                         let mut labels = Labels::default();
                         element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut labels);
-                        let b = labels.0.iter().find(|(value,_)| value==&shown).unwrap().1;
+                        let (shown, b) = &labels.0[1]; // Save current is first, followed by the first actual preset label.
+                        let b = *b;
                         assert!(b.x>=0.0 && b.x+b.width<=width+0.1);
                         assert!(b.height <= 30.0+0.1, "one bounded line must fit button height");
-                        assert!(crate::donor_back_layout::measured_width(&shown,11.0*legible_type_scale(control_scale),crate::donor_folio::source_ui::UI_FONT) <= name_width +0.1);
+                        assert!(shown == name || shown.ends_with('…') || shown.is_empty());
+                        assert!(crate::donor_back_layout::measured_width(shown,11.0*legible_type_scale(control_scale),crate::donor_folio::source_ui::UI_FONT) <= b.width +0.1);
                         let deletes: Vec<_> = labels.0.iter().filter(|(value,_)| value == "×").map(|(_,bounds)| *bounds).collect();
                         assert_eq!(deletes.len(), 2);
                         assert!((b.center().y - deletes[0].center().y).abs() < 0.1, "name and delete stay on the same row");

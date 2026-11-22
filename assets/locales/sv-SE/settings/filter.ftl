@@ -1,7 +1,7 @@
 settings-filter-appearance-card = Utseende
 settings-filter-appearance-card-desc = Matcha filterraden mot väljarens layout, eller behåll en och samma visuella stil i alla lägen.
 settings-filter-visual-style-label = Visuell stil
-settings-filter-visual-style-desc = Matcha väljaren använder den skeva raden i Slices och Sandy, den geometriska raden i Geometric och den raka raden i Wall.
+settings-filter-visual-style-desc = Matcha väljaren använder den skeva raden i Slices, den geometriska raden i Geometric och den raka raden i Wall.
 settings-filter-visual-style-match = Matcha väljaren
 settings-filter-visual-style-slices = Slices
 settings-filter-visual-style-hex = Geometric

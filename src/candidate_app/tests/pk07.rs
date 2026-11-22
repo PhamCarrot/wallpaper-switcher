@@ -6,6 +6,270 @@ use iced::advanced::{
     Layout, Shell,
 };
 
+fn w5_mount<'a>(
+    app: &'a GpuCandidate,
+    renderer: &iced::Renderer,
+    previous: Option<Tree>,
+) -> Scene<'a> {
+    let mut element = view::settings::gateway::view(app);
+    let size = iced::Size::new(app.viewport[0], app.viewport[1]);
+    let mut tree = previous.unwrap_or_else(|| Tree::new(&element));
+    tree.diff(element.as_widget());
+    let node =
+        element
+            .as_widget_mut()
+            .layout(&mut tree, renderer, &layout::Limits::new(size, size));
+    Scene {
+        element,
+        tree,
+        node,
+        bounds: iced::Rectangle::with_size(size),
+        cursor: iced::mouse::Cursor::Unavailable,
+    }
+}
+
+fn w5_redraw(
+    app: &mut GpuCandidate,
+    renderer: &iced::Renderer,
+    previous: &mut Option<Tree>,
+    now: std::time::Instant,
+) {
+    let messages = {
+        let mut scene = w5_mount(app, renderer, previous.take());
+        let messages = scene.event(
+            renderer,
+            iced::mouse::Cursor::Unavailable,
+            iced::Event::Window(window::Event::RedrawRequested(now)),
+        );
+        *previous = Some(scene.tree);
+        messages
+    };
+    for message in messages {
+        let _ = update(app, message);
+    }
+}
+
+fn w5_pixels(
+    app: &GpuCandidate,
+    renderer: &mut iced::Renderer,
+    previous: &mut Option<Tree>,
+) -> (Probe, Vec<u8>) {
+    let mut s = w5_mount(app, renderer, previous.take());
+    let probe = s.probe(renderer);
+    let theme = theme(app, app.window.unwrap());
+    let style = application_style(app, &theme);
+    renderer.reset(s.bounds);
+    s.element.as_widget().draw(
+        &s.tree,
+        renderer,
+        &theme,
+        &iced::advanced::renderer::Style {
+            text_color: style.text_color,
+        },
+        Layout::new(&s.node),
+        iced::mouse::Cursor::Unavailable,
+        &s.bounds,
+    );
+    let bytes = Headless::screenshot(
+        renderer,
+        iced::Size::new(s.bounds.width as u32, s.bounds.height as u32),
+        1.0,
+        style.background_color,
+    );
+    *previous = Some(s.tree);
+    (probe, bytes)
+}
+
+#[test]
+#[ignore = "Explicit retained-tree WGPU Settings regression"]
+fn w5_gateway_animates_page_choices_with_static_navigation() {
+    use std::time::{Duration, Instant};
+    use view::settings::folio::intent::{Message as Intent, SettingsMsg};
+
+    fn regions(p: &Probe, nav: &str, heading: &str) -> [iced::Rectangle; 2] {
+        let nav_text = p
+            .texts
+            .iter()
+            .filter(|(s, _)| s == nav)
+            .map(|(_, r)| *r)
+            .min_by(|a, b| a.x.total_cmp(&b.x))
+            .unwrap();
+        let title = p
+            .texts
+            .iter()
+            .filter(|(s, _)| s == heading)
+            .map(|(_, r)| *r)
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+            .unwrap();
+        let pane = |text: iced::Rectangle| {
+            p.scrolls
+                .iter()
+                .map(|s| s.1)
+                .filter(|r| r.contains(text.center()))
+                .min_by(|a, b| (a.width * a.height).total_cmp(&(b.width * b.height)))
+                .unwrap()
+        };
+        let index = pane(nav_text);
+        let reading = pane(title);
+        assert!(index.x + index.width <= reading.x + 1.0);
+        [
+            iced::Rectangle {
+                y: nav_text.y,
+                height: nav_text.height,
+                ..index
+            },
+            reading,
+        ]
+    }
+
+    fn crop(bytes: &[u8], rect: iced::Rectangle) -> Vec<[u8; 4]> {
+        let stride = 1920usize;
+        assert_eq!(bytes.len(), stride * 1080 * 4);
+        let mut out = Vec::new();
+        for y in rect.y.ceil() as usize..(rect.y + rect.height).floor() as usize {
+            for x in rect.x.ceil() as usize..(rect.x + rect.width).floor() as usize {
+                let i = (y * stride + x) * 4;
+                out.push(bytes[i..i + 4].try_into().unwrap());
+            }
+        }
+        assert!(out.len() > 64);
+        out
+    }
+
+    let mut app = p3_composed_editor_app(SettingsCategory::Picker);
+    app.settings_locale = localization::Catalog::new("en-US", "en-US").unwrap();
+    app.viewport = [1920.0, 1080.0];
+    view::settings::controller::reconcile(&mut app);
+    let mut r = renderer();
+    let mut tree = None;
+    let mut now = Instant::now();
+    let dt = Duration::from_millis(16);
+    for _ in 0..60 {
+        now += dt;
+        w5_redraw(&mut app, &r, &mut tree, now);
+    }
+    assert!(app.settings_workbench.folio_entrance.unwrap().settled());
+
+    for (nav, heading, section) in [
+        ("Motion", "Shared speeds", None),
+        ("Launch", "Launch", Some(1usize)),
+        ("Picker motion", "Picker motion", Some(2)),
+        ("Picker", "General", None),
+    ] {
+        let msg = {
+            let mut scene = w5_mount(&app, &r, tree.take());
+            let msg = scene.hit_label(&r, nav, |m| match m {
+                Message::SettingsIntent {
+                    intent: Intent::Settings(SettingsMsg::SelectTab(tab)),
+                    ..
+                } => section.is_none() && tab.eq_ignore_ascii_case(nav),
+                Message::SettingsIntent {
+                    intent: Intent::Settings(SettingsMsg::SelectSection(i)),
+                    ..
+                } => Some(*i) == section,
+                _ => false,
+            });
+            tree = Some(scene.tree);
+            msg
+        };
+        let _ = update(&mut app, msg);
+
+        let mut snapshots = Vec::new();
+        for frame in 0..=60 {
+            now += dt;
+            w5_redraw(&mut app, &r, &mut tree, now);
+            if matches!(frame, 0 | 2 | 60) {
+                let (p, raw) = w5_pixels(&app, &mut r, &mut tree);
+                let mut areas = regions(&p, nav, heading);
+                if nav == "Picker" {
+                    let choice = p
+                        .texts
+                        .iter()
+                        .find(|(text, _)| text == "Beginning")
+                        .expect("Start position choice")
+                        .1;
+                    areas[1] = iced::Rectangle {
+                        x: choice.x - 5.0,
+                        y: choice.y - 4.0,
+                        width: choice.width + 10.0,
+                        height: choice.height + 8.0,
+                    };
+                }
+                let [band, page] = areas.map(|area| crop(&raw, area));
+                snapshots.push((
+                    crop(
+                        &raw,
+                        p.texts
+                            .iter()
+                            .filter(|(t, _)| t == heading)
+                            .map(|(_, r)| *r)
+                            .max_by(|a, b| a.x.total_cmp(&b.x))
+                            .unwrap(),
+                    ),
+                    band,
+                    page,
+                    app.settings_workbench.tab_reveal.unwrap().x,
+                ));
+            }
+        }
+
+        let [first, mid, end] = snapshots.as_slice() else {
+            unreachable!()
+        };
+        assert!(first.0 == mid.0, "{nav} heading changed");
+        assert!(mid.0 == end.0, "{nav} heading changed");
+        if section.is_none() {
+            assert_eq!(first.3, 0.0);
+            assert!(0.0 < mid.3 && mid.3 < 1.0);
+        } else {
+            assert_eq!((first.3, mid.3), (1.0, 1.0));
+        }
+        assert_eq!(end.3, 1.0);
+
+        assert!(first.1 == mid.1 && mid.1 == end.1, "{nav} sidebar animated");
+        if nav == "Picker" {
+            let mut untouched = 0;
+            let mut filled = 0;
+            for ((a, b), c) in first.2.iter().zip(&mid.2).zip(&end.2) {
+                if a != c {
+                    untouched += usize::from(b == a);
+                    filled += usize::from(b == c);
+                }
+            }
+            assert!(
+                untouched >= 16 && filled >= 16,
+                "Picker choices lacked a partial wipe: {untouched}, {filled}"
+            );
+        }
+    }
+    let (option, message) = {
+        let mut scene = w5_mount(&app, &r, tree.take());
+        let option = scene
+            .probe(&r)
+            .texts
+            .into_iter()
+            .find(|(t, _)| t.starts_with("Last applied"))
+            .expect("applied choice");
+        let message = scene.hit_label(&r, &option.0, |m| matches!(m, Message::SettingsIntent {intent:Intent::Settings(SettingsMsg::Pick(path,value)),..} if path==view::settings::composed::keys::selector::START_POSITION && value=="applied"));
+        tree = Some(scene.tree);
+        (option, message)
+    };
+    let _ = update(&mut app, message);
+    let mut states = Vec::new();
+    for i in 0..=60 {
+        now += dt;
+        w5_redraw(&mut app, &r, &mut tree, now);
+        if matches!(i, 0 | 2 | 60) {
+            let (_, raw) = w5_pixels(&app, &mut r, &mut tree);
+            states.push(crop(&raw, option.1));
+        }
+    }
+    assert!(
+        states[0] != states[1] && states[1] != states[2],
+        "clicked choice must animate"
+    );
+}
+
 pub(super) struct Scene<'a> {
     element: Element<'a, Message>,
     tree: Tree,

@@ -1,12 +1,10 @@
-//! One window/generation boundary for composed Settings and retained Windows
-//! controls. All resulting actions still enter the existing app updater.
+//! One window and generation boundary for Settings and its platform forms.
 use super::{bridge, controller, folio::intent};
 use crate::candidate_app::*;
 
 pub(in crate::candidate_app) fn folder_owns_input(app: &GpuCandidate) -> bool {
     app.folder_menu_open
-        && (!app.panel_state.settings_open
-            || app.settings_workbench.windows_panel == Some(SettingsCategory::Library))
+        && (!app.panel_state.settings_open || app.settings_workbench.tab == "library")
 }
 
 pub(in crate::candidate_app) fn controls_owns_input(app: &GpuCandidate) -> bool {
@@ -42,19 +40,130 @@ pub(in crate::candidate_app) fn valid(
 ) -> bool {
     bound(app, window, generation) && !folder_owns_input(app)
 }
-pub(in crate::candidate_app) fn legacy_valid(
+pub(in crate::candidate_app) fn page_valid(
     app: &GpuCandidate,
     window: Option<window::Id>,
     generation: u64,
     message: &Message,
 ) -> bool {
-    bound(app, window, generation)
-        && (!folder_owns_input(app)
-            || (app.settings_workbench.windows_panel == Some(SettingsCategory::Library)
-                && matches!(
-                    message,
-                    Message::SetFolderFilter(_) | Message::ToggleFolderMenu
-                )))
+    if !bound(app, window, generation) {
+        return false;
+    }
+    if app.launch_policy.is_preview()
+        && matches!(message, Message::Wake(Wake::Tray(TrayAction::OpenConfig)))
+    {
+        return false;
+    }
+    if folder_owns_input(app) {
+        return app.settings_workbench.tab == "library"
+            && matches!(
+                message,
+                Message::SetFolderFilter(_) | Message::ToggleFolderMenu
+            );
+    }
+    if app.settings_workbench.windows_panel == Some(SettingsCategory::Theme) {
+        return true;
+    }
+    match app.settings_workbench.tab.as_str() {
+        "displays" => matches!(
+            message,
+            Message::CycleTargetMonitor
+                | Message::ToggleMonitorLock(_)
+                | Message::Wake(Wake::Tray(TrayAction::OpenConfig))
+                | Message::SettingsRecheckProvider { .. }
+        ),
+        "library" => matches!(
+            message,
+            Message::FolderPathChanged(_)
+                | Message::AddLocalRoot
+                | Message::UnlistLocalRoot(_)
+                | Message::SetInstalledDiscovery(_)
+                | Message::RefreshCatalog
+                | Message::SearchChanged(_)
+                | Message::SetSourceFilter(_)
+                | Message::ToggleFolderMenu
+                | Message::ToggleFavoritesFilter
+                | Message::SetLibraryWatching(_)
+                | Message::SetLibraryPolling(_)
+                | Message::RefreshThumbnails
+                | Message::ClearPosterCache
+        ),
+        "automation" => matches!(
+            message,
+            Message::ScheduleNameChanged(_)
+                | Message::ScheduleTimeChanged(_)
+                | Message::ToggleScheduleDay(_)
+                | Message::ToggleScheduleMonitor(_)
+                | Message::CreateSchedule
+                | Message::ToggleSchedule(_)
+        ),
+        "playback" => matches!(
+            message,
+            Message::ToggleRandomRotation
+                | Message::CycleSlideshowInterval
+                | Message::TogglePlaylistPanel
+                | Message::ToggleEnginePaused
+                | Message::ToggleEngineMuted
+                | Message::CycleEngineVolume
+                | Message::StopPlaylist { .. }
+                | Message::ResumeRandomRotation
+        ),
+        _ => false,
+    }
+}
+
+pub(super) fn platform_form(app: &GpuCandidate) -> Option<Element<'_, Message>> {
+    let scale = bridge::effective_ui_scale(app);
+    let palette = crate::candidate_app::view::donor_palette(app);
+    Some(match app.settings_workbench.tab.as_str() {
+        "displays" => {
+            let mut content =
+                iced::widget::column![super::windows_display_content(app)].spacing(12.0 * scale);
+            for recovery in app
+                .provider_recoveries
+                .iter()
+                .filter(|recovery| coordinator::provider_recheck_available(recovery))
+            {
+                content = content.push(
+                    iced::widget::column![
+                        super::super::sheets::panel_text(
+                            format!(
+                                "{} · {}",
+                                recovery.target_id,
+                                app.settings_locale
+                                    .text_static("settings-windows-provider-needs-recheck")
+                            ),
+                            scale,
+                        ),
+                        super::super::sheets::panel_button(
+                            super::super::sheets::panel_text(
+                                app.settings_locale
+                                    .text_static("settings-windows-recheck-provider"),
+                                scale
+                            ),
+                            palette,
+                            scale,
+                        )
+                        .on_press_maybe(
+                            (app.launch_policy.allows_provider() && !app.apply_pending).then(
+                                || Message::SettingsRecheckProvider {
+                                    window: app.window,
+                                    generation: app.settings_workbench.generation,
+                                    recovery: recovery.clone(),
+                                }
+                            )
+                        ),
+                    ]
+                    .spacing(6.0 * scale),
+                );
+            }
+            content.into()
+        }
+        "library" => super::library_platform_form(app),
+        "playback" => super::playback_settings_content(app),
+        "automation" => super::automation_settings_content_with_palette(app, palette),
+        _ => return None,
+    })
 }
 
 pub(in crate::candidate_app) fn view(app: &GpuCandidate) -> Element<'_, Message> {
@@ -62,155 +171,52 @@ pub(in crate::candidate_app) fn view(app: &GpuCandidate) -> Element<'_, Message>
     let session = &app.settings_workbench;
     let generation = session.generation;
     let window = app.window;
-    let palette = crate::candidate_app::view::donor_palette(app);
-    if let Some(category) = session.windows_panel {
-        // Theme owns a source-style index and one reading scroller. Mount it
-        // directly, retaining the same window/generation and departure gateway.
-        if category == SettingsCategory::Theme {
-            let bind = move |message| Message::SettingsLegacy {
-                window,
-                generation,
-                message: Box::new(message),
-            };
-            return crate::donor_folio::sheet_with_scroll_capture(
-                app.viewport,
-                Some(super::theme_designer::palette_index(app).map(bind)),
-                super::theme_settings_content(app).map(bind),
-                palette,
-                Message::SettingsWindowsClose { window, generation },
-                Message::SheetBackdrop,
-                None,
-                scale,
-            );
-        }
-        let mut content = super::windows_settings_content(app, category).map(move |message| {
-            Message::SettingsLegacy {
-                window,
-                generation,
-                message: Box::new(message),
-            }
-        });
-        if app.local_state_recovery_available() {
-            content = iced::widget::column![
-                super::super::sheets::panel_button(
-                    super::super::sheets::panel_text(
-                        app.settings_locale.text_static("r5-reload-settings"),
-                        scale
-                    ),
-                    palette,
-                    scale
-                )
-                .on_press(Message::SettingsReloadSavedState { window, generation }),
-                iced::widget::scrollable(
-                    iced::widget::text(&session.message)
-                        .size(12.0 * crate::donor_folio::source_ui::legible_type_scale(scale))
-                        .width(Fill)
-                )
-                .height(60.0 * scale),
-                content,
-            ]
-            .spacing(10.0 * scale)
-            .into();
-        }
-        let close = Message::SettingsWindowsClose { window, generation };
-        let tr = |key| app.settings_locale.text_static(key);
-        let index = crate::donor_folio::index(
-            tr("r5-windows-controls"),
-            tr("r5-windows-note"),
-            iced::widget::column![
-                super::super::sheets::panel_button(
-                    super::super::sheets::panel_text(tr("r5-back-settings"), scale),
-                    palette,
-                    scale
-                )
-                .on_press(close.clone()),
-                super::super::sheets::panel_text(category.label(), scale)
-                    .size(13.0 * crate::donor_folio::source_ui::legible_type_scale(scale)),
-                super::super::sheets::panel_text(category.description(), scale),
-            ]
-            .spacing(12.0 * scale)
-            .into(),
-            palette,
-            scale,
-        );
-        let page = crate::donor_folio::page(
-            category.label(),
-            if category == SettingsCategory::Theme {
-                "Theme designer"
-            } else {
-                "Windows controls"
-            },
-            content,
-            Some(close.clone()),
-            None,
-            palette,
-            crate::donor_folio::BlueprintKind::Settings,
-            scale,
-        );
+    let opacity = app.scene_motion.settings_opacity();
+    let opacity = if app.panel_state.settings_open && opacity == 0.0 {
+        1.0
+    } else {
+        opacity
+    };
+    let palette = crate::candidate_app::view::donor_palette(app).opacity(opacity);
+    if session.windows_panel == Some(SettingsCategory::Theme) {
+        let bind = move |message| Message::SettingsPageAction {
+            window,
+            generation,
+            message: Box::new(message),
+        };
         return crate::donor_folio::sheet_with_scroll_capture(
             app.viewport,
-            Some(index),
-            page,
+            Some(super::theme_designer::palette_index(app).map(bind)),
+            super::theme_settings_content(app).map(bind),
             palette,
-            close,
+            Message::SettingsThemeClose { window, generation },
             Message::SheetBackdrop,
             None,
             scale,
         );
     }
-    let content = bridge::view(app).map(move |intent| Message::SettingsIntent {
-        window,
-        generation,
-        intent,
+    let content = bridge::view(app).map(move |intent| match intent {
+        intent::Message::PageAction(message) => match *message {
+            message @ Message::SettingsRecheckProvider { .. } => message,
+            message => Message::SettingsPageAction {
+                window,
+                generation,
+                message: Box::new(message),
+            },
+        },
+        intent => Message::SettingsIntent {
+            window,
+            generation,
+            intent,
+        },
     });
     let mut footer = iced::widget::row![]
         .spacing(10.0 * scale)
         .align_y(iced::Alignment::Center);
-    let windows_category = category_for_tab(&session.tab)
-        .filter(|_| !matches!(session.tab.as_str(), "picker" | "library" | "automation"));
     let recover = app.local_state_recovery_available();
-    let studio_status = session.layout_studio() && !session.message.is_empty();
-    if windows_category.is_none() && session.tab != "library" && !recover && !studio_status {
-        return content.into();
-    }
-    if let Some(category) = windows_category {
-        footer = footer.push(
-            super::super::sheets::panel_button(
-                super::super::sheets::panel_text(
-                    app.settings_locale.text_static("r5-windows-controls"),
-                    scale,
-                ),
-                palette,
-                scale,
-            )
-            .on_press(Message::SettingsWindowsOpen {
-                window,
-                generation,
-                category,
-            })
-            .style(move |_, status| crate::donor_ui::action_style(palette, false, false, status)),
-        );
-    }
-    if session.tab == "library" {
-        footer = footer.push(
-            iced::widget::text(format!("{} wallpapers", app.wallpapers.len()))
-                .size(12.0 * crate::donor_folio::source_ui::legible_type_scale(scale)),
-        );
-        footer = footer.push(
-            super::super::sheets::panel_button(
-                super::super::sheets::panel_text(
-                    app.settings_locale.text_static("r5-catalog-refresh"),
-                    scale,
-                ),
-                palette,
-                scale,
-            )
-            .on_press(Message::SettingsIntent {
-                window,
-                generation,
-                intent: intent::Message::RefreshCatalog,
-            }),
-        );
+    let studio_status = session.layout_studio() && session.save_notice.is_some();
+    if !recover && !studio_status {
+        return iced::widget::stack![content].into();
     }
     if recover {
         footer = footer.push(
@@ -225,17 +231,14 @@ pub(in crate::candidate_app) fn view(app: &GpuCandidate) -> Element<'_, Message>
             .on_press(Message::SettingsReloadSavedState { window, generation }),
         );
     }
-    // The reading panel and process modal own the scrollable status text.
-    // Studio uses its own renderer, so retain its existing gateway status slot.
-    if studio_status {
+    if let Some(palette) = session.palette.as_ref().filter(|_| studio_status) {
         footer = footer.push(
-            iced::widget::scrollable(
-                iced::widget::text(&session.message)
-                    .size(11.0 * crate::donor_folio::source_ui::legible_type_scale(scale))
-                    .width(Fill),
-            )
-            .height(60.0 * scale)
-            .width(Fill),
+            super::folio::workbench::status_footer(bridge::SaveNotice::status(app), scale, palette)
+                .map(move |intent| Message::SettingsIntent {
+                    window,
+                    generation,
+                    intent,
+                }),
         );
     }
     let footer = iced::widget::container(footer)
@@ -257,20 +260,6 @@ pub(in crate::candidate_app) fn view(app: &GpuCandidate) -> Element<'_, Message>
     .into()
 }
 
-fn category_for_tab(tab: &str) -> Option<SettingsCategory> {
-    Some(match tab {
-        "picker" => SettingsCategory::Picker,
-        "filter" => SettingsCategory::CatalogFilters,
-        "position" => SettingsCategory::Position,
-        "motion" => SettingsCategory::Motion,
-        "playback" => SettingsCategory::Playback,
-        "library" => SettingsCategory::Library,
-        "automation" => SettingsCategory::Automation,
-        "theme" => SettingsCategory::Theme,
-        _ => return None,
-    })
-}
-
 pub(in crate::candidate_app) fn open(
     app: &mut GpuCandidate,
     category: SettingsCategory,
@@ -279,13 +268,26 @@ pub(in crate::candidate_app) fn open(
         Ok(task) => task,
         Err(task) => return task,
     };
-    if category == SettingsCategory::Theme {
-        app.ensure_theme_designer();
+    let tab = match category {
+        SettingsCategory::Theme => {
+            app.ensure_theme_designer();
+            controller::select_tab(app, "theme".into());
+            app.settings_workbench.windows_panel = Some(SettingsCategory::Theme);
+            return task;
+        }
+        SettingsCategory::WallpapersDisplays => "displays",
+        SettingsCategory::Library => "library",
+        SettingsCategory::Automation => "automation",
+        SettingsCategory::Playback => "playback",
+        _ => return task,
+    };
+    controller::select_tab(app, tab.into());
+    if let Some(section) = controller::cards(app).iter().position(|(_, rows)| {
+        rows.iter()
+            .any(|row| matches!(row.control, super::composed::Control::PlatformForm))
+    }) {
+        app.settings_workbench.navigation.section = section;
     }
-    app.panel_state.settings_category = category;
-    app.settings_workbench.legacy_category = Some(category);
-    app.settings_workbench.windows_panel = Some(category);
-    controller::rotate(app);
     task
 }
 pub(in crate::candidate_app) fn close(app: &mut GpuCandidate) {
@@ -298,7 +300,7 @@ pub(in crate::candidate_app) fn close(app: &mut GpuCandidate) {
     {
         let _ =
             app.request_theme_departure(crate::candidate_app::theme_workflow::Departure::Message(
-                Box::new(Message::SettingsWindowsClose {
+                Box::new(Message::SettingsThemeClose {
                     window: app.window,
                     generation: app.settings_workbench.generation,
                 }),

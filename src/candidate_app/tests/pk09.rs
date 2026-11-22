@@ -34,7 +34,7 @@ fn settings(app: &mut GpuCandidate, message: intent::SettingsMsg) {
     );
 }
 
-fn advance(app: &mut GpuCandidate, dt: f32) -> bool {
+fn next_frame(app: &GpuCandidate, dt: f32) -> (bool, Wake) {
     let mut scene = app.scene_motion;
     let mut moving = scene.tick(dt);
     let mut hex = app.hex_presentation.clone();
@@ -45,9 +45,9 @@ fn advance(app: &mut GpuCandidate, dt: f32) -> bool {
     let state = app
         .depth_camera
         .unwrap_or_else(|| GalleryMotionState::absolute_camera(0.0, 0.0, 250.0, 1.0, 1.0));
-    let _ = update(
-        app,
-        Message::Wake(Wake::MotionFrame {
+    (
+        moving,
+        Wake::MotionFrame {
             generation: app.motion_generation.load(Ordering::Acquire),
             value: 0.0,
             velocity: 0.0,
@@ -59,8 +59,13 @@ fn advance(app: &mut GpuCandidate, dt: f32) -> bool {
             hex,
             wall: app.wall_presentation.clone(),
             scene: Some(scene),
-        }),
-    );
+        },
+    )
+}
+
+fn advance(app: &mut GpuCandidate, dt: f32) -> bool {
+    let (moving, frame) = next_frame(app, dt);
+    let _ = update(app, Message::Wake(frame));
     moving
 }
 
@@ -71,6 +76,77 @@ fn settle(app: &mut GpuCandidate) {
         }
     }
     panic!("scene never settled");
+}
+
+pub(super) fn wall_hover_burst(app: &mut GpuCandidate, target: Option<usize>) {
+    for _ in 0..16 {
+        let message =
+            super::super::lifecycle::bind_gallery_input(app, GalleryMessage::Hovered(target));
+        let _ = update(app, message);
+    }
+}
+
+#[test]
+fn wall_sheet_exit_reuses_hover_generation_and_releases_keyboard_border() {
+    fn selected_border(app: &GpuCandidate) -> f32 {
+        app.ordinary_frame()
+            .iter()
+            .find(|e| e.card.selected)
+            .unwrap()
+            .wall_border
+            .unwrap()
+            .0
+    }
+
+    for menu in [Message::ToggleSettingsPanel, Message::TogglePlaylistChooser] {
+        let (mut app, calls) = fixture(GalleryMode::Wall);
+        let selected = app.selected;
+        let _ = update(&mut app, menu.clone());
+        settle(&mut app);
+        assert_eq!(app.scene_motion.opacity(), 0.0);
+        let _ = update(&mut app, menu);
+        assert!(!app.panel_state.settings_open && !app.playlist_panel_open);
+
+        app.gallery_keyboard = true;
+        app.wall_presentation.as_mut().unwrap().keyboard = true;
+        assert_eq!(selected_border(&app), 0.8);
+        let generation = app.motion_generation.load(Ordering::Acquire);
+        let (moving, queued) = next_frame(&app, 0.016);
+        assert!(moving);
+        wall_hover_burst(&mut app, None);
+        assert_eq!(app.motion_generation.load(Ordering::Acquire), generation);
+        assert!(!app.gallery_keyboard && !app.wall_presentation.as_ref().unwrap().keyboard);
+        assert_eq!(selected_border(&app), 0.0);
+
+        // Keep poster scheduling from rewriting keyboard state after the merge.
+        app.cache_operation = Some(1);
+        let _ = update(&mut app, Message::Wake(queued));
+        app.cache_operation = None;
+        assert!(!app.wall_presentation.as_ref().unwrap().keyboard);
+        assert_eq!(selected_border(&app), 0.0);
+        let partial = app.scene_motion.opacity();
+        assert!(partial > 0.0 && partial < 1.0);
+
+        for target in [Some(1), Some(2), None] {
+            let before = app.motion_generation.load(Ordering::Acquire);
+            wall_hover_burst(&mut app, target);
+            let expected = target.map(|i| app.wallpapers[i].id.as_str());
+            assert_eq!(
+                app.wall_presentation.as_ref().unwrap().hover.as_deref(),
+                expected
+            );
+            assert_eq!(app.motion_generation.load(Ordering::Acquire), before + 1);
+            assert_eq!(app.scene_motion.opacity(), partial);
+        }
+        assert!(advance(&mut app, 0.016));
+        assert!(app.scene_motion.opacity() > partial);
+        settle(&mut app);
+        assert_eq!(app.scene_motion.opacity(), 1.0);
+        assert_eq!(app.scene_motion.settings_opacity(), 0.0);
+        assert_eq!(app.scene_motion.playlist_opacity(), 0.0);
+        assert_eq!(app.selected, selected);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
 }
 
 #[test]
@@ -149,6 +225,68 @@ fn modal_handoff_keeps_current_motion_and_owns_input() {
     assert_eq!(submissions.load(Ordering::SeqCst), 0);
 }
 
+#[test]
+fn stable_sheet_exit_retires_visuals_after_releasing_input_in_wall_and_slices() {
+    for mode in [GalleryMode::Wall, GalleryMode::Slices] {
+        let (mut app, calls) = fixture(mode);
+        let _ = update(&mut app, Message::ToggleSettingsPanel);
+        settle(&mut app);
+        let stale_settings = app.settings_workbench.generation;
+        let window = app.window;
+        let _ = update(&mut app, Message::ToggleSettingsPanel);
+        assert!(!app.settings_workbench.active);
+        assert_ne!(app.settings_workbench.generation, stale_settings);
+        assert_eq!(app.scene_motion.settings_opacity(), 1.0);
+        let _ = update(
+            &mut app,
+            Message::SettingsIntent {
+                window,
+                generation: stale_settings,
+                intent: intent::Message::Settings(intent::SettingsMsg::SelectTab("theme".into())),
+            },
+        );
+        assert_eq!(app.settings_workbench.tab, "picker");
+        assert!(advance(&mut app, 0.032));
+        let partial = app.scene_motion.settings_opacity();
+        assert!(partial > 0.0 && partial < 1.0);
+        let _ = update(&mut app, Message::ToggleSettingsPanel);
+        assert!(app.settings_workbench.active);
+        assert_eq!(app.scene_motion.settings_opacity(), partial);
+        settle(&mut app);
+        assert_eq!(app.scene_motion.settings_opacity(), 1.0);
+        let _ = update(&mut app, Message::ToggleSettingsPanel);
+        settle(&mut app);
+        assert_eq!(app.scene_motion.settings_opacity(), 0.0);
+
+        let _ = update(&mut app, Message::TogglePlaylistChooser);
+        let owner = app.playlist_owner().unwrap();
+        let _ = update(
+            &mut app,
+            Message::PlaylistBrowse(owner, playlists::Browse::Query("night".into())),
+        );
+        let owner = app.playlist_owner().unwrap();
+        let _ = update(
+            &mut app,
+            Message::PlaylistBrowse(owner.clone(), playlists::Browse::Close),
+        );
+        assert!(app.playlist_owner().is_none());
+        assert_eq!(app.scene_motion.playlist_opacity(), 1.0);
+        assert_eq!(app.retiring_playlist.as_ref().unwrap().query, "night");
+        let _ = update(
+            &mut app,
+            Message::PlaylistBrowse(owner, playlists::Browse::Query("wrong".into())),
+        );
+        assert_eq!(app.playlist_query, "night");
+        assert!(advance(&mut app, 0.032));
+        assert!((0.0..1.0).contains(&app.scene_motion.playlist_opacity()));
+        assert!(app.retiring_playlist.is_some());
+        settle(&mut app);
+        assert_eq!(app.scene_motion.playlist_opacity(), 0.0);
+        assert!(app.retiring_playlist.is_none());
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+}
+
 fn center(app: &GpuCandidate) -> [f32; 2] {
     if app.gallery_mode == GalleryMode::Depth {
         let frame = app.depth_frame.as_ref().unwrap();
@@ -177,7 +315,7 @@ fn center(app: &GpuCandidate) -> [f32; 2] {
 }
 
 #[test]
-fn studio_reveals_each_direction_between_layout_families_and_changed_presets() {
+fn studio_reveals_new_modes_and_preserves_same_mode_composition() {
     let modes = [
         GalleryMode::Slices,
         GalleryMode::Geometric,
@@ -196,8 +334,10 @@ fn studio_reveals_each_direction_between_layout_families_and_changed_presets() {
         for to in modes.into_iter().filter(|to| *to != from) {
             let _ = update(&mut app, Message::SetGalleryMode(to));
             assert_eq!(app.scene_motion.opacity(), 0.0, "{from:?} to {to:?}");
-            assert!(advance(&mut app, 0.05));
-            assert!((0.0..1.0).contains(&app.scene_motion.opacity()));
+            let moving = advance(&mut app, 0.05);
+            assert!(app.scene_motion.opacity() > 0.0);
+            assert!(moving);
+            assert!(app.scene_motion.opacity() < 1.0);
             settle(&mut app);
             assert_eq!(app.scene_motion.opacity(), 1.0);
             let _ = update(&mut app, Message::SetGalleryMode(from));
@@ -236,10 +376,28 @@ fn studio_reveals_each_direction_between_layout_families_and_changed_presets() {
             before, snapshot,
             "{from:?} needs different geometry before applying the preset"
         );
-        app.apply_gallery_preset(gallery_kind(from), saved).unwrap();
-        assert_eq!(app.scene_motion.opacity(), 0.0, "{from:?} preset");
-        assert!(advance(&mut app, 0.05));
-        assert!((0.0..1.0).contains(&app.scene_motion.opacity()));
+        let window = app.window;
+        let generation = app.settings_workbench.generation;
+        let _ = update(
+            &mut app,
+            Message::SettingsIntent {
+                window,
+                generation,
+                intent: intent::Message::ApplyPreset(gallery_kind(from), saved),
+            },
+        );
+        assert_eq!(view::settings::profile_projection::capture(&app), snapshot);
+        assert_eq!(
+            app.scene_motion.opacity(),
+            1.0,
+            "{from:?} preset first frame"
+        );
+        advance(&mut app, 0.05);
+        assert_eq!(
+            app.scene_motion.opacity(),
+            1.0,
+            "{from:?} preset intermediate frame"
+        );
         settle(&mut app);
         assert_eq!(app.scene_motion.opacity(), 1.0);
     }
@@ -446,8 +604,9 @@ fn production_motion_compositions() {
                     index,
                     PosterSlot {
                         layer,
-                        is_video: false,
+                        kind: crate::poster_worker::PosterKind::Still,
                         generation,
+                        last_requested: generation,
                         catalog_generation,
                         item_id: item.id.clone(),
                         source: path,
@@ -512,5 +671,41 @@ fn production_motion_compositions() {
             advance(&mut app, 0.032);
             save(&app, "studio-return-mid");
         }
+    }
+}
+
+#[test]
+fn studio_parallax_updates_the_control_and_saves_the_boolean() {
+    use view::settings::bridge::SaveNotice;
+    use view::settings::composed::Control;
+    for (mode, path) in [
+        (GalleryMode::Slices, selector::SLICE_PARALLAX),
+        (GalleryMode::Geometric, selector::HEX_PARALLAX),
+    ] {
+        let (mut app, calls) = fixture(mode);
+        app.persist_state_outcome().unwrap();
+        let _ = update(&mut app, Message::ToggleSettingsPanel);
+        settings(&mut app, intent::SettingsMsg::SelectTab("picker".into()));
+        let index = view::settings::composed::PICKER_LAYOUT_SECTION;
+        settings(&mut app, intent::SettingsMsg::SelectSection(index));
+        assert!(app.settings_workbench.layout_studio());
+        for enabled in [true, false] {
+            settings(&mut app, intent::SettingsMsg::Toggle(path.into(), enabled));
+            assert!(app.settings_workbench.layout_studio());
+            let cards = view::settings::controller::cards(&app);
+            assert!(cards[index].1.iter().any(|row| matches!(&row.control,
+                Control::Toggle { path: key, value } if key == path && *value == enabled)));
+            assert!(matches!(
+                app.settings_workbench.save_notice,
+                Some(SaveNotice::Saved(_))
+            ));
+            let saved = CandidateState::load(&app.state_path);
+            let value = match mode {
+                GalleryMode::Slices => saved.gallery.slices.parallax,
+                _ => saved.gallery.geometric.parallax,
+            };
+            assert_eq!(value, Some(enabled));
+        }
+        assert_eq!(calls.load(Ordering::Acquire), 0);
     }
 }

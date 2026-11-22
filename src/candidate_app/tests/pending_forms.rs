@@ -13,7 +13,9 @@ fn form(app: &mut GpuCandidate, action: Form) {
 }
 fn pending_app(category: SettingsCategory) -> GpuCandidate {
     let mut app = p3_composed_editor_app(category);
-    let _ = view::settings::gateway::open(&mut app, category);
+    // These compatibility forms have no public launcher. Bind the dormant
+    // form owner directly while exercising the real generation and save path.
+    app.settings_workbench.windows_panel = Some(category);
     view::settings::controller::reconcile(&mut app);
     app
 }

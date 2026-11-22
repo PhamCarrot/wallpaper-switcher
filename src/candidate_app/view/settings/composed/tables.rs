@@ -1,10 +1,11 @@
 //! Source-derived pure control projection; explicit locale and -owned consumers.
 use crate::candidate_app::view::settings::composed::{transitions, wallpaper_kind, SettingsSource};
 
-pub const TABS: [&str; 10] = [
+pub const TABS: [&str; 11] = [
     "picker",
     "filter",
     "position",
+    "displays",
     "motion",
     "playback",
     "performance",
@@ -66,7 +67,7 @@ pub(super) fn motion_speed_options(
 }
 
 pub const PICKER_LAYOUT_SECTION: usize = 1;
-pub const PICKER_CONTROLS_SECTION: usize = 3;
+pub const PICKER_CONTROLS_SECTION: usize = 2;
 
 pub fn is_picker_layout_section(tab: &str, section: usize) -> bool {
     tab == "picker" && section == PICKER_LAYOUT_SECTION

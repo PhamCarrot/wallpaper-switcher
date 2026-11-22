@@ -1,6 +1,6 @@
 //! Shared still selection. A poster describes only its stored still, never live frames.
 use crate::scanner::{WallpaperItem, WallpaperSource};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -8,13 +8,30 @@ pub enum Provenance {
     Image,
     ExistingPoster,
 }
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 /// Cheap scheduling stamp; this is not a content hash.
 pub struct Fingerprint {
     pub bytes: u64,
     pub modified: SystemTime,
 }
+impl Fingerprint {
+    pub(crate) fn capture(path: &std::path::Path) -> Option<Self> {
+        let meta = path.metadata().ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        Some(Self {
+            bytes: meta.len(),
+            modified: meta.modified().ok()?,
+        })
+    }
+
+    pub(crate) fn matches(&self, path: &std::path::Path) -> bool {
+        Self::capture(path).as_ref() == Some(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MediaStill {
@@ -24,7 +41,13 @@ pub struct MediaStill {
     pub fingerprint: Fingerprint,
     pub provenance: Provenance,
 }
-pub fn supported(path: &std::path::Path) -> bool {
+pub(crate) fn is_gif(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("gif"))
+}
+
+pub fn supported(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
         matches!(
             e.to_ascii_lowercase().as_str(),
@@ -34,33 +57,11 @@ pub fn supported(path: &std::path::Path) -> bool {
 }
 impl MediaStill {
     pub fn is_current(&self) -> bool {
-        self.path.metadata().is_ok_and(|m| {
-            m.is_file()
-                && m.len() == self.fingerprint.bytes
-                && m.modified().ok() == Some(self.fingerprint.modified)
-        })
+        self.fingerprint.matches(&self.path)
     }
     pub fn select(item: &WallpaperItem, catalog_revision: u64) -> Option<Self> {
-        let candidates = item
-            .preview_path
-            .iter()
-            .map(|p| (p, Provenance::ExistingPoster))
-            .chain(
-                (item.source == WallpaperSource::LocalImage
-                    || item.wallpaper_type.eq_ignore_ascii_case("image"))
-                .then_some((&item.file_target, Provenance::Image)),
-            );
-        for (path, mut provenance) in candidates {
-            if !supported(path) {
-                continue;
-            }
-            let Ok(meta) = path.metadata() else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
-            }
-            let Ok(modified) = meta.modified() else {
+        for (path, mut provenance) in Self::candidates(item) {
+            let Some(fingerprint) = Fingerprint::capture(path) else {
                 continue;
             };
             if path == &item.file_target {
@@ -70,14 +71,23 @@ impl MediaStill {
                 item_id: item.id.clone(),
                 catalog_revision,
                 path: path.clone(),
-                fingerprint: Fingerprint {
-                    bytes: meta.len(),
-                    modified,
-                },
+                fingerprint,
                 provenance,
             });
         }
         None
+    }
+
+    pub(crate) fn candidates(item: &WallpaperItem) -> impl Iterator<Item = (&PathBuf, Provenance)> {
+        item.preview_path
+            .iter()
+            .map(|p| (p, Provenance::ExistingPoster))
+            .chain(
+                (item.source == WallpaperSource::LocalImage
+                    || item.wallpaper_type.eq_ignore_ascii_case("image"))
+                .then_some((&item.file_target, Provenance::Image)),
+            )
+            .filter(|(path, _)| supported(path))
     }
 }
 

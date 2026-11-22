@@ -472,38 +472,6 @@ pub(super) fn tab_selector(builder: &mut Builder<'_>) {
         "ms",
     );
     builder.card(
-        tr("settings-selector-tag-cloud-card"),
-        tr("settings-selector-tag-cloud-card-desc"),
-    );
-    builder.num(
-        tr("settings-selector-tag-cloud-width-label"),
-        tr("settings-selector-tag-cloud-width-desc"),
-        keys::selector::TAG_CLOUD_WIDTH,
-        "px",
-    );
-    builder.chips(
-        tr("settings-selector-tag-cloud-rows-label"),
-        tr("settings-selector-tag-cloud-rows-desc"),
-        keys::selector::TAG_CLOUD_ROWS,
-        &[
-            ("1", tr("settings-selector-tag-cloud-rows-one")),
-            ("2", tr("settings-selector-tag-cloud-rows-two")),
-            ("3", tr("settings-selector-tag-cloud-rows-three")),
-        ],
-    );
-    builder.num(
-        tr("settings-selector-tag-offset-x-label"),
-        tr("settings-selector-tag-offset-x-desc"),
-        keys::selector::TAG_CLOUD_OFFSET_X,
-        "px",
-    );
-    builder.num(
-        tr("settings-selector-tag-offset-y-label"),
-        tr("settings-selector-tag-offset-y-desc"),
-        keys::selector::TAG_CLOUD_OFFSET_Y,
-        "px",
-    );
-    builder.card(
         tr("settings-selector-video-preview-card"),
         tr("settings-selector-video-preview-card-desc"),
     );

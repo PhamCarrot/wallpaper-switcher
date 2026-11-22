@@ -748,7 +748,7 @@ pub(super) fn content(app: &GpuCandidate) -> Element<'_, Message> {
                 .width(Fill),
             source_ui::folio_close(
                 app.settings_locale.language.rtl,
-                Message::SettingsWindowsClose {
+                Message::SettingsThemeClose {
                     window: app.window,
                     generation: app.settings_workbench.generation
                 },

@@ -2,34 +2,87 @@
 
 use super::Message;
 use iced::{window, Task};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
-pub(super) fn install(id: window::Id) -> Task<Message> {
-    window::run(id, |window| {
-        use iced::window::raw_window_handle::RawWindowHandle;
-        if let Ok(handle) = window.window_handle() {
-            if let RawWindowHandle::Win32(handle) = handle.as_raw() {
-                // iced runs this callback on the owning window/event-loop thread.
-                let installed = unsafe { install_on_window(handle.hwnd.get() as _) };
-                crate::log_debug(&format!(
-                    "Native caption activation filter installed={installed}"
-                ));
+#[derive(Default)]
+pub(super) struct Visibility(Arc<AtomicU64>);
+
+impl Visibility {
+    fn next_request(&self) -> impl Fn() -> bool + Send + 'static {
+        let generation = self.0.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        let current = self.0.clone();
+        move || current.load(Ordering::Acquire) == generation
+    }
+
+    pub(super) fn apply(
+        &self,
+        id: window::Id,
+        visible: bool,
+        monitor_bounds: Option<[i32; 4]>,
+    ) -> Task<Message> {
+        let current = self.next_request();
+        window::run(id, move |window| {
+            use iced::window::raw_window_handle::RawWindowHandle;
+            if !current() {
+                return;
             }
-        }
-    })
-    .discard()
+            let Ok(handle) = window.window_handle() else {
+                return;
+            };
+            let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+                return;
+            };
+            // Iced runs this on the owner thread. Keeping HWND visibility separate
+            // from fullscreen mode avoids Winit restoring windowed placement.
+            let hwnd = handle.hwnd.get() as HWND;
+            unsafe {
+                if visible {
+                    let installed = install_on_window(hwnd);
+                    crate::log_debug(&format!(
+                        "Native caption activation filter installed={installed}"
+                    ));
+                    if let Some([left, top, right, bottom]) = monitor_bounds {
+                        SetWindowPos(
+                            hwnd,
+                            std::ptr::null_mut(),
+                            left,
+                            top,
+                            right - left,
+                            bottom - top,
+                            SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+                        );
+                    }
+                    ShowWindow(hwnd, SW_SHOW);
+                    let focused = GetForegroundWindow() == hwnd || SetForegroundWindow(hwnd) != 0;
+                    crate::apply_trace::event_lazy("ui-native-visibility", || {
+                        format!(
+                            "window={id:?} visible={} focused={focused}",
+                            IsWindowVisible(hwnd) != 0
+                        )
+                    });
+                } else {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+            }
+        })
+        .discard()
+    }
 }
 
 use windows_sys::Win32::{
     Foundation::{GetLastError, SetLastError, HWND, LPARAM, LRESULT, WPARAM},
     UI::WindowsAndMessaging::{
-        CallWindowProcW, DefWindowProcW, GetPropW, GetWindowLongPtrW, IsIconic, RemovePropW,
-        SetPropW, SetWindowLongPtrW, GWLP_WNDPROC, GWL_STYLE, WM_NCACTIVATE, WM_NCDESTROY,
-        WS_CAPTION,
+        CallWindowProcW, DefWindowProcW, GetForegroundWindow, GetPropW, GetWindowLongPtrW,
+        IsIconic, IsWindowVisible, RemovePropW, SetForegroundWindow, SetPropW, SetWindowLongPtrW,
+        SetWindowPos, ShowWindow, GWLP_WNDPROC, GWL_STYLE, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
+        SWP_NOZORDER, SW_HIDE, SW_SHOW, WM_NCACTIVATE, WM_NCDESTROY, WS_CAPTION,
     },
 };
 
-const ORIGINAL_PROC: *const u16 =
-    windows_sys::w!("WallpaperSwitcher.NativeCaption.OriginalProc");
+const ORIGINAL_PROC: *const u16 = windows_sys::w!("WallpaperSwitcher.NativeCaption.OriginalProc");
 
 unsafe fn install_on_window(hwnd: HWND) -> bool {
     // Caller owns this live HWND on its event-loop thread; the box belongs to
@@ -162,6 +215,17 @@ mod tests {
         fn drop(&mut self) {
             unsafe { DestroyWindow(self.0) };
         }
+    }
+
+    #[test]
+    fn later_visibility_requests_supersede_queued_native_operations() {
+        let visibility = Visibility::default();
+        let open = visibility.next_request();
+        let hide = visibility.next_request();
+        assert!(!open());
+        assert!(hide());
+        let reopen = visibility.next_request();
+        assert!(!open() && !hide() && reopen());
     }
 
     #[test]

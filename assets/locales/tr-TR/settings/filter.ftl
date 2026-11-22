@@ -1,7 +1,7 @@
 settings-filter-appearance-card = Görünüm
 settings-filter-appearance-card-desc = Filtre çubuğunu her seçici yerleşimiyle eşleştirin veya her yerde tek bir stil kullanın.
 settings-filter-visual-style-label = Görsel stil
-settings-filter-visual-style-desc = Seçiciyle eşleştir seçeneği, Dilimler ve Sandy için eğik çubuğu, Geometrik için geometrik çubuğu, Duvar için düz çubuğu kullanır.
+settings-filter-visual-style-desc = Seçiciyle eşleştir seçeneği, Dilimler için eğik çubuğu, Geometrik için geometrik çubuğu, Duvar için düz çubuğu kullanır.
 settings-filter-visual-style-match = Seçiciyle eşleştir
 settings-filter-visual-style-slices = Dilimler
 settings-filter-visual-style-hex = Geometrik

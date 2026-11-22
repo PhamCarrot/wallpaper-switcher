@@ -12,12 +12,13 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowExW,
-    FindWindowW, GetParent, GetWindowLongPtrW, GetWindowRect, IsWindow, PeekMessageW,
-    RegisterClassExW, SendMessageTimeoutW, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, GWL_STYLE, HTTRANSPARENT, HWND_BOTTOM,
-    HWND_TOP, MSG, PM_REMOVE, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SW_SHOW, WM_ERASEBKGND,
-    WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN,
-    WS_CLIPSIBLINGS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    FindWindowW, GetAncestor, GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect, IsWindow,
+    IsWindowVisible, PeekMessageW, RegisterClassExW, SendMessageTimeoutW, SetParent,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GA_ROOT,
+    GWLP_USERDATA, GWL_STYLE, GW_HWNDNEXT, GW_HWNDPREV, HTTRANSPARENT, HWND_BOTTOM, HWND_TOP, MSG,
+    PM_REMOVE, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SW_SHOW, WM_ERASEBKGND, WM_NCCREATE, WM_NCDESTROY,
+    WM_NCHITTEST, WM_PAINT, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 
 use crate::d3d11_transition::D3d11TransitionRenderer;
@@ -31,6 +32,7 @@ struct WindowState {
     width: u32,
     height: u32,
     bgra: Vec<u8>,
+    painted: bool,
     #[cfg(test)]
     drops: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
@@ -41,6 +43,7 @@ impl WindowState {
             width: frame.width,
             height: frame.height,
             bgra: Vec::with_capacity(frame.rgba.len()),
+            painted: false,
             #[cfg(test)]
             drops: None,
         };
@@ -232,7 +235,7 @@ impl DesktopTransitionSession {
                     // every icon child so only the wallpaper pixels are replaced.
                     HWND_BOTTOM
                 };
-            SetWindowPos(
+            if SetWindowPos(
                 hwnd,
                 insert_after,
                 target.left - host_rect.left,
@@ -240,7 +243,12 @@ impl DesktopTransitionSession {
                 target.width() as i32,
                 target.height() as i32,
                 SWP_NOACTIVATE,
-            );
+            ) == 0
+            {
+                let error = last_error("Windows refused the transition window position");
+                DestroyWindow(hwnd);
+                return Err(error);
+            }
             ShowWindow(hwnd, SW_SHOW);
             UpdateWindow(hwnd);
         }
@@ -336,13 +344,49 @@ impl DesktopTransitionSession {
         Ok(())
     }
 
+    pub(crate) fn window_identity(&self) -> usize {
+        self.hwnd as usize
+    }
+
+    pub(crate) fn placement_trace(&self) -> String {
+        unsafe {
+            let mut rect: RECT = std::mem::zeroed();
+            let found = GetWindowRect(self.hwnd, &mut rect) != 0;
+            let root = GetAncestor(self.hwnd, GA_ROOT);
+            format!(
+                "hwnd={:?} parent={:?} root={root:?} rect={:?} visible={} renderer={} previous={:?} next={:?} root_previous={:?} root_next={:?}",
+                self.hwnd,
+                GetParent(self.hwnd),
+                found.then_some([rect.left, rect.top, rect.right, rect.bottom]),
+                IsWindowVisible(self.hwnd) != 0,
+                if self.gpu.is_some() { "d3d11" } else { "cpu" },
+                GetWindow(self.hwnd, GW_HWNDPREV),
+                GetWindow(self.hwnd, GW_HWNDNEXT),
+                GetWindow(root, GW_HWNDPREV),
+                GetWindow(root, GW_HWNDNEXT),
+            )
+        }
+    }
+
     pub fn present(&self) -> Result<(), String> {
         if let Some(renderer) = &self.gpu {
             renderer.present()?;
         } else {
             unsafe {
-                InvalidateRect(self.hwnd, null(), 0);
-                UpdateWindow(self.hwnd);
+                let state = GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *mut WindowState;
+                if state.is_null() {
+                    return Err("The transition surface no longer owns a frame buffer".into());
+                }
+                (*state).painted = false;
+                if InvalidateRect(self.hwnd, null(), 0) == 0 || UpdateWindow(self.hwnd) == 0 {
+                    return Err("Windows did not update the CPU transition surface".into());
+                }
+                // UpdateWindow can dispatch WM_PAINT synchronously. Read the
+                // current state again after that callback has returned.
+                let state = GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *const WindowState;
+                if state.is_null() || !(*state).painted {
+                    return Err("The CPU transition surface did not paint the frame".into());
+                }
             }
         }
         pump_messages();
@@ -394,11 +438,11 @@ unsafe extern "system" fn window_proc(
         WM_NCHITTEST => HTTRANSPARENT as LRESULT,
         WM_ERASEBKGND => 1,
         WM_PAINT => {
-            let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const WindowState;
+            let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             let mut paint: PAINTSTRUCT = std::mem::zeroed();
             let dc = BeginPaint(hwnd, &mut paint);
-            if !state.is_null() {
-                let state = &*state;
+            if !state.is_null() && !dc.is_null() {
+                let state = &mut *state;
                 let mut info: BITMAPINFO = std::mem::zeroed();
                 info.bmiHeader = BITMAPINFOHEADER {
                     biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -410,7 +454,7 @@ unsafe extern "system" fn window_proc(
                     biSizeImage: (state.width * state.height * 4),
                     ..std::mem::zeroed()
                 };
-                StretchDIBits(
+                state.painted = StretchDIBits(
                     dc,
                     0,
                     0,
@@ -424,7 +468,7 @@ unsafe extern "system" fn window_proc(
                     &info,
                     DIB_RGB_COLORS,
                     SRCCOPY,
-                );
+                ) > 0;
             }
             EndPaint(hwnd, &paint);
             0

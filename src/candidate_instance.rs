@@ -484,13 +484,7 @@ mod tests {
         std::fs::create_dir(&profile).unwrap();
         std::fs::create_dir(&other).unwrap();
         let alias = root.join("junction");
-        let status = Command::new("cmd.exe")
-            .args(["/d", "/c", "mklink", "/J"])
-            .arg(&alias)
-            .arg(&profile)
-            .status()
-            .unwrap();
-        assert!(status.success(), "real owned directory junction required");
+        create_probe_junction(&alias, &profile);
         let mut resident =
             CandidateInstanceGuard::acquire(ProfileIdentity::open(&profile).unwrap(), true)
                 .unwrap();
@@ -563,38 +557,16 @@ mod tests {
         let profile = root.join("profile");
         std::fs::create_dir(&profile).unwrap();
         let alias = root.join("junction");
-        assert!(Command::new("cmd.exe")
-            .args(["/d", "/c", "mklink", "/J"])
-            .arg(&alias)
-            .arg(&profile)
-            .status()
-            .unwrap()
-            .success());
+        create_probe_junction(&alias, &profile);
         let mut children = Vec::new();
         for (index, path) in [&profile, &alias].iter().enumerate() {
-            children.push(
-                child_probe_command(path.to_str().unwrap(), "profile-race")
-                    .env("WSL_S2_RACE_ROOT", &root)
-                    .env("WSL_S2_RACE_INDEX", index.to_string())
-                    .spawn()
-                    .unwrap(),
-            );
+            children.push(start_race_probe(path, &root, index, false));
         }
-        let wait_for = |path: &Path| {
-            let until = std::time::Instant::now() + Duration::from_secs(10);
-            while !path.exists() {
-                assert!(
-                    std::time::Instant::now() < until,
-                    "child handshake timed out: {path:?}"
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        };
-        wait_for(&root.join("ready0"));
-        wait_for(&root.join("ready1"));
+        wait_probe_file(&root.join("ready0"), "ready", &mut children).unwrap();
+        wait_probe_file(&root.join("ready1"), "ready", &mut children).unwrap();
         std::fs::write(root.join("go"), b"go").unwrap();
-        wait_for(&root.join("result0"));
-        wait_for(&root.join("result1"));
+        wait_probe_file(&root.join("result0"), "result", &mut children).unwrap();
+        wait_probe_file(&root.join("result1"), "result", &mut children).unwrap();
         let results = [
             std::fs::read_to_string(root.join("result0")).unwrap(),
             std::fs::read_to_string(root.join("result1")).unwrap(),
@@ -611,10 +583,47 @@ mod tests {
         );
         std::fs::write(root.join("release"), b"release").unwrap();
         for child in &mut children {
-            assert!(child.wait().unwrap().success());
+            child.assert_exit_success("release");
         }
         run_child_probe(alias.to_str().unwrap(), "profile-available");
         eprintln!("S2 simultaneous fixture retained: {root:?}; outcomes: {results:?}");
+    }
+
+    #[test]
+    fn partial_instance_result_reports_early_exit_and_reaps_waiting_peer() {
+        let failed_root = owned_profile("partial-result");
+        let peer_root = owned_profile("waiting-peer");
+        let (reaped, observed) = std::sync::mpsc::channel();
+        let mut children = [
+            start_race_probe(&failed_root, &failed_root, 0, true),
+            start_race_probe(&peer_root, &peer_root, 1, false),
+        ];
+        let failed_pid = children[0].process.id();
+        let peer_pid = children[1].process.id();
+        children[1].reaped = Some(reaped);
+        let final_path = failed_root.join("result0");
+        let stage = failed_root.join("result0.partial");
+        struct InjectedExit(String);
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            wait_probe_file(&failed_root.join("ready0"), "ready", &mut children).unwrap();
+            wait_probe_file(&peer_root.join("ready1"), "ready", &mut children).unwrap();
+            std::fs::write(failed_root.join("go"), b"go").unwrap();
+            wait_probe_file(&stage, "partial result", &mut children).unwrap();
+            assert!(!final_path.exists());
+            std::fs::write(failed_root.join("abort"), b"abort").unwrap();
+            let error = wait_probe_file(&final_path, "result", &mut children).unwrap_err();
+            std::panic::panic_any(InjectedExit(error));
+        }))
+        .unwrap_err();
+        let error = failure.downcast::<InjectedExit>().unwrap().0;
+        assert!(error.contains(&format!("pid={failed_pid}")), "{error}");
+        assert!(error.contains("phase=result"), "{error}");
+        assert!(error.contains("result0"), "{error}");
+        assert!(!error.contains("status=running"), "{error}");
+        eprintln!("S2 injected early exit: {error}");
+        let (pid, status) = observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(pid, peer_pid);
+        assert!(!status.success());
     }
 
     #[test]
@@ -629,14 +638,14 @@ mod tests {
                 let root = std::path::PathBuf::from(env::var_os("WSL_S2_RACE_ROOT").unwrap());
                 let index = env::var("WSL_S2_RACE_INDEX").unwrap();
                 std::fs::write(root.join(format!("ready{index}")), b"ready").unwrap();
-                let wait_for = |path: &Path| {
-                    let until = std::time::Instant::now() + Duration::from_secs(10);
-                    while !path.exists() {
-                        assert!(std::time::Instant::now() < until, "race timed out");
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                };
-                wait_for(&root.join("go"));
+                wait_probe_file(&root.join("go"), "go", &mut []).unwrap();
+                let stage = root.join(format!("result{index}.partial"));
+                let final_path = root.join(format!("result{index}"));
+                if env::var_os("WSL_S2_FAIL_PARTIAL").is_some() {
+                    std::fs::write(&stage, b"ow").unwrap();
+                    wait_probe_file(&root.join("abort"), "abort", &mut []).unwrap();
+                    panic!("injected early exit after partial result {stage:?}");
+                }
                 let result = CandidateInstanceGuard::acquire(
                     ProfileIdentity::open(Path::new(&name)).unwrap(),
                     false,
@@ -646,8 +655,15 @@ mod tests {
                     Err(CandidateInstanceError::AlreadyRunning) => "blocked",
                     Err(e) => panic!("{e}"),
                 };
-                std::fs::write(root.join(format!("result{index}")), outcome).unwrap();
-                wait_for(&root.join("release"));
+                std::fs::write(&stage, outcome).unwrap();
+                crate::file_publication::rename_file_create_only(&stage, &final_path)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "pid={} publish {stage:?} to {final_path:?}: {error}",
+                            process::id()
+                        )
+                    });
+                wait_probe_file(&root.join("release"), "release", &mut []).unwrap();
                 drop(result);
                 return;
             }
@@ -679,10 +695,145 @@ mod tests {
     }
 
     fn run_child_probe(name: &str, expectation: &str) {
-        let status = child_probe_command(name, expectation)
-            .status()
-            .expect("start cross-process guard probe");
-        assert!(status.success(), "cross-process guard probe failed");
+        ProbeChild::start(
+            &mut child_probe_command(name, expectation),
+            Path::new(name),
+            expectation,
+        )
+        .assert_exit_success("probe exit");
+    }
+
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+    const PROBE_POLL: Duration = Duration::from_millis(10);
+
+    struct ProbeChild {
+        process: process::Child,
+        source: std::path::PathBuf,
+        role: String,
+        reaped: Option<std::sync::mpsc::Sender<(u32, process::ExitStatus)>>,
+    }
+
+    impl ProbeChild {
+        fn start(command: &mut Command, source: &Path, role: &str) -> Self {
+            let process = command.spawn().unwrap_or_else(|error| {
+                panic!("phase=spawn role={role} path={source:?}: {error}");
+            });
+            Self {
+                process,
+                source: source.to_owned(),
+                role: role.into(),
+                reaped: None,
+            }
+        }
+
+        fn diagnostic(&self, phase: &str, path: &Path, status: impl std::fmt::Display) -> String {
+            format!(
+                "pid={} phase={phase} path={path:?} role={} source={:?} status={status}",
+                self.process.id(),
+                self.role,
+                self.source
+            )
+        }
+
+        fn poll(
+            &mut self,
+            phase: &str,
+            path: &Path,
+        ) -> Result<Option<process::ExitStatus>, String> {
+            self.process
+                .try_wait()
+                .map_err(|error| self.diagnostic(phase, path, error))
+        }
+
+        fn assert_exit_success(&mut self, phase: &str) {
+            let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+            let path = self.source.clone();
+            loop {
+                if let Some(status) = self.poll(phase, &path).unwrap() {
+                    assert!(
+                        status.success(),
+                        "{}",
+                        self.diagnostic(phase, &path, status)
+                    );
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out: {}",
+                    self.diagnostic(phase, &path, "running")
+                );
+                std::thread::sleep(PROBE_POLL);
+            }
+        }
+    }
+
+    impl Drop for ProbeChild {
+        fn drop(&mut self) {
+            if !matches!(self.process.try_wait(), Ok(Some(_))) {
+                // An exit between try_wait and kill is benign; wait owns reaping.
+                let _ = self.process.kill();
+            }
+            match self.process.wait() {
+                Ok(status) => {
+                    if let Some(reaped) = &self.reaped {
+                        let _ = reaped.send((self.process.id(), status));
+                    }
+                }
+                Err(error) => eprintln!("{}", self.diagnostic("reap", &self.source, error)),
+            }
+        }
+    }
+
+    fn wait_probe_file(
+        path: &Path,
+        phase: &str,
+        children: &mut [ProbeChild],
+    ) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+        loop {
+            for child in &mut *children {
+                if let Some(status) = child.poll(phase, path)? {
+                    return Err(child.diagnostic(phase, path, status));
+                }
+            }
+            let here = || format!("pid={} phase={phase} path={path:?}", process::id());
+            if path
+                .try_exists()
+                .map_err(|error| format!("{}: {error}", here()))?
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                let live: Vec<_> = children
+                    .iter()
+                    .map(|child| child.diagnostic(phase, path, "running"))
+                    .collect();
+                return Err(format!("handshake timeout: {} {live:?}", here()));
+            }
+            std::thread::sleep(PROBE_POLL);
+        }
+    }
+
+    fn create_probe_junction(alias: &Path, profile: &Path) {
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(alias)
+            .arg(profile);
+        ProbeChild::start(&mut command, alias, "junction").assert_exit_success("create junction");
+    }
+
+    fn start_race_probe(path: &Path, root: &Path, index: usize, fail_partial: bool) -> ProbeChild {
+        let mut command = child_probe_command(path.to_str().unwrap(), "profile-race");
+        command
+            .env("WSL_S2_RACE_ROOT", root)
+            .env("WSL_S2_RACE_INDEX", index.to_string());
+        if fail_partial {
+            command.env("WSL_S2_FAIL_PARTIAL", "1");
+        } else {
+            command.env_remove("WSL_S2_FAIL_PARTIAL");
+        }
+        ProbeChild::start(&mut command, path, "profile-race")
     }
 
     fn child_probe_command(name: &str, expectation: &str) -> Command {

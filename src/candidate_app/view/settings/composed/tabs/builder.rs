@@ -15,6 +15,7 @@ use super::system_tabs::{
     tab_schedule,
 };
 use super::theme_tabs::{tab_integrations, tab_matugen, tab_niri, tab_theme};
+use super::wallpaper_transition_tab::tab_wallpaper_transition;
 use super::{Builder, Card, Control, Row};
 
 pub(super) fn type_chip_label(
@@ -121,11 +122,16 @@ pub(crate) fn build_tab_with_runtime_status(
     playback: Option<&crate::candidate_app::view::settings::composed::status::PlaybackStatus>,
     app_themes: Option<&crate::candidate_app::view::settings::composed::status::AppThemesResult>,
 ) -> Vec<(Card, Vec<Row>)> {
+    let tr = |key| cfg.catalog().text_static(key);
     match tab {
         "picker" => compose_picker(cfg, themes, outputs),
         "filter" => compose_filter_search(cfg, folders, analysis),
         "position" => compose_position(cfg),
-        "displays" => Vec::new(),
+        "displays" => vec![platform_form(
+            tr("settings-displays-card"),
+            tr("r5-windows-target-help"),
+            tr("settings-windows-recheck-provider"),
+        )],
         "motion" => compose_motion(cfg),
         "playback" => compose_playback(cfg, themes, outputs, playback),
         "performance" => compose_performance(cfg),
@@ -137,6 +143,21 @@ pub(crate) fn build_tab_with_runtime_status(
         "language" => collect(cfg, tab_language),
         _ => Vec::new(),
     }
+}
+
+fn platform_form(
+    title: &'static str,
+    subtitle: &'static str,
+    search_title: &str,
+) -> (Card, Vec<Row>) {
+    (
+        Card { title, subtitle },
+        vec![Row {
+            title: search_title.into(),
+            desc: subtitle.into(),
+            control: Control::PlatformForm,
+        }],
+    )
 }
 
 fn compose_displays(
@@ -418,13 +439,6 @@ fn compose_picker(
 
     section(
         &mut out,
-        tr("settings-section-tag-panel"),
-        tr("settings-section-tag-panel-note"),
-        take_card(&mut selector, tr("settings-selector-tag-cloud-card")),
-    );
-
-    section(
-        &mut out,
         tr("settings-section-controls"),
         tr("settings-keybinds-controls-card-desc"),
         segmented_rows(keys),
@@ -508,7 +522,18 @@ fn compose_filter_search(
         &mut out,
         tr("settings-section-visibility"),
         tr("settings-filter-visibility-card-desc"),
-        take_card(&mut filter, tr("settings-filter-visibility-card")),
+        {
+            let mut rows = take_card(&mut filter, tr("settings-filter-visibility-card"));
+            rows.push(Row {
+                title: tr("settings-filter-show-excluded").into(),
+                desc: String::new(),
+                control: Control::ToggleAction {
+                    id: super::ActionId::ShowExcluded,
+                    value: cfg.flag("filterBar.showExcluded"),
+                },
+            });
+            rows
+        },
     );
     section(
         &mut out,
@@ -562,6 +587,10 @@ fn compose_position(cfg: &dyn SettingsSource) -> Vec<(Card, Vec<Row>)> {
             tr("settings-position-picker-card-desc"),
         ),
         (
+            tr("settings-position-depth-card"),
+            tr("settings-position-picker-card-desc"),
+        ),
+        (
             tr("settings-position-sandy-card"),
             tr("settings-position-picker-card-desc"),
         ),
@@ -588,6 +617,7 @@ fn compose_motion(cfg: &dyn SettingsSource) -> Vec<(Card, Vec<Row>)> {
     let mut launch = collect(cfg, tab_launch);
     let mut selector = collect(cfg, tab_selector);
     let mut paper = collect(cfg, tab_paper);
+    let mut wallpaper_transition = collect(cfg, tab_wallpaper_transition);
 
     section(
         &mut out,
@@ -614,6 +644,16 @@ fn compose_motion(cfg: &dyn SettingsSource) -> Vec<(Card, Vec<Row>)> {
         tr("settings-section-picker-motion"),
         tr("settings-selector-card-flip-card-desc"),
         picker_motion,
+    );
+
+    section(
+        &mut out,
+        tr("settings-transitions-transitions-card"),
+        tr("settings-transitions-transitions-card-desc"),
+        take_card(
+            &mut wallpaper_transition,
+            tr("settings-transitions-transitions-card"),
+        ),
     );
 
     let mut sandy = take_card(&mut selector, tr("settings-selector-sand-card"));
@@ -658,6 +698,11 @@ fn compose_playback(
         audio,
     );
 
+    out.push(platform_form(
+        tr("settings-playback-native-controls"),
+        "",
+        tr("settings-playback-native-controls-search"),
+    ));
     out
 }
 
@@ -670,11 +715,11 @@ fn compose_performance(cfg: &dyn SettingsSource) -> Vec<(Card, Vec<Row>)> {
     let mut paper = collect(cfg, tab_paper);
     section(
         &mut out,
-        " animation pacing",
+        "Animation pacing",
         "",
         vec![Row {
-            title: " animation pacing".into(),
-            desc: "Maximum FPS / frame rate for Picker animation".into(),
+            title: "Animation pacing".into(),
+            desc: "Maximum frame rate for picker motion.".into(),
             control: Control::Number {
                 key: keys::general::MAX_FPS.into(),
                 path: keys::general::MAX_FPS.into(),
@@ -706,19 +751,11 @@ fn compose_library(
         &mut performance,
         tr("settings-performance-trash-card"),
     ));
-    section(
-        &mut out,
+    out.push(platform_form(
         tr("r5-library-paths"),
-        tr("r5-config-note"),
-        vec![Row {
-            title: tr("r5-library-manage").into(),
-            desc: tr("r5-library-manage-note").into(),
-            control: Control::ActionBtn {
-                id: super::ActionId::OpenLibraryTools,
-                label: tr("r5-library-open").into(),
-            },
-        }],
-    );
+        tr("r5-library-manage-note"),
+        tr("r5-library-manage"),
+    ));
     out
 }
 
@@ -949,30 +986,18 @@ fn compose_automation(
 
     let mut out = Vec::new();
     let mut general = collect(cfg, |builder| tab_general(builder, themes, outputs));
-    let mut schedule = collect(cfg, tab_schedule);
     let mut random = take_card(&mut general, tr("settings-general-random-card"));
     for row in &mut random {
-        match &row.control {
-            Control::Toggle { path, .. } if path == keys::general::RANDOM_ROTATE => {
+        row.desc.clear();
+        if let Control::Toggle { path, .. } = &row.control {
+            if path == keys::general::RANDOM_ROTATE {
                 row.title = "Enable random rotation".into();
-                row.desc = "Independent library pool on every eligible unlocked display. Enabled random waits while playlist playback is active. No immediate Apply.".into();
             }
-            Control::Toggle { path, .. } if path == keys::general::RANDOM_INCLUDE_FAVOURITES => {
-                row.title = "Favourites only (restriction)".into();
-                row.desc = "Restrict the independent random pool to local favourites; fresh default off. Saving a choice activates the displayed rotation choices.".into();
+            if path == keys::general::RANDOM_INCLUDE_FAVOURITES {
+                row.title = "Favourites only".into();
             }
-            Control::Toggle { .. } => row.desc = "Independent library pool; picker text, colour and folder filters do not apply. Save deliberately to activate displayed media choices.".into(),
-            _ => {}
         }
     }
-    random.insert(
-        0,
-        Row {
-            title: "Execution policy".into(),
-            desc: cfg.text("w6.policyStatus"),
-            control: Control::Static,
-        },
-    );
     if cfg.flag("pk03.canResumeRandom") {
         random.push(Row { title: "Resume random rotation".into(),
             desc: "Explicitly clear the safety stop; wait a full interval. Resolve provider ownership first.".into(),
@@ -992,30 +1017,14 @@ fn compose_automation(
     section(&mut out, tr("settings-section-random-rotation"), "", random);
     let restore = take_card(&mut general, tr("settings-general-behaviour-card")).into_iter()
         .filter(|row| matches!(&row.control, Control::Toggle { path, .. } if path == keys::system::RESTORE_ON_STARTUP))
-        .map(|mut row| { row.title = "Reapply confirmed assignments on startup (opt-in)".into();
-            row.desc = "Off by default. Uses last confirmed per-display item/source; unavailable or restricted assignments are skipped. Separate from timer resumption and startup registration. Preview never applies.".into(); row }).collect();
-    section(
-        &mut out,
-        "Startup reapply",
-        "Does not start Theme following, post-processing, notifications or helpers.",
-        restore,
-    );
-    let mut schedules = take_card(&mut schedule, tr("settings-schedule-schedule-card"));
-    schedules.retain(|row| {
-        matches!(
-            &row.control,
-            Control::ActionBtn {
-                id: super::ActionId::OpenScheduleEditor,
-                ..
-            }
-        )
-    });
-    section(
-        &mut out,
+        .map(|mut row| { row.title = "Reapply last confirmed wallpapers on startup".into();
+            row.desc = "Unavailable wallpapers are skipped.".into(); row }).collect();
+    section(&mut out, "Startup reapply", "", restore);
+    out.push(platform_form(
         tr("settings-section-schedule"),
         tr("settings-schedule-schedule-card-desc"),
-        schedules,
-    );
+        tr("settings-section-schedule"),
+    ));
     out
 }
 
@@ -1076,6 +1085,8 @@ pub(crate) fn compatibility_owner_rows(
         "automation" => {
             rows.extend(collect(cfg, tab_schedule));
             rows.extend(collect(cfg, tab_postprocessing));
+        }
+        "displays" => {
             rows.extend(compose_displays(cfg, statuses, previews));
         }
         "theme" => {

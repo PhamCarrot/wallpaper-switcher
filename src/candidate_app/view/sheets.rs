@@ -191,7 +191,7 @@ pub(super) fn engine_property_sheet(
                                         format!("{} {} {}", updated[0], updated[1], updated[2]),
                                     )
                                 })
-                                .step(0.001)
+                                .step(0.001_f32)
                                 .style(move |_, _| panel_slider_style(palette)),
                                 panel_text(format!("{:.3}", rgb[channel]), scale)
                                     .width(48.0 * scale)
@@ -943,10 +943,10 @@ pub(super) fn local_tag_editor_view(
             )
             .on_press(add)
         ]
-        .spacing(7.0 * scale),
+        .spacing(11.0 * scale),
         panel_text(tr("tags-local-help"), scale),
     ]
-    .spacing(10.0 * scale)
+    .spacing(12.0 * scale)
     .height(Fill);
     let panel = container(content)
         .id("local-tag-editor")
@@ -971,22 +971,30 @@ pub(super) fn local_tag_editor_view(
 }
 
 /// Rail browsing is transient and never shares the captured membership picker.
-pub(super) fn playlist_chooser_view(app: &GpuCandidate) -> Element<'_, Message> {
+pub(super) fn playlist_chooser_view<'a>(
+    app: &'a GpuCandidate,
+    retiring: Option<&'a playlists::RetiringPlaylist>,
+    opacity: f32,
+) -> Element<'a, Message> {
     use super::super::playlists::Browse;
-    let Some(owner) = app.playlist_owner() else {
+    let Some(owner) = retiring.map_or_else(|| app.playlist_owner(), |old| old.owner.clone()) else {
         return Space::new().into();
     };
-    let palette = donor_palette(app);
+    let palette = donor_palette(app).opacity(opacity);
+    let browse_id = retiring.map_or(app.browse_playlist_id.as_deref(), |old| {
+        old.browse_id.as_deref()
+    });
+    let query_input = retiring.map_or(app.playlist_query.as_str(), |old| old.query.as_str());
     let scale = view::settings::bridge::effective_ui_scale(app);
     let rtl = app.settings_locale.language.rtl;
     let type_scale = donor_folio::source_ui::legible_type_scale(scale);
     let tr = |key| app.settings_locale.text_static(key);
     let message = |action| Message::PlaylistBrowse(owner.clone(), action);
-    let query = app.playlist_query.trim().to_lowercase();
+    let query = query_input.trim().to_lowercase();
     let mut choices = column![donor_folio::source_ui::folio_action(
         rtl,
         tr("playlists-browse-all"),
-        app.browse_playlist_id.is_none(),
+        browse_id.is_none(),
         Some(message(Browse::Choose(None))),
         Fill,
         scale,
@@ -1002,7 +1010,7 @@ pub(super) fn playlist_chooser_view(app: &GpuCandidate) -> Element<'_, Message> 
             continue;
         }
         matches += 1;
-        let active = app.browse_playlist_id.as_deref() == Some(&playlist.id);
+        let active = browse_id == Some(&playlist.id);
         let name = if playlist.name.is_empty() {
             tr("playlists-unnamed")
         } else {
@@ -1052,7 +1060,7 @@ pub(super) fn playlist_chooser_view(app: &GpuCandidate) -> Element<'_, Message> 
         .spacing(12.0 * scale),
         panel_text(tr("playlists-picker-hint"), scale).width(Fill),
         donor_folio::source_ui::folio_ghost_field(
-            &app.playlist_query,
+            query_input,
             tr("playlists-picker-search"),
             move |value| Message::PlaylistBrowse(input_owner.clone(), Browse::Query(value)),
             Message::SheetBackdrop,
@@ -1092,21 +1100,33 @@ pub(super) fn playlist_chooser_view(app: &GpuCandidate) -> Element<'_, Message> 
         .height(Fill)
         .center_x(Fill)
         .center_y(Fill)
-        .style(move |_| donor_folio::source_ui::folio_scrim_style(1.0));
+        .style(move |_| donor_folio::source_ui::folio_scrim_style(opacity));
     mouse_area(scrim).on_press(message(Browse::Close)).into()
 }
 
-pub(super) fn playlist_picker_view(app: &GpuCandidate) -> Element<'_, Message> {
+pub(super) fn playlist_picker_view<'a>(
+    app: &'a GpuCandidate,
+    retiring: Option<&'a playlists::RetiringPlaylist>,
+    opacity: f32,
+) -> Element<'a, Message> {
     use super::super::playlists::Edit;
-    let Some(owner) = app.playlist_owner() else {
+    let Some(owner) = retiring.map_or_else(|| app.playlist_owner(), |old| old.owner.clone()) else {
         return Space::new().into();
     };
-    let palette = donor_palette(app);
+    let palette = donor_palette(app).opacity(opacity);
+    let name = retiring.map_or(app.playlist_name.as_str(), |old| old.name.as_str());
     let scale = view::settings::bridge::effective_ui_scale(app);
     let type_scale = donor_folio::source_ui::legible_type_scale(scale);
     let tr = |key| app.settings_locale.text_static(key);
     let message = |edit| Message::PlaylistEdit(owner.clone(), edit);
-    let selected = app.selected.and_then(|i| app.wallpapers.get(i));
+    let selected = retiring.map_or_else(
+        || app.selected.and_then(|i| app.wallpapers.get(i)),
+        |old| {
+            app.wallpapers
+                .iter()
+                .find(|item| Some(item.id.as_str()) == old.selected_id.as_deref())
+        },
+    );
     let header = row![
         panel_text(tr("playlists-card-add-title"), scale)
             .size(16.0 * type_scale)
@@ -1150,7 +1170,7 @@ pub(super) fn playlist_picker_view(app: &GpuCandidate) -> Element<'_, Message> {
         donor_folio::rule(palette),
         panel_text(tr("r5-new-playlist"), scale).color(palette.primary),
         row![
-            text_input(tr("playlists-new-name"), &app.playlist_name)
+            text_input(tr("playlists-new-name"), name)
                 .on_input(move |name| Message::PlaylistEdit(input_owner.clone(), Edit::Name(name)))
                 .on_submit(message(Edit::Create))
                 .font(UI_FONT)
@@ -1158,9 +1178,8 @@ pub(super) fn playlist_picker_view(app: &GpuCandidate) -> Element<'_, Message> {
                 .padding([7.0 * scale, 10.0 * scale])
                 .style(move |_, _| donor_ui::field_input_style(palette))
                 .width(Fill),
-            panel_button(panel_text(tr("r5-create"), scale), palette, scale).on_press_maybe(
-                (!app.playlist_name.trim().is_empty()).then(|| message(Edit::Create))
-            ),
+            panel_button(panel_text(tr("r5-create"), scale), palette, scale)
+                .on_press_maybe((!name.trim().is_empty()).then(|| message(Edit::Create))),
         ]
         .spacing(8.0 * scale)
         .align_y(Alignment::Center),
@@ -1206,19 +1225,21 @@ pub(super) fn playlist_picker_view(app: &GpuCandidate) -> Element<'_, Message> {
         .height(Fill)
         .center_x(Fill)
         .center_y(Fill)
-        .style(move |_| donor_ui::scrim_style(0.55));
+        .style(move |_| donor_ui::scrim_style(0.55 * opacity));
     mouse_area(scrim).on_press(message(Edit::Close)).into()
 }
 
 fn playlist_delete_view<'a>(
     app: &'a GpuCandidate,
     target: &'a playlists::Deletion,
+    owner: Option<playlists::Owner>,
+    opacity: f32,
 ) -> Element<'a, Message> {
     use super::super::playlists::Edit;
-    let Some(owner) = app.playlist_owner() else {
+    let Some(owner) = owner else {
         return Space::new().into();
     };
-    let palette = donor_palette(app);
+    let palette = donor_palette(app).opacity(opacity);
     let scale = view::settings::bridge::effective_ui_scale(app);
     let tr = |key| app.settings_locale.text_static(key);
     let message = |edit| Message::PlaylistEdit(owner.clone(), edit);
@@ -1293,7 +1314,7 @@ fn playlist_delete_view<'a>(
         .height(Fill)
         .center_x(Fill)
         .center_y(Fill)
-        .style(move |_| donor_ui::scrim_style(0.55));
+        .style(move |_| donor_ui::scrim_style(0.55 * opacity));
     mouse_area(scrim)
         .on_press(message(Edit::DeleteCancel))
         .into()
@@ -1302,17 +1323,23 @@ fn playlist_delete_view<'a>(
 pub(super) fn playlist_panel_view<'a>(
     app: &'a GpuCandidate,
     selected: Option<(usize, &'a WallpaperItem)>,
+    retiring: Option<&'a playlists::RetiringPlaylist>,
+    opacity: f32,
 ) -> Element<'a, Message> {
-    if let Some(target) = &app.playlist_delete {
-        return playlist_delete_view(app, target);
+    let owner = || retiring.map_or_else(|| app.playlist_owner(), |old| old.owner.clone());
+    if let Some(target) = retiring.map_or(app.playlist_delete.as_ref(), |old| old.deletion.as_ref())
+    {
+        return playlist_delete_view(app, target, owner(), opacity);
     }
     let scale = crate::candidate_app::view::settings::bridge::effective_ui_scale(app);
-    let palette = donor_palette(app);
+    let palette = donor_palette(app).opacity(opacity);
+    let name = retiring.map_or(app.playlist_name.as_str(), |old| old.name.as_str());
     let type_scale = donor_folio::source_ui::legible_type_scale(scale);
     let tr = |key| app.settings_locale.text_static(key);
-    let browsing_id = app
-        .playlist_browsing_id
-        .as_deref()
+    let browsing_id = retiring
+        .map_or(app.playlist_browsing_id.as_deref(), |old| {
+            old.editor_id.as_deref()
+        })
         .filter(|id| app.state.playlists.iter().any(|p| p.id == *id))
         .or(app.state.active_playlist_id.as_deref())
         .or_else(|| app.state.playlists.first().map(|p| p.id.as_str()));
@@ -1333,6 +1360,7 @@ pub(super) fn playlist_panel_view<'a>(
             })
     };
     let mut lists = column![].spacing(4.0 * scale);
+    let mut browsed = None;
     if app.state.playlists.is_empty() {
         lists = lists
             .push(
@@ -1345,7 +1373,11 @@ pub(super) fn playlist_panel_view<'a>(
         let active =
             app.state.active_playlist_id.as_deref() == Some(&playlist.id) && app.playlist_playing();
         let browsing = browsing_id == Some(playlist.id.as_str());
-        let count = library::evaluate_playlist(playlist, &app.catalog, &app.state.favorites).len();
+        let entries = library::evaluate_playlist(playlist, &app.catalog, &app.state.favorites);
+        let count = entries.len();
+        if browsing && browsed.is_none() {
+            browsed = Some((playlist, entries));
+        }
         let kind = if matches!(playlist.membership, PlaylistMembership::Smart { .. }) {
             tr("r5-smart")
         } else {
@@ -1402,7 +1434,7 @@ pub(super) fn playlist_panel_view<'a>(
             panel_text(format!("{:02}", app.state.playlists.len()), scale)
         ]
         .align_y(iced::Alignment::Center),
-        text_input(tr("r5-playlist-name"), &app.playlist_name)
+        text_input(tr("r5-playlist-name"), name)
             .on_input(Message::PlaylistNameChanged)
             .font(UI_FONT)
             .size(11.0 * crate::donor_folio::source_ui::legible_type_scale(scale))
@@ -1412,15 +1444,14 @@ pub(super) fn playlist_panel_view<'a>(
         row![
             container(
                 panel_button(panel_text(tr("r5-create"), scale), palette, scale).on_press_maybe(
-                    (!app.playlist_name.trim().is_empty())
-                        .then_some(Message::CreatePlaylist { smart: false })
+                    (!name.trim().is_empty()).then_some(Message::CreatePlaylist { smart: false })
                 )
             )
             .id(iced::widget::Id::new("playlist-create-manual-action")),
             container(
                 panel_button(panel_text(tr("r5-create-smart"), scale), palette, scale)
                     .on_press_maybe(
-                        (!app.playlist_name.trim().is_empty())
+                        (!name.trim().is_empty())
                             .then_some(Message::CreatePlaylist { smart: true })
                     )
             )
@@ -1459,9 +1490,7 @@ pub(super) fn playlist_panel_view<'a>(
     let mut reading: Element<'a, Message> = panel_text(tr("r5-playlist-reading-empty"), scale)
         .size(22.0 * type_scale)
         .into();
-    if let Some(playlist) =
-        browsing_id.and_then(|id| app.state.playlists.iter().find(|p| p.id == id))
-    {
+    if let Some((playlist, entries)) = browsed {
         let editable = matches!(playlist.membership, PlaylistMembership::Explicit { .. });
         let member = selected.is_some_and(|(index, wallpaper)| match &playlist.membership {
             PlaylistMembership::Explicit { wallpaper_ids } => wallpaper_ids.contains(&wallpaper.id),
@@ -1471,7 +1500,6 @@ pub(super) fn playlist_panel_view<'a>(
         });
         let active =
             app.state.active_playlist_id.as_deref() == Some(&playlist.id) && app.playlist_playing();
-        let entries = library::evaluate_playlist(playlist, &app.catalog, &app.state.favorites);
         let kind = if editable {
             tr("r5-explicit")
         } else {
@@ -1589,7 +1617,7 @@ pub(super) fn playlist_panel_view<'a>(
             );
         }
 
-        if let Some(owner) = app.playlist_owner() {
+        if let Some(owner) = owner() {
             use super::super::playlists::Edit;
             let message = |edit| Message::PlaylistEdit(owner.clone(), edit);
             details = details.push(rule());
@@ -1724,6 +1752,7 @@ pub(super) fn playlist_panel_view<'a>(
                 .filter(|p| p.is_file())
                 .map(|p| {
                     image(image::Handle::from_path(p))
+                        .opacity(opacity)
                         .content_fit(iced::ContentFit::Cover)
                         .width(Fill)
                         .height(158.0 * scale * (2.0 / 3.0))

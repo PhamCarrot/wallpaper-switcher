@@ -8,6 +8,7 @@ use view::settings::composed::SettingsSource;
 #[derive(Debug, Clone)]
 pub(super) struct HexPresentation {
     pub ids: Arc<[String]>,
+    positions: Arc<HashMap<String, usize>>,
     pub selected: String,
     pub hover: Option<String>,
     pub camera: GalleryMotionState,
@@ -15,10 +16,13 @@ pub(super) struct HexPresentation {
     pub selection: HashMap<String, GalleryMotionState>,
     pub params: HexParams,
     pub target: HexParams,
+    topology_from: Option<Arc<[SliceCard]>>,
+    topology_progress: f32,
+    target_circle: bool,
     pub viewport: [f32; 2],
     pub duration: f32,
     pub keyboard: bool,
-    pub parallax: bool,
+    pub parallax: GalleryMotionState,
     pub circle: bool,
     pub inset: f32,
     pub rtl: bool,
@@ -74,9 +78,35 @@ fn parameters(p: &HexProfileSnapshot, viewport: [f32; 2]) -> HexParams {
     }
 }
 
+fn morph_numeric(current: &mut HexParams, target: &HexParams, amount: f32) {
+    let topology = (
+        current.rows,
+        current.cols,
+        current.scroll_step,
+        current.curve,
+        current.shape,
+    );
+    current.morph_toward(target, amount);
+    current.rows = topology.0;
+    current.cols = topology.1;
+    current.scroll_step = topology.2;
+    current.curve = topology.3;
+    current.shape = topology.4;
+}
+
+fn numeric_settled(current: &HexParams, target: &HexParams) -> bool {
+    let mut probe = *current;
+    probe.rows = target.rows;
+    probe.cols = target.cols;
+    probe.scroll_step = target.scroll_step;
+    probe.curve = target.curve;
+    probe.shape = target.shape;
+    probe.settled_to(target)
+}
+
 impl HexPresentation {
     pub fn new(
-        ids: Vec<String>,
+        ids: impl Into<Arc<[String]>>,
         selected: String,
         p: HexProfileSnapshot,
         viewport: [f32; 2],
@@ -84,11 +114,18 @@ impl HexPresentation {
         inset: f32,
         rtl: bool,
     ) -> Self {
+        let ids = ids.into();
         let params = parameters(&p, viewport);
         let index = ids.iter().position(|id| *id == selected).unwrap_or(0);
         let center = params.column_x(index / params.rows);
         let mut state = Self {
-            ids: ids.into(),
+            positions: Arc::new(
+                ids.iter()
+                    .enumerate()
+                    .map(|(i, id)| (id.clone(), i))
+                    .collect(),
+            ),
+            ids,
             selected,
             hover: None,
             camera: GalleryMotionState::source(center, center, duration, 1.0),
@@ -96,10 +133,17 @@ impl HexPresentation {
             selection: HashMap::new(),
             params,
             target: params,
+            topology_from: None,
+            topology_progress: 1.0,
+            target_circle: p.shape == StateGeometricShape::Circle,
             viewport,
             duration,
             keyboard: true,
-            parallax: p.parallax,
+            parallax: gallery_presentation::parallax_motion(
+                f32::from(p.parallax),
+                p.parallax,
+                duration,
+            ),
             circle: p.shape == StateGeometricShape::Circle,
             inset,
             rtl,
@@ -112,7 +156,7 @@ impl HexPresentation {
 
     pub fn sync(
         &mut self,
-        ids: Vec<String>,
+        ids: impl Into<Arc<[String]>>,
         selected: String,
         p: HexProfileSnapshot,
         viewport: [f32; 2],
@@ -120,20 +164,46 @@ impl HexPresentation {
         inset: f32,
         rtl: bool,
     ) -> bool {
+        let ids = ids.into();
         let target = parameters(&p, viewport);
-        let geometry = !self.target.settled_to(&target)
-            || self.viewport != viewport
-            || self.inset != inset
-            || self.rtl != rtl;
-        let catalog = self.ids.as_ref() != ids.as_slice();
+        let target_circle = p.shape == StateGeometricShape::Circle;
+        let target_changed =
+            !self.target.settled_to(&target) || self.target_circle != target_circle;
+        let geometry =
+            target_changed || self.viewport != viewport || self.inset != inset || self.rtl != rtl;
+        let catalog = !Arc::ptr_eq(&self.ids, &ids) && self.ids != ids;
         let changed = geometry
             || catalog
             || self.selected != selected
             || self.duration != duration
-            || self.parallax != p.parallax
-            || self.circle != (p.shape == StateGeometricShape::Circle);
+            || self.parallax.target != f32::from(p.parallax)
+            || self.target_circle != target_circle;
         if !changed {
+            self.ids = ids;
             return false;
+        }
+        let restart = !catalog
+            && (self.target.topology_differs(&target)
+                || self.target_circle != target_circle
+                || (target_changed && self.topology_from.is_some()));
+        if restart {
+            let mut source = self.placed_frame();
+            source.retain(|card| card.opacity > 0.0);
+            self.topology_from = Some(source.into());
+            self.topology_progress = 0.0;
+            self.scales.clear();
+        } else if catalog && self.topology_from.take().is_some() {
+            self.params = target;
+            self.circle = target_circle;
+            self.topology_progress = 1.0;
+        } else if catalog {
+            // Filtered indices cannot carry the old frame across a catalog change.
+            self.params.rows = target.rows;
+            self.params.cols = target.cols;
+            self.params.scroll_step = target.scroll_step;
+            self.params.curve = target.curve;
+            self.params.shape = target.shape;
+            self.circle = target_circle;
         }
         if self.selected != selected {
             for (id, was) in [(self.selected.clone(), true), (selected.clone(), false)] {
@@ -147,8 +217,17 @@ impl HexPresentation {
                 );
             }
         }
-        self.selection.retain(|id, _| ids.contains(id));
-        if catalog || self.params.topology_differs(&target) {
+        if catalog {
+            self.positions = Arc::new(
+                ids.iter()
+                    .enumerate()
+                    .map(|(i, id)| (id.clone(), i))
+                    .collect(),
+            );
+            self.selection
+                .retain(|id, _| self.positions.contains_key(id));
+        }
+        if catalog {
             self.scales.clear();
         }
         if self.duration != duration {
@@ -162,17 +241,20 @@ impl HexPresentation {
             }
         }
         if catalog {
-            self.ids = ids.into();
+            self.ids = ids;
         }
         self.selected = selected;
         self.target = target;
         self.viewport = viewport;
+        if self.parallax.target != f32::from(p.parallax) || self.duration != duration {
+            self.parallax =
+                gallery_presentation::parallax_motion(self.parallax.value(), p.parallax, duration);
+        }
         self.duration = duration;
         self.inset = inset;
         self.rtl = rtl;
-        self.parallax = p.parallax;
-        self.circle = p.shape == StateGeometricShape::Circle;
-        self.retarget(catalog || geometry);
+        self.target_circle = target_circle;
+        self.retarget(restart || catalog || (geometry && self.topology_from.is_none()));
         true
     }
 
@@ -181,12 +263,8 @@ impl HexPresentation {
         (if self.rtl { 0.0 } else { inset }) + (self.viewport[0] - inset) * 0.5
     }
     pub fn camera_target(&self) -> f32 {
-        let p = &self.params;
-        let index = self
-            .ids
-            .iter()
-            .position(|id| *id == self.selected)
-            .unwrap_or(0);
+        let p = self.placement_params();
+        let index = self.positions.get(&self.selected).copied().unwrap_or(0);
         let center = p.column_x(index / p.rows.max(1));
         let cx = self.center_x();
         let fade = ((self.viewport[0] - self.inset - p.visible_band()) * 0.5).max(0.0);
@@ -215,7 +293,7 @@ impl HexPresentation {
     }
 
     pub fn scale_target(&self, col: usize) -> f32 {
-        let p = &self.params;
+        let p = self.placement_params();
         if p.curve == HexCurve::Flat {
             return 1.0;
         }
@@ -253,16 +331,17 @@ impl HexPresentation {
         for (id, spring) in &mut self.selection {
             spring.retarget_source(f32::from(*id == self.selected));
         }
-        let count = self.ids.len().div_ceil(self.params.rows.max(1));
+        let params = self.placement_params();
+        let count = self.ids.len().div_ceil(params.rows.max(1));
         let cx = self.center_x();
-        let margin =
-            self.viewport[0] + self.params.item_half_w().hypot(self.params.item_half_h()) * 2.0;
-        let active: Vec<_> = (0..count)
-            .filter(|col| {
-                let x = cx - self.camera.value() + self.params.column_x(*col);
-                x >= -margin && x <= self.viewport[0] + margin
-            })
-            .collect();
+        let margin = self.viewport[0] + params.item_half_w().hypot(params.item_half_h()) * 2.0;
+        let active = donor_layout::monotone_window(
+            count,
+            |col| cx - self.camera.value() + params.column_x(col),
+            -margin,
+            self.viewport[0] + margin,
+        );
+        donor_layout::layout_work(2, active.len());
         self.scales.retain(|col, _| active.contains(col));
         for col in active {
             let target = self.scale_target(col);
@@ -273,17 +352,44 @@ impl HexPresentation {
         }
     }
 
+    fn placement_params(&self) -> HexParams {
+        if self.topology_from.is_some() {
+            self.target
+        } else {
+            self.params
+        }
+    }
+
     pub fn tick(&mut self, dt: f32) -> bool {
-        let morphing = !self.params.settled_to(&self.target);
+        let morphing = self.topology_from.is_none() && !numeric_settled(&self.params, &self.target);
         if morphing {
             let k = 1.0 - (-dt.min(0.05) * 1000.0 / (self.duration / 4.0).max(1.0)).exp();
-            self.params.morph_toward(&self.target, k);
-            if self.params.settled_to(&self.target) {
+            morph_numeric(&mut self.params, &self.target, k);
+            if numeric_settled(&self.params, &self.target) {
                 self.params = self.target;
             }
         }
+        let topology_moving = if self.topology_from.is_some() {
+            let k = 1.0 - (-dt.min(0.05) * 1000.0 / (self.duration / 4.0).max(1.0)).exp();
+            self.topology_progress += (1.0 - self.topology_progress) * k;
+            if self.topology_progress >= 0.995 {
+                self.topology_progress = 1.0;
+                self.params = self.target;
+                self.circle = self.target_circle;
+                self.topology_from = None;
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
         self.retarget(morphing);
-        let mut moving = self.camera.tick(dt) | self.entrance.tick(dt) | morphing;
+        let mut moving = self.camera.tick(dt)
+            | self.entrance.tick(dt)
+            | self.parallax.tick(dt)
+            | morphing
+            | topology_moving;
         for spring in self.scales.values_mut().chain(self.selection.values_mut()) {
             moving |= spring.tick(dt);
         }
@@ -293,6 +399,14 @@ impl HexPresentation {
 
     pub fn settle(&mut self) {
         self.params = self.target;
+        self.circle = self.target_circle;
+        self.parallax = gallery_presentation::parallax_motion(
+            self.parallax.target,
+            self.parallax.target > 0.0,
+            self.duration,
+        );
+        self.topology_from = None;
+        self.topology_progress = 1.0;
         self.selection.clear();
         self.retarget(true);
         for s in self.scales.values_mut() {
@@ -301,45 +415,41 @@ impl HexPresentation {
         self.entrance = GalleryMotionState::source(1.0, 1.0, 250.0, 1.0);
     }
 
-    pub fn cards(&self) -> Vec<(SliceCard, f32, bool, [f32; 4], donor_scene::SurfacePayload)> {
-        let scales = self
-            .scales
-            .iter()
-            .map(|(col, s)| (*col, s.value().clamp(0.0, 1.0)))
-            .collect();
-        let selected = self
-            .ids
-            .iter()
-            .position(|id| *id == self.selected)
-            .unwrap_or(0);
-        let placed: Vec<_> = if self.circle {
-            let p = &self.params;
-            gpu_gallery::layout_gallery(
+    fn placed_cards(
+        &self,
+        params: HexParams,
+        circle: bool,
+        scales: &HashMap<usize, f32>,
+        selected: usize,
+    ) -> Vec<SliceCard> {
+        if circle {
+            return gpu_gallery::layout_gallery(
                 GalleryMode::Geometric,
                 self.ids.len(),
                 selected,
                 self.viewport,
                 gpu_gallery::GalleryLayoutParams {
                     geometric: gpu_gallery::GeometricParams {
-                        radius: p.r,
-                        rows: p.rows,
-                        columns: p.cols,
+                        radius: params.r,
+                        rows: params.rows,
+                        columns: params.cols,
                         shape: gpu_gallery::GeometricShape::Circle,
                         curve: gpu_gallery::GeometricCurve::Flat,
-                        curve_strength: p.curve_strength,
-                        curve_frequency: p.curve_frequency,
-                        gap_x: p.gap_x,
-                        gap_y: p.gap_y,
-                        aspect: p.aspect,
-                        stagger: p.stagger,
-                        lens: p.lens,
-                        orbit: p.orbit,
-                        orbit_radius: p.orbit_radius,
-                        twist: p.twist,
-                        scatter: p.scatter,
-                        motion: (p.column_x(selected / p.rows) - self.camera.value())
-                            / (p.r * 2.0 * p.aspect + p.gap_x).max(1.0),
-                        stage: p.stage,
+                        curve_strength: params.curve_strength,
+                        curve_frequency: params.curve_frequency,
+                        gap_x: params.gap_x,
+                        gap_y: params.gap_y,
+                        aspect: params.aspect,
+                        stagger: params.stagger,
+                        lens: params.lens,
+                        orbit: params.orbit,
+                        orbit_radius: params.orbit_radius,
+                        twist: params.twist,
+                        scatter: params.scatter,
+                        motion: (params.column_x(selected / params.rows.max(1))
+                            - self.camera.value())
+                            / (params.r * 2.0 * params.aspect + params.gap_x).max(1.0),
+                        stage: params.stage,
                     },
                     ..Default::default()
                 },
@@ -349,43 +459,100 @@ impl HexPresentation {
                 card.center[0] += self.center_x() - self.viewport[0] * 0.5;
                 card
             })
-            .collect()
+            .collect();
+        }
+        donor_layout::hex_placements_current(
+            self.ids.len(),
+            self.viewport,
+            &params,
+            self.camera.value(),
+            self.center_x(),
+            scales,
+        )
+        .into_iter()
+        .map(|p| SliceCard {
+            triangle_direction: p.triangle_direction,
+            index: p.index,
+            center: [p.x, p.y],
+            size: [p.width, p.height],
+            layer: None,
+            selected: p.index == selected,
+            opacity: p.opacity,
+            skew_distance: 0.0,
+            edge_tilt_distance: 0.0,
+            rotation: 0.0,
+            corner_radius: 0.0,
+            shape: match p.shape {
+                HexShape::Hexagon => 2,
+                HexShape::Triangle => 4,
+                _ => 3,
+            },
+            poster_aspect_ratio: 16.0 / 9.0,
+        })
+        .collect()
+    }
+
+    fn placed_frame(&self) -> Vec<SliceCard> {
+        let scales = self
+            .scales
+            .iter()
+            .map(|(col, s)| (*col, s.value().clamp(0.0, 1.0)))
+            .collect();
+        let selected = self.positions.get(&self.selected).copied().unwrap_or(0);
+        if let Some(from) = &self.topology_from {
+            let target = self.placed_cards(self.target, self.target_circle, &scales, selected);
+            gallery_presentation::blend_layout_cards(from, target, selected, self.topology_progress)
         } else {
-            donor_layout::hex_placements_current(
-                self.ids.len(),
-                self.viewport,
-                &self.params,
-                self.camera.value(),
-                self.center_x(),
-                &scales,
-            )
-            .into_iter()
-            .map(|p| SliceCard {
-                triangle_direction: p.triangle_direction,
-                index: p.index,
-                center: [p.x, p.y],
-                size: [p.width, p.height],
-                layer: None,
-                selected: p.index == selected,
-                opacity: p.opacity,
-                skew_distance: 0.0,
-                edge_tilt_distance: 0.0,
-                rotation: 0.0,
-                corner_radius: 0.0,
-                shape: if self.circle {
-                    1
-                } else {
-                    match p.shape {
-                        HexShape::Hexagon => 2,
-                        HexShape::Triangle => 4,
-                        _ => 3,
-                    }
-                },
-                poster_aspect_ratio: 16.0 / 9.0,
-            })
-            .collect()
+            self.placed_cards(self.params, self.circle, &scales, selected)
+        }
+    }
+
+    pub(super) fn prefetch_indices(&self) -> Vec<usize> {
+        let params = self.placement_params();
+        let circle = if self.topology_from.is_some() {
+            self.target_circle
+        } else {
+            self.circle
         };
-        let mut cards: Vec<_> = placed
+        let selected = self.positions.get(&self.selected).copied().unwrap_or(0);
+        let scales = self
+            .scales
+            .iter()
+            .map(|(col, s)| (*col, s.value().clamp(0.0, 1.0)))
+            .collect();
+        let rows = params.rows.max(1);
+        let mut columns = self
+            .placed_cards(params, circle, &scales, selected)
+            .into_iter()
+            .map(|card| card.index / rows);
+        let Some(first) = columns.next() else {
+            return Vec::new();
+        };
+        let (first, last) =
+            columns.fold((first, first), |(lo, hi), col| (lo.min(col), hi.max(col)));
+        let before = first.checked_sub(1);
+        let after = (last + 1 < self.ids.len().div_ceil(rows)).then_some(last + 1);
+        let travel = self.camera.target - self.camera.value();
+        let before_first = if !circle && params.step_x() < 0.0 {
+            travel > 0.0
+        } else {
+            travel < 0.0
+        };
+        let edges = if before_first {
+            [before, after]
+        } else {
+            [after, before]
+        };
+        edges
+            .into_iter()
+            .flatten()
+            .flat_map(|col| col * rows..((col + 1) * rows).min(self.ids.len()))
+            .collect()
+    }
+
+    pub fn cards(&self) -> Vec<(SliceCard, f32, bool, [f32; 4], donor_scene::SurfacePayload)> {
+        let mut cards: Vec<_> = self
+            .placed_frame()
             .into_iter()
             .map(|card| {
                 let id = &self.ids[card.index];
@@ -416,11 +583,7 @@ impl GpuCandidate {
         let Snapshot::Hex(p) = view::settings::profile_projection::capture(self) else {
             return false;
         };
-        let ids: Vec<_> = self
-            .filtered_indices
-            .iter()
-            .filter_map(|i| self.wallpapers.get(*i).map(|w| w.id.clone()))
-            .collect();
+        let ids = self.presentation_inputs().ids;
         let selected = self
             .selected
             .and_then(|i| self.wallpapers.get(i))

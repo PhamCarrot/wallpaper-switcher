@@ -15,19 +15,23 @@ pub(super) fn effective_input_bindings(
     };
     let config = &app.config.keybinds;
     let mut map = InputMap::from_bindings(A::ALL.into_iter().map(|action| {
-        let raw = if !action.local_available() {
-            "none"
-        } else {
-            match action {
-                A::Apply => &config.apply_wallpaper,
-                A::NavLeft => &config.left,
-                A::NavRight => &config.right,
-                A::PageBack => &config.page_left,
-                A::PageForward => &config.page_right,
-                A::JumpFirst => &config.first,
-                A::JumpLast => &config.last,
-                _ => action.default_binding(),
-            }
+        let raw = match action {
+            A::Apply => &config.apply_wallpaper,
+            A::NavLeft => &config.left,
+            A::NavRight => &config.right,
+            A::PageBack => &config.page_left,
+            A::PageForward => &config.page_right,
+            A::JumpFirst => &config.first,
+            A::JumpLast => &config.last,
+            A::ConfigApplyToAll => &config.apply_to_all,
+            A::ConfigClose => &config.close,
+            A::ConfigSwitchMonitor => &config.switch_monitor,
+            A::ConfigToggleExclude => &config.toggle_exclude,
+            A::ConfigToggleHidden => &config.toggle_hidden,
+            A::ConfigOpenExplorer => &config.open_in_explorer,
+            A::ConfigReload => &config.reload_config,
+            _ if !action.local_available() => "none",
+            _ => action.default_binding(),
         };
         (action, raw.to_string())
     }));
@@ -71,19 +75,32 @@ pub(super) fn effective_input_bindings(
     ]);
     for (label, raw) in [
         ("Config: close", config.close.as_str()),
-        ("Config: apply to all", &config.apply_to_all),
-        ("Config: monitor", &config.switch_monitor),
-        ("Config: exclude", &config.toggle_exclude),
-        ("Config: hidden", &config.toggle_hidden),
-        ("Config: Explorer", &config.open_in_explorer),
-        ("Config: reload", &config.reload_config),
-        ("Config: global gallery toggle", &config.toggle_gallery),
+        ("Config: apply to all", config.apply_to_all.as_str()),
+        ("Config: monitor", config.switch_monitor.as_str()),
+        ("Config: exclude", config.toggle_exclude.as_str()),
+        ("Config: hidden", config.toggle_hidden.as_str()),
+        ("Config: Explorer", config.open_in_explorer.as_str()),
+        ("Config: reload", config.reload_config.as_str()),
+        (
+            "Config: global gallery toggle",
+            config.toggle_gallery.as_str(),
+        ),
         ("Literal Escape", "escape"),
         ("Gallery search", "ctrl+f"),
+        ("Gallery mode Slices", "1"),
+        ("Gallery mode Geometric", "2"),
+        ("Gallery mode Wall", "3"),
+        ("Gallery mode Depth", "4"),
     ] {
         match parse_binding(raw) {
-            Some(keys) => map.reserved.push((label.into(), keys)),
-            None => map
+            Some(keys)
+                if !keys
+                    .iter()
+                    .any(|trigger| matches!(trigger, composed::input::Trigger::Wheel(_))) =>
+            {
+                map.reserved.push((label.into(), keys))
+            }
+            _ => map
                 .native_diagnostics
                 .push(format!("Invalid {label} binding: {raw:?}")),
         }
@@ -606,18 +623,6 @@ impl GpuCandidate {
         });
     }
 
-    /// Winit restores the saved placement while leaving fullscreen. Queue the
-    /// windowed transition before the one hidden transition so that placement
-    /// restoration cannot re-show a window after the hide request.
-    pub(super) fn hidden_window_mode_sequence() -> [window::Mode; 2] {
-        [window::Mode::Windowed, window::Mode::Hidden]
-    }
-
-    pub(super) fn hide_window_task(id: window::Id) -> Task<Message> {
-        let modes = Self::hidden_window_mode_sequence();
-        window::set_mode(id, modes[0]).chain(window::set_mode(id, modes[1]))
-    }
-
     pub(super) fn start_rail_reveal(&mut self, opening: bool) {
         let generation = self.rail_generation.fetch_add(1, Ordering::AcqRel) + 1;
         if self.screenshot_path.is_some() {
@@ -681,6 +686,9 @@ impl GpuCandidate {
         }
         let previous_visible = self.visible;
         let previous_window = self.window;
+        if visible != previous_visible {
+            self.window_focused = None;
+        }
         if visible && !previous_visible {
             self.reset_default_folder();
             self.browse_position_restored = false;
@@ -709,6 +717,19 @@ impl GpuCandidate {
             }
             self.refresh_filter();
             self.refresh_backdrop();
+            let monitor_bounds = self.active_monitor_id.as_ref().and_then(|active| {
+                native_wallpaper::monitors()
+                    .ok()?
+                    .into_iter()
+                    .find_map(|monitor| {
+                        monitor.device_id.eq_ignore_ascii_case(active).then_some([
+                            monitor.rect.left,
+                            monitor.rect.top,
+                            monitor.rect.right,
+                            monitor.rect.bottom,
+                        ])
+                    })
+            });
             if let Some(id) = self.window {
                 self.visible = true;
                 if !previous_visible
@@ -729,37 +750,10 @@ impl GpuCandidate {
                     reason,
                 );
                 self.schedule_posters();
-                let origin = self.active_monitor_id.as_ref().and_then(|active| {
-                    native_wallpaper::monitors()
-                        .ok()?
-                        .into_iter()
-                        .find_map(|monitor| {
-                            monitor.device_id.eq_ignore_ascii_case(active).then_some(
-                                iced::Point::new(monitor.rect.left as f32, monitor.rect.top as f32),
-                            )
-                        })
-                });
-                let mut tasks = vec![
-                    window::set_mode(id, window::Mode::Fullscreen),
-                    window::gain_focus(id),
-                ];
-                if let Some(origin) = origin {
-                    tasks.push(window::move_to(id, origin));
-                }
-                return Task::batch(tasks);
+                return self.native_visibility.apply(id, true, monitor_bounds);
             }
 
-            let origin = self.active_monitor_id.as_ref().and_then(|active| {
-                native_wallpaper::monitors()
-                    .ok()?
-                    .into_iter()
-                    .find_map(|monitor| {
-                        monitor
-                            .device_id
-                            .eq_ignore_ascii_case(active)
-                            .then_some([monitor.rect.left, monitor.rect.top])
-                    })
-            });
+            let origin = monitor_bounds.map(|[left, top, _, _]| [left, top]);
             let (id, open) = window::open(window_settings(origin));
             self.window = Some(id);
             self.visible = true;
@@ -780,7 +774,7 @@ impl GpuCandidate {
         } else if let Some(id) = self.window {
             self.visible = false;
             self.stop_gallery_transients("visibility-hidden");
-            self.clear_posters();
+            self.invalidate_poster_work();
             let generation = self.visibility_generation;
             if let Some(close_tx) = WAKE_TX.get().and_then(|slot| slot.lock().ok()?.clone()) {
                 let _ = std::thread::Builder::new()
@@ -792,15 +786,15 @@ impl GpuCandidate {
             }
             if self.scenario.is_some() {
                 log_debug(&format!(
-                    "[SCENARIO-VISIBILITY] hide-sequence window_id={id:?} modes=Windowed->Hidden generation={generation}"
+                    "[SCENARIO-VISIBILITY] hide-preserving-fullscreen window_id={id:?} generation={generation}"
                 ));
             }
             self.trace_visibility_transition(previous_visible, previous_window, visible, reason);
-            Self::hide_window_task(id)
+            self.native_visibility.apply(id, false, None)
         } else {
             self.visible = false;
             self.stop_gallery_transients("visibility-hidden");
-            self.clear_posters();
+            self.invalidate_poster_work();
             self.trace_visibility_transition(previous_visible, previous_window, visible, reason);
             Task::none()
         }

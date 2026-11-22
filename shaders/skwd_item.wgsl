@@ -181,8 +181,8 @@ fn sample_card(in: VsOut, norm: vec2<f32>) -> vec3<f32> {
     let n = clamp(norm, vec2(0.0), vec2(1.0));
     let cropped = in.crop.xy + n * in.crop.zw;
     let uv = in.uv.xy + cropped * in.uv.zw;
-    if (in.misc.x == 1u) {
-        return textureSampleLevel(near_tex, samp, uv, in.misc.y, 0.0).rgb;
+    if (in.misc.x == 1u || in.misc.x == 4u) {
+        return near_lod(in, norm, 0.0);
     }
     if (in.misc.x == 3u) {
         return textureSampleLevel(preview_tex, samp, uv, 0.0).rgb;
@@ -194,13 +194,15 @@ fn near_lod(in: VsOut, norm: vec2<f32>, lod: f32) -> vec3<f32> {
     let n = clamp(norm, vec2(0.0), vec2(1.0));
     let cropped = in.crop.xy + n * in.crop.zw;
     let uv = in.uv.xy + cropped * in.uv.zw;
-    return textureSampleLevel(near_tex, samp, uv, in.misc.y, lod).rgb;
+    let texels_per_pixel = vec2<f32>(textureDimensions(near_tex)) * in.uv.zw * in.crop.zw / max(2.0 * in.half_ext, vec2(1.0));
+    let projected_lod = log2(max(1.0, max(texels_per_pixel.x, texels_per_pixel.y)));
+    return textureSampleLevel(near_tex, samp, uv, in.misc.y, max(lod, projected_lod)).rgb;
 }
 
 fn card_dof(in: VsOut, norm: vec2<f32>, blur: f32, ca: f32) -> vec3<f32> {
     let dirn = in.local / max(in.half_ext, vec2(1.0));
     let ca_off = dirn * ca * 0.016;
-    if (in.misc.x == 1u) {
+    if (in.misc.x == 1u || in.misc.x == 4u) {
         let lod = blur * 3.4;
         if (ca > 0.01) {
             let r = near_lod(in, norm + ca_off, lod).r;
@@ -486,7 +488,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             let cropped = in.crop.xy + norm * in.crop.zw;
             let uv = in.uv.xy + cropped * in.uv.zw;
             var tex: vec4<f32>;
-            if (in.misc.x == 1u) {
+            if (in.misc.x == 1u || in.misc.x == 4u) {
                 tex = textureSample(near_tex, samp, uv, in.misc.y);
             } else if (in.misc.x == 3u) {
                 tex = textureSample(preview_tex, samp, uv);

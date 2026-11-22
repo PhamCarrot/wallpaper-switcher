@@ -582,10 +582,8 @@ fn w2_choose_displays_opens_actual_target_owner_without_effects_or_apply() {
     let (mut app, count) = gallery();
     let message = pointer(&app, 0, MouseButton::Left, Mods::new(true, false, false));
     let _ = update(&mut app, message);
-    assert_eq!(
-        app.settings_workbench.windows_panel,
-        Some(SettingsCategory::WallpapersDisplays)
-    );
+    assert_eq!(app.settings_workbench.tab, "displays");
+    assert!(app.settings_workbench.windows_panel.is_none());
     assert_eq!(count.load(Ordering::Acquire), 0);
 }
 
@@ -800,5 +798,230 @@ fn e2_bound_detail_right_click_escape_close_and_reopen_stay_usable() {
             assert!(app.visible);
         }
         assert_eq!(count.load(Ordering::Acquire), 0);
+    }
+}
+#[test]
+fn picker_preset_bindings_capture_round_trip_and_ignore_old_per_preset_keys() {
+    use crate::candidate_state::mode_profiles::ProfileShortcut;
+    use view::settings::composed::input::WheelDirection;
+
+    let mut app = p3_composed_editor_app(SettingsCategory::Picker);
+    app.launch_policy = p1_preview_policy();
+    app.gallery_mode = GalleryMode::Slices;
+    app.state.gallery.mode = GalleryKind::Slices;
+    app.state.gallery.slices.width = 301.0;
+    app.save_gallery_preset().unwrap();
+    let first = app
+        .state
+        .mode_profiles
+        .selected_id(GalleryKind::Slices)
+        .unwrap();
+    app.state.gallery.slices.width = 437.0;
+    app.save_gallery_preset().unwrap();
+    let last = app
+        .state
+        .mode_profiles
+        .selected_id(GalleryKind::Slices)
+        .unwrap();
+    app.state.mode_profiles.shortcuts.push(ProfileShortcut {
+        mode: GalleryKind::Slices,
+        id: first,
+        binding: "q".into(),
+    });
+    app.state
+        .frontend_preferences
+        .bindings
+        .insert(B::FilterBar, "shift+b".into());
+    let map = super::super::lifecycle::effective_input_bindings(&app);
+    assert!(map.triggers(A::PresetNext).is_empty());
+    assert!(map.triggers(A::PresetPrev).is_empty());
+
+    p3_settings_intent(
+        &mut app,
+        SettingsMsg::SelectSection(view::settings::composed::PICKER_CONTROLS_SECTION),
+    );
+    p3_settings_intent(
+        &mut app,
+        SettingsMsg::KeybindCapture("keys.presetNext".into(), 0),
+    );
+    character(&mut app, "k");
+    p3_settings_intent(&mut app, SettingsMsg::KeybindCaptureApply);
+    p3_settings_intent(
+        &mut app,
+        SettingsMsg::KeybindCapture("keys.presetPrev".into(), 0),
+    );
+    let window = app.window.unwrap();
+    let _ = update(
+        &mut app,
+        Message::SettingsModifiers {
+            window,
+            modifiers: keyboard::Modifiers::CTRL,
+        },
+    );
+    p3_settings_intent(
+        &mut app,
+        SettingsMsg::KeybindCaptureClick(MouseButton::Middle),
+    );
+    p3_settings_intent(&mut app, SettingsMsg::KeybindCaptureApply);
+    p3_settings_intent(
+        &mut app,
+        SettingsMsg::KeybindCapture("keys.presetNext".into(), 1),
+    );
+    let _ = update(
+        &mut app,
+        Message::SettingsModifiers {
+            window,
+            modifiers: keyboard::Modifiers::CTRL,
+        },
+    );
+    p3_settings_intent(
+        &mut app,
+        SettingsMsg::KeybindCaptureWheel(WheelDirection::Up),
+    );
+    p3_settings_intent(&mut app, SettingsMsg::KeybindCaptureApply);
+    app.state = CandidateState::load(&app.state_path);
+    assert_eq!(
+        app.state.frontend_preferences.bindings[&B::PresetNext],
+        "k, ctrl+wheel-up"
+    );
+    assert_eq!(
+        app.state.frontend_preferences.bindings[&B::PresetPrev],
+        "ctrl+middle-click"
+    );
+    assert_eq!(app.state.mode_profiles.shortcuts[0].binding, "q");
+    let _ = update(&mut app, Message::ToggleSettingsPanel);
+    character(&mut app, "q");
+    assert_eq!(
+        app.state.mode_profiles.selected_id(GalleryKind::Slices),
+        Some(last)
+    );
+    character(&mut app, "k");
+    assert_eq!(
+        app.state.mode_profiles.selected_id(GalleryKind::Slices),
+        Some(first)
+    );
+    assert_eq!(app.state.gallery.slices.width, 301.0);
+    let message = pointer(&app, 0, MouseButton::Middle, Mods::new(true, false, false));
+    let _ = update(&mut app, message);
+    assert_eq!(
+        app.state.mode_profiles.selected_id(GalleryKind::Slices),
+        Some(last)
+    );
+    assert_eq!(app.state.gallery.slices.width, 437.0);
+    let scroll = |app: &mut GpuCandidate, amount, vertical| {
+        let event = super::super::lifecycle::bind_gallery_input(
+            app,
+            GalleryMessage::BoundWheel {
+                amount,
+                vertical,
+                modifiers: Mods::new(true, false, false),
+                sequence: None,
+            },
+        );
+        let _ = update(app, event);
+    };
+    scroll(&mut app, 1.0, 0.0);
+    assert_eq!(
+        app.state.mode_profiles.selected_id(GalleryKind::Slices),
+        Some(last)
+    );
+    scroll(&mut app, 0.5, 0.5);
+    assert_eq!(
+        app.state.mode_profiles.selected_id(GalleryKind::Slices),
+        Some(last)
+    );
+    scroll(&mut app, 0.5, 0.5);
+    assert_eq!(
+        app.state.mode_profiles.selected_id(GalleryKind::Slices),
+        Some(first)
+    );
+    let rail = app.rail_dismissed;
+    key(
+        &mut app,
+        keyboard::Key::Character("b".into()),
+        keyboard::Modifiers::SHIFT,
+    );
+    assert_ne!(app.rail_dismissed, rail);
+    let _ = update(&mut app, Message::OpenSearch);
+    character(&mut app, "k");
+    assert_eq!(
+        app.state.mode_profiles.selected_id(GalleryKind::Slices),
+        Some(first)
+    );
+    assert!(!app.apply_pending);
+}
+
+#[test]
+fn unsupported_wheel_tokens_cannot_conflict_with_preset_bindings() {
+    use view::settings::composed::input::{InputMap, Trigger};
+    let map = InputMap::from_bindings([
+        (A::Favourite, "f, ctrl+wheel-up".into()),
+        (A::PresetNext, "ctrl+wheel-up".into()),
+    ]);
+    let wheel = Trigger::parse("ctrl+wheel-up").unwrap();
+    assert_eq!(map.triggers(A::Favourite), &[Trigger::parse("f").unwrap()]);
+    assert_eq!(map.triggers(A::PresetNext), &[wheel.clone()]);
+    assert!(map.trigger_holders(A::PresetNext, &wheel).next().is_none());
+    assert!(map
+        .diagnostics
+        .iter()
+        .any(|message| message.contains("does not accept a wheel")));
+}
+
+#[test]
+fn mixed_shortcut_save_announces_config_commit_and_local_write_failure() {
+    use crate::candidate_app::view::settings::bridge::SaveNotice;
+    let mut app = p3_composed_editor_app(SettingsCategory::Picker);
+    let config_path = Config::config_path();
+    let owned = std::env::var_os("WALLPAPER_SWITCHER_CONFIG_DIR").expect("isolated config fixture");
+    assert!(config_path.starts_with(std::path::Path::new(&owned)));
+    let backup = config_path.with_extension("toml.bak");
+    let previous_config = std::fs::read(&config_path).ok();
+    let previous_backup = std::fs::read(&backup).ok();
+    let fixture_path = app
+        .state_path
+        .with_file_name("mixed-shortcuts-blocked-parent");
+    std::fs::write(&fixture_path, b"owned fixture").unwrap();
+    app.state_path = fixture_path.join("state.toml");
+    app.state
+        .frontend_preferences
+        .bindings
+        .insert(B::PresetNext, "ctrl+q".into());
+    let old_local = app.state.frontend_preferences.bindings.clone();
+    p3_settings_intent(
+        &mut app,
+        SettingsMsg::SelectSection(view::settings::composed::PICKER_CONTROLS_SECTION),
+    );
+    p3_settings_intent(
+        &mut app,
+        SettingsMsg::KeybindCapture("config.keybinds.close".into(), 0),
+    );
+    key(
+        &mut app,
+        keyboard::Key::Character("q".into()),
+        keyboard::Modifiers::CTRL,
+    );
+    p3_settings_intent(&mut app, SettingsMsg::KeybindCaptureApply);
+    assert_eq!(
+        app.settings_workbench.save_notice,
+        Some(SaveNotice::Partial)
+    );
+    assert_eq!(app.config.keybinds.close, "ctrl+q");
+    assert_eq!(
+        Config::load_read_only_with_diagnostics()
+            .config
+            .keybinds
+            .close,
+        "ctrl+q"
+    );
+    assert_eq!(app.state.frontend_preferences.bindings, old_local);
+    assert!(app.save_failure.is_some());
+    assert!(!app.state_path.exists());
+    for (path, previous) in [(config_path, previous_config), (backup, previous_backup)] {
+        if let Some(previous) = previous {
+            std::fs::write(path, previous).unwrap();
+        } else {
+            crate::file_publication::remove_if_present(&path).unwrap();
+        }
     }
 }

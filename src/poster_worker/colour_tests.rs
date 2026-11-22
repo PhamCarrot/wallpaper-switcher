@@ -195,8 +195,9 @@ fn w5_production_decode_content_refresh_provenance_missing_and_bounds() {
         .contains("Transparent-only"));
     let mut too_big = still.clone();
     too_big.fingerprint.bytes = MAX_BYTES as u64 + 1;
-    assert!(analyse(&too_big, &profile, true, &|| false).is_err());
-    assert!(analyse(&still, &profile, true, &|| true).is_err());
+    let mut cache = CacheBatch::new(&profile);
+    assert!(analyse(&too_big, &mut cache, true, &|| false).is_err());
+    assert!(analyse(&still, &mut cache, true, &|| true).is_err());
     std::fs::remove_file(&still.path).unwrap();
     assert!(run(&profile, &still, true).result.is_err());
 }
@@ -305,7 +306,14 @@ fn w5_held_production_analysis_epoch_clear_and_regeneration() {
     let source_before = std::fs::read(&still.path).unwrap();
     let clock = Arc::new(AtomicU64::new(1));
     let catalog_clock = Arc::new(AtomicU64::new(1));
-    let worker = PosterWorker::spawn(clock.clone(), |_| true).unwrap();
+    let (posters, poster_rx) = mpsc::channel();
+    let worker = PosterWorker::spawn_with_builder(
+        std::thread::Builder::new(),
+        clock.clone(),
+        move |completion| posters.send(completion).is_ok(),
+        |_, _| None,
+    )
+    .unwrap();
     let (tx, rx) = mpsc::channel();
     let (started, waiting) = mpsc::channel();
     let release = Arc::new(Barrier::new(2));
@@ -327,6 +335,28 @@ fn w5_held_production_analysis_epoch_clear_and_regeneration() {
         })
         .unwrap();
     waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+    worker
+        .submit(super::super::PosterBatch::new(
+            1,
+            vec![super::super::PosterSource {
+                index: 0,
+                layer: 0,
+                item_id: still.item_id.clone(),
+                kind: crate::poster_worker::PosterKind::Still,
+                video_stamp: None,
+                still: Some(still.clone()),
+                path: still.path.clone(),
+            }],
+            profile.join("cache/posters"),
+        ))
+        .unwrap();
+    let poster_result = poster_rx
+        .recv_timeout(Duration::from_secs(10))
+        .and_then(|failure| {
+            poster_rx
+                .recv_timeout(Duration::from_secs(10))
+                .map(|terminal| (failure, terminal))
+        });
     let (ack, ack_rx) = mpsc::channel();
     let epoch = worker
         .request_cache(cache::Request {
@@ -338,9 +368,14 @@ fn w5_held_production_analysis_epoch_clear_and_regeneration() {
             acknowledge: Box::new(move |r| ack.send(r).unwrap()),
         })
         .unwrap();
-    assert!(ack_rx.try_recv().is_err());
-    assert!(worker.cache_busy());
+    let pending = ack_rx.try_recv().is_err() && worker.cache_busy();
     release.wait();
+    let (failure, terminal) = poster_result.expect("posters settle while colour is held");
+    assert_eq!((failure.cursor, failure.finished), (1, false));
+    assert_eq!(failure.failures.len(), 1);
+    assert_eq!(failure.failures[0].source.item_id, still.item_id);
+    assert_eq!((terminal.cursor, terminal.finished), (2, true));
+    assert!(pending, "cache clear waits until the colour batch settles");
     let report = ack_rx.recv_timeout(Duration::from_secs(20)).unwrap();
     eprintln!("W5 held analysis clear: {report:?}");
     assert_eq!(report.epoch, epoch);
@@ -353,6 +388,78 @@ fn w5_held_production_analysis_epoch_clear_and_regeneration() {
     assert!(owned.exists());
     assert_eq!(std::fs::read(&still.path).unwrap(), source_before);
     drop(worker);
+}
+
+#[test]
+fn colour_batch_writes_all_valid_entries_before_delivering_results() {
+    let (profile, still) = fixture();
+    let mut second = still.clone();
+    second.item_id.push_str("-second");
+    let generation = Arc::new(AtomicU64::new(1));
+    let catalog = Arc::new(AtomicU64::new(1));
+    let worker = PosterWorker::spawn(generation.clone(), |_| true).unwrap();
+    let (send, receive) = mpsc::channel();
+    let jobs = [still, second]
+        .into_iter()
+        .map(|still| {
+            let send = send.clone();
+            Job {
+                generation: 1,
+                epoch: 0,
+                catalog_clock: catalog.clone(),
+                clock: generation.clone(),
+                still,
+                profile: profile.clone(),
+                refresh: true,
+                publish: Box::new(move |completion| send.send(completion).unwrap()),
+                held: None,
+            }
+        })
+        .collect();
+    worker.submit_colours(jobs).unwrap();
+    let first = receive.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(first.persistence.is_ok());
+    let root = profile.join("cache/colour-v1");
+    let files: Vec<_> = std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(
+        files.len(),
+        2,
+        "both entries are published before the first completion"
+    );
+    for path in files {
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(valid_bytes(path.file_name().unwrap().to_str().unwrap(), &bytes).is_some());
+    }
+    let second = receive.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(second.persistence.is_ok());
+    assert_ne!(first.still.item_id, second.still.item_id);
+}
+
+#[test]
+fn colour_and_sort_pixel_loops_observe_cancellation_after_start() {
+    use std::cell::Cell;
+    let sample = image::RgbaImage::from_pixel(128, 128, image::Rgba([255, 0, 0, 255]));
+    let colour_checks = Cell::new(0);
+    let colour = color_metadata::analyse_sample_cancellable(&sample, "A".repeat(64), &|| {
+        colour_checks.set(colour_checks.get() + 1);
+        colour_checks.get() == 2
+    });
+    assert_eq!(colour.unwrap_err(), "Colour analysis cancelled");
+    assert_eq!(colour_checks.get(), 2);
+
+    let sort_checks = Cell::new(0);
+    let sorting = crate::library::sort_metrics::analyse_cancellable(
+        &image::DynamicImage::ImageRgba8(sample),
+        &|| {
+            sort_checks.set(sort_checks.get() + 1);
+            sort_checks.get() == 4
+        },
+    );
+    assert!(sorting.is_none());
+    assert_eq!(sort_checks.get(), 4);
 }
 #[test]
 fn w5_cancel_catalog_and_changed_input_settlement_never_publish_stale_metrics() {
@@ -405,12 +512,13 @@ fn w5_queued_colour_job_settles_when_shared_poster_decoder_fails() {
     let (profile, still) = fixture();
     let clock = Arc::new(AtomicU64::new(1));
     let (started, waiting) = mpsc::channel();
+    let (posters, poster_results) = mpsc::channel();
     let release = Arc::new(Barrier::new(2));
     let held = release.clone();
     let worker = PosterWorker::spawn_with_builder(
         std::thread::Builder::new().name("w5-failing-shared-decode".into()),
         clock.clone(),
-        |_| true,
+        move |completion| posters.send(completion).is_ok(),
         move |_, _| {
             started.send(()).unwrap();
             held.wait();
@@ -425,7 +533,8 @@ fn w5_queued_colour_job_settles_when_shared_poster_decoder_fails() {
                 index: 0,
                 layer: 0,
                 item_id: still.item_id.clone(),
-                is_video: false,
+                kind: crate::poster_worker::PosterKind::Still,
+                video_stamp: None,
                 still: Some(still.clone()),
                 path: still.path.clone(),
             }],
@@ -455,6 +564,14 @@ fn w5_queued_colour_job_settles_when_shared_poster_decoder_fails() {
     );
     assert!(c.result.is_err());
     worker.wait_until_stopped();
+    assert_eq!(
+        worker.unavailable_reason(),
+        Some(crate::poster_worker::WorkerFailure::DecoderPanicked)
+    );
+    assert!(matches!(
+        poster_results.try_recv(),
+        Err(mpsc::TryRecvError::Disconnected)
+    ));
     assert!(!profile.join("cache/colour-v1").exists());
 }
 
@@ -510,6 +627,11 @@ fn retirement_worker_exit_closes_colour_submission_before_drain_unlock() {
         });
     });
     rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    shared.queue.lock().unwrap().background_active = true;
+    assert!(
+        !worker.can_replace(),
+        "a stopped worker still owns an active colour batch"
+    );
     let (profile, still) = fixture();
     let submission = worker.submit_colour(Job {
         generation: 1,
@@ -529,17 +651,29 @@ fn retirement_worker_exit_closes_colour_submission_before_drain_unlock() {
         "exit closes availability before drain-unlock interval"
     );
     assert!(shared.queue.lock().unwrap().colour.is_none());
+    shared.queue.lock().unwrap().background_active = false;
+    assert!(worker.can_replace());
 }
 
 #[test]
 fn retirement_poisoned_worker_queue_settles_colour_and_cache_ack() {
+    exit_acknowledgement_settles(true, false);
+}
+
+#[test]
+fn p36_exit_acknowledgement_reenters_and_panics_without_blocking_settlement() {
+    exit_acknowledgement_settles(false, true);
+}
+
+fn exit_acknowledgement_settles(poison_queue: bool, panic_ack: bool) {
     let shared = Arc::new(crate::poster_worker::Shared::new());
     let (profile, still) = fixture();
     let (tx, rx) = mpsc::channel();
     let (ack, ack_rx) = mpsc::channel();
+    let callback_shared = Arc::clone(&shared);
     {
         let mut queue = shared.queue.lock().unwrap();
-        queue.colour = Some(Job {
+        queue.colour = Some(vec![Job {
             generation: 1,
             epoch: 0,
             clock: Arc::new(AtomicU64::new(1)),
@@ -549,7 +683,7 @@ fn retirement_poisoned_worker_queue_settles_colour_and_cache_ack() {
             refresh: true,
             publish: Box::new(move |c| tx.send(c).unwrap()),
             held: None,
-        });
+        }]);
         queue.cache_busy = true;
         queue.clear = Some(cache::Request {
             profile: profile.clone(),
@@ -557,16 +691,31 @@ fn retirement_poisoned_worker_queue_settles_colour_and_cache_ack() {
             names: None,
             colour: true,
             epoch: 7,
-            acknowledge: Box::new(move |r| ack.send(r).unwrap()),
+            acknowledge: Box::new(move |r| {
+                let queue = match callback_shared.queue.try_lock() {
+                    Ok(queue) => queue,
+                    Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        panic!("acknowledgement must run outside the queue lock")
+                    }
+                };
+                assert!(!queue.cache_busy);
+                assert!(!callback_shared.running.load(Ordering::Acquire));
+                drop(queue);
+                ack.send(r).unwrap();
+                assert!(!panic_ack, "controlled exit acknowledgement panic");
+            }),
         });
     }
-    let poisoned = shared.clone();
-    assert!(std::thread::spawn(move || {
-        let _lock = poisoned.queue.lock().unwrap();
-        panic!("controlled queue poison");
-    })
-    .join()
-    .is_err());
+    if poison_queue {
+        let poisoned = shared.clone();
+        assert!(std::thread::spawn(move || {
+            let _lock = poisoned.queue.lock().unwrap();
+            panic!("controlled queue poison");
+        })
+        .join()
+        .is_err());
+    }
     crate::poster_worker::finish_worker_exit(&shared, || {});
     let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(result.result.is_err());
@@ -586,6 +735,7 @@ fn retirement_poisoned_worker_queue_settles_colour_and_cache_ack() {
             .cache_busy
     );
     assert!(!profile.join("cache/colour-v1").exists());
+    assert_eq!(shared.queue.is_poisoned(), poison_queue);
 }
 
 #[test]

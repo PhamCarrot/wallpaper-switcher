@@ -2,6 +2,7 @@ settings-position-picker-card-desc = Position this picker style and its filter b
 settings-position-slices-card = Slices picker
 settings-position-hex-card = Geometric picker
 settings-position-wall-card = Wall picker
+settings-position-depth-card = Depth picker
 settings-position-sandy-card = Sandy picker
 settings-position-hand-card = Card hand picker
 settings-position-horizontal-label = Horizontal offset

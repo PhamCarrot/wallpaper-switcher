@@ -20,11 +20,25 @@ impl Default for InputMap {
         Self {
             bindings: InputAction::ALL
                 .into_iter()
-                .map(|action| (action, built_in(action)))
+                .map(|action| {
+                    let triggers = if action.is_config_global() {
+                        Vec::new()
+                    } else {
+                        built_in(action)
+                    };
+                    (action, triggers)
+                })
                 .collect(),
             fallbacks: InputAction::ALL
                 .into_iter()
-                .map(|action| (action, built_in(action)))
+                .map(|action| {
+                    let triggers = if action.is_config_global() {
+                        Vec::new()
+                    } else {
+                        built_in(action)
+                    };
+                    (action, triggers)
+                })
                 .collect(),
             diagnostics: Vec::new(),
             native_diagnostics: Vec::new(),
@@ -56,16 +70,24 @@ impl InputMap {
             .map(|(label, _)| label.clone())
             .collect()
     }
+
+    pub fn reserved_conflicts_except(
+        &self,
+        action: InputAction,
+        triggers: &[Trigger],
+    ) -> Vec<String> {
+        let own_label = action.config_reserved_label();
+        self.reserved
+            .iter()
+            .filter(|(label, keys)| {
+                own_label != Some(label.as_str()) && keys.iter().any(|key| triggers.contains(key))
+            })
+            .map(|(label, _)| label.clone())
+            .collect()
+    }
     pub fn override_bindings(&mut self, bindings: impl IntoIterator<Item = (InputAction, String)>) {
         for (action, raw) in bindings {
-            let triggers = parse_binding(&raw)
-                .filter(|triggers| triggers.len() <= super::trigger::SLOTS)
-                .unwrap_or_else(|| {
-                    self.diagnostics.push(format!(
-                        "Invalid {action:?} binding: {raw:?}; action is unbound."
-                    ));
-                    Vec::new()
-                });
+            let triggers = self.parse_action_binding(action, &raw);
             if let Some(slot) = self
                 .bindings
                 .iter_mut()
@@ -73,6 +95,39 @@ impl InputMap {
             {
                 slot.1 = triggers;
             }
+        }
+    }
+
+    fn parse_action_binding(&mut self, action: InputAction, raw: &str) -> Vec<Trigger> {
+        let mut triggers = parse_binding(raw)
+            .filter(|triggers| triggers.len() <= super::trigger::SLOTS)
+            .unwrap_or_else(|| {
+                self.diagnostics.push(format!(
+                    "Invalid {action:?} binding: {raw:?}; action is unbound."
+                ));
+                Vec::new()
+            });
+        if !action.accepts_preset_wheel() {
+            let count = triggers.len();
+            triggers.retain(|trigger| !matches!(trigger, Trigger::Wheel(_)));
+            if triggers.len() != count {
+                self.diagnostics
+                    .push(format!("{action:?} does not accept a wheel shortcut."));
+            }
+        }
+        triggers
+    }
+
+    pub fn add_binding(&mut self, action: InputAction, raw: &str) {
+        let triggers = self.parse_action_binding(action, raw);
+        if let Some(slot) = self
+            .bindings
+            .iter_mut()
+            .find(|(existing, _)| *existing == action)
+        {
+            slot.1 = triggers;
+        } else {
+            self.bindings.push((action, triggers));
         }
     }
 
@@ -133,6 +188,18 @@ impl InputMap {
     pub fn lookup_mouse(&self, spec: MouseSpec, scopes: ActiveScopes) -> Option<InputAction> {
         self.active(scopes)
             .find(|(_, triggers)| triggers.contains(&Trigger::Mouse(spec)))
+            .map(|(action, _)| *action)
+    }
+
+    pub fn lookup_preset_wheel(
+        &self,
+        spec: super::WheelSpec,
+        scopes: ActiveScopes,
+    ) -> Option<InputAction> {
+        self.active(scopes)
+            .find(|(action, triggers)| {
+                action.accepts_preset_wheel() && triggers.contains(&Trigger::Wheel(spec))
+            })
             .map(|(action, _)| *action)
     }
 

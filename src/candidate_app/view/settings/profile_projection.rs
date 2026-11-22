@@ -134,6 +134,8 @@ pub(in crate::candidate_app) fn capture(app: &GpuCandidate) -> Snapshot {
         GalleryMode::Depth => {
             let g = &gallery.depth;
             Snapshot::Depth(DepthProfileSnapshot {
+                offset_x: g.offset_x,
+                offset_y: g.offset_y,
                 shadows: g.shadows,
                 selection_frame: g.selection_frame,
                 height: g.height,
@@ -258,6 +260,8 @@ pub(in crate::candidate_app) fn source_values(
             number(K::GRID_CYLINDER_RADIUS, g.cylinder_radius),
         ],
         Snapshot::Depth(g) => vec![
+            number(K::DEPTH_STAGE_X, g.offset_x * 100.0),
+            number(K::DEPTH_STAGE_Y, g.offset_y * 100.0),
             flag(K::DEPTH_SHADOWS, g.shadows),
             flag(K::DEPTH_SELECTION_FRAME, g.selection_frame),
             number(K::DEPTH_HEIGHT, g.height),
@@ -401,6 +405,8 @@ pub(in crate::candidate_app) fn geometry_proposal(
         }
         Snapshot::Depth(g) => {
             let target = &mut gallery.depth;
+            target.offset_x = g.offset_x;
+            target.offset_y = g.offset_y;
             target.shadows = g.shadows;
             target.selection_frame = g.selection_frame;
             target.height = g.height;
@@ -430,10 +436,25 @@ pub(in crate::candidate_app) fn geometry_proposal(
 
 pub(in crate::candidate_app) fn install(
     app: &mut GpuCandidate,
+    snapshot: Result<&Snapshot, &str>,
+    selected_id: Option<u64>,
+) -> (Task<Message>, Result<(), String>) {
+    match super::controller::finish_geometry_owner_edit(app) {
+        Ok(task) => {
+            let result = snapshot
+                .map_err(str::to_owned)
+                .and_then(|snapshot| install_after_edit(app, snapshot, selected_id));
+            (task, result)
+        }
+        Err(task) => (task, Err(app.settings_workbench.message.clone())),
+    }
+}
+
+fn install_after_edit(
+    app: &mut GpuCandidate,
     snapshot: &Snapshot,
     selected_id: Option<u64>,
 ) -> Result<(), String> {
-    super::controller::finish_geometry_owner_edit(app)?;
     let geometry = geometry_proposal(app, snapshot)?;
     let mut proposed = app.state.clone();
     proposed.gallery = geometry;
@@ -444,6 +465,16 @@ pub(in crate::candidate_app) fn install(
     }
     let previous = app.state.gallery.depth.clone();
     let changed = proposed.gallery != app.state.gallery;
+    let ordinary_outgoing = if changed && app.gallery_mode != GalleryMode::Depth {
+        app.capture_ordinary_roll()?
+    } else {
+        None
+    };
+    let depth_outgoing = if changed && app.gallery_mode == GalleryMode::Depth {
+        app.capture_depth_roll()
+    } else {
+        None
+    };
     app.commit_local_state_change(proposed).map_err(|error| {
         app.save_failure
             .clone()
@@ -458,12 +489,16 @@ pub(in crate::candidate_app) fn install(
     if changed {
         if app.gallery_mode == GalleryMode::Depth {
             app.depth_settings_changed(&previous);
+            if depth_outgoing.is_some() {
+                app.depth_roll = depth_outgoing;
+                app.start_motion(0.0);
+            }
+        } else {
+            app.ordinary_roll = ordinary_outgoing;
+            app.start_motion(0.0);
         }
         app.wall_scroll_offset = 0.0;
         app.schedule_posters();
-        if selected_id.is_some() {
-            app.reveal_gallery_layout();
-        }
     }
     Ok(())
 }

@@ -2,13 +2,11 @@ use super::*;
 use crate::candidate_app::view::settings::composed::test_source::FakeSettingsSource;
 
 #[test]
-fn pk08_tag_rows_search_points_to_the_tag_panel() {
+fn retired_tag_rows_are_absent_from_settings_search() {
     let cfg = FakeSettingsSource::default();
     for query in ["Clickable tag rows", "tagCloudRows"] {
         let results = search_settings(query, &cfg, &[], &[], "", &[], None);
-        assert_eq!(results.len(), 1, "{query}: {results:?}");
-        assert_eq!(results[0].tab, "picker");
-        assert_eq!(results[0].section_title, "Tag panel");
+        assert!(results.is_empty(), "{query}: {results:?}");
     }
 }
 

@@ -250,15 +250,12 @@ fn pk04_windows_route_is_mounted_and_preserves_stable_target_and_apply_policy() 
         .any(|row| matches!(
             row.control,
             Control::ActionBtn {
-                id: ActionId::OpenWindowsDisplays,
+                id: ActionId::OpenDisplays,
                 ..
             }
         )));
-    p3_settings_intent(&mut app, SettingsMsg::Run(ActionId::OpenWindowsDisplays));
-    assert_eq!(
-        app.settings_workbench.windows_panel,
-        Some(SettingsCategory::WallpapersDisplays)
-    );
+    p3_settings_intent(&mut app, SettingsMsg::Run(ActionId::OpenDisplays));
+    assert_eq!(app.settings_workbench.tab, "displays");
     assert_eq!(app.active_monitor_id.as_deref(), Some("STABLE-B"));
     assert!(!app.launch_policy.allows_provider());
     assert_eq!(calls.load(Ordering::Acquire), 0);
@@ -393,7 +390,7 @@ fn pk04_production_compositions_and_public_routes() {
 
     fn action(message: &Message, expected: ActionId) -> bool {
         match message {
-            Message::SettingsLegacy { message, .. } => action(message, expected),
+            Message::SettingsPageAction { message, .. } => action(message, expected),
             Message::SettingsIntent {
                 intent: Intent::Settings(SettingsMsg::Run(actual)),
                 ..
@@ -403,7 +400,7 @@ fn pk04_production_compositions_and_public_routes() {
     }
     fn closes(message: &Message) -> bool {
         match message {
-            Message::SettingsLegacy { message, .. } => closes(message),
+            Message::SettingsPageAction { message, .. } => closes(message),
             Message::SettingsIntent {
                 intent: Intent::ToggleSettings,
                 ..
@@ -1076,7 +1073,7 @@ fn pk04_production_compositions_and_public_routes() {
             );
             let p = probe(&mut element, &mut tree, &node, &renderer);
             let mut result = Vec::new();
-            let label = app.settings_locale.text_static("r5-windows-controls");
+            let label = app.settings_locale.text_static("settings-tab-displays");
             for (_, r) in p.texts.iter().filter(|(t, _)| t == label) {
                 let candidate = click(
                     &mut element,
@@ -1086,10 +1083,7 @@ fn pk04_production_compositions_and_public_routes() {
                     viewport,
                     r.center(),
                 );
-                if candidate
-                    .iter()
-                    .any(|m| action(m, ActionId::OpenWindowsDisplays))
-                {
+                if candidate.iter().any(|m| action(m, ActionId::OpenDisplays)) {
                     result = candidate;
                     break;
                 }
@@ -1107,16 +1101,11 @@ fn pk04_production_compositions_and_public_routes() {
             index.push(serde_json::json!({"path":path,"case":"windows-entry","actual_action_hit":!result.is_empty()}));
             result
         };
-        assert!(messages
-            .iter()
-            .any(|m| action(m, ActionId::OpenWindowsDisplays)));
+        assert!(messages.iter().any(|m| action(m, ActionId::OpenDisplays)));
         for message in messages {
             let _ = update(&mut app, message);
         }
-        assert_eq!(
-            app.settings_workbench.windows_panel,
-            Some(SettingsCategory::WallpapersDisplays)
-        );
+        assert_eq!(app.settings_workbench.tab, "displays");
         let messages = {
             let mut element = view(&app, app.window.unwrap());
             let mut tree = Tree::new(&element);
@@ -1152,10 +1141,10 @@ fn pk04_production_compositions_and_public_routes() {
                 iced::mouse::Cursor::Unavailable,
                 &path,
             );
-            index.push(serde_json::json!({"path":path,"case":"windows-target","stable_ids":app.monitor_ids,"active_id":app.active_monitor_id,"actual_cycle_hit":messages.iter().any(|m|matches!(m,Message::SettingsLegacy{message,..} if matches!(**message,Message::CycleTargetMonitor)))}));
+            index.push(serde_json::json!({"path":path,"case":"windows-target","stable_ids":app.monitor_ids,"active_id":app.active_monitor_id,"actual_cycle_hit":messages.iter().any(|m|matches!(m,Message::SettingsPageAction{message,..} if matches!(**message,Message::CycleTargetMonitor)))}));
             messages
         };
-        let cycle = messages.into_iter().find(|m| matches!(m, Message::SettingsLegacy { message, .. } if matches!(**message, Message::CycleTargetMonitor))).expect("actual mounted cycle callback");
+        let cycle = messages.into_iter().find(|m| matches!(m, Message::SettingsPageAction { message, .. } if matches!(**message, Message::CycleTargetMonitor))).expect("actual mounted cycle callback");
         let previous_ids = app.monitor_ids.clone();
         super::super::operations::TARGET_MONITORS_FOR_TEST.with(|slot| {
             assert!(slot

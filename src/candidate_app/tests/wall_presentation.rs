@@ -1,4 +1,5 @@
 use super::*;
+use crate::candidate_state::mode_profiles::Snapshot;
 
 #[test]
 fn p9_wall_engagement_is_scene_global_and_only_selection_or_restore_engages() {
@@ -127,6 +128,7 @@ fn p9_wall_six_layouts_share_current_draw_hit_and_stable_demand_with_aspects_and
         app.filtered_indices.rotate_left(7);
         app.catalog[7].width = 400;
         app.catalog[7].height = 1000;
+        app.presentation_inputs = None;
         app.state.gallery.wall.layout = layout;
         app.state.gallery.wall.round_corners = Some(false);
         app.sync_wall_presentation();
@@ -425,4 +427,143 @@ fn p9_wall_border_only_edit_morphs_current_material_and_mid_morph_save_restores_
         Some(saved.anchor.as_str()),
         "restart target layout differs from captured intermediate layout"
     );
+}
+
+#[test]
+fn p9_profile_layout_retarget_keeps_card_identity_and_reverses() {
+    let mut app = fixture(40);
+    let original = view::settings::profile_projection::capture(&app);
+    let original_params = app.wall_presentation.as_ref().unwrap().params;
+    app.state.gallery.wall.columns = 2;
+    app.state.gallery.wall.rows = 5;
+    app.state.gallery.wall.layout = StateWallLayout::Cylinder;
+    app.sync_wall_presentation();
+    {
+        let p = app.wall_presentation.as_ref().unwrap();
+        assert_ne!(p.params.columns, p.target.columns);
+        assert_ne!(p.params.rows, p.target.rows);
+        assert_ne!(p.params.layout, p.target.layout);
+    }
+    app.wall_presentation.as_mut().unwrap().tick(0.05);
+    let frame = app.ordinary_frame();
+    let ids: std::collections::BTreeSet<_> = frame.iter().map(|entry| entry.id.clone()).collect();
+    assert_eq!(ids.len(), frame.len());
+    assert!(frame.iter().all(|entry| {
+        entry.card.center.iter().all(|value| value.is_finite())
+            && entry
+                .card
+                .size
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+    }));
+    let selected = frame.iter().find(|entry| entry.card.selected).unwrap();
+    assert_eq!(
+        gpu_gallery::hit_test(
+            &frame.iter().map(|entry| entry.card).collect::<Vec<_>>(),
+            selected.card.center[0],
+            selected.card.center[1]
+        ),
+        Some(selected.card.index)
+    );
+    assert!(app
+        .ordinary_poster_indices()
+        .iter()
+        .all(|index| *index < app.wallpapers.len()));
+
+    let Snapshot::Wall(original) = original else {
+        panic!("wall snapshot")
+    };
+    app.state.gallery.wall.columns = original.columns as usize;
+    app.state.gallery.wall.rows = original.rows as usize;
+    app.state.gallery.wall.layout = original.layout;
+    app.sync_wall_presentation();
+    app.wall_presentation.as_mut().unwrap().tick(0.05);
+    app.wall_presentation.as_mut().unwrap().settle();
+    assert_eq!(
+        app.wall_presentation.as_ref().unwrap().params,
+        original_params
+    );
+}
+
+#[test]
+fn wall_layout_reverses_after_midpoint_and_reuses_both_indexes_to_settlement() {
+    let mut app = fixture(10_000);
+    app.wall_presentation.as_mut().unwrap().settle();
+    let original = app.state.gallery.wall.columns;
+    let original_frame = app.ordinary_frame();
+    app.state.gallery.wall.columns = 7;
+    app.sync_wall_presentation();
+    let built = donor_layout::layout_work_snapshot()[1];
+    for _ in 0..3 {
+        assert!(app.wall_presentation.as_mut().unwrap().tick(0.05));
+        let _ = app.ordinary_frame();
+    }
+    let before = app.ordinary_frame();
+    let composition = gallery_layout_params_for_app(&app).wall;
+    let clip = app
+        .wall_presentation
+        .as_ref()
+        .unwrap()
+        .clip(app.viewport, composition);
+    app.state.gallery.wall.columns = original;
+    app.sync_wall_presentation();
+    let reversed = app.ordinary_frame();
+    let composition = gallery_layout_params_for_app(&app).wall;
+    assert_eq!(
+        app.wall_presentation
+            .as_ref()
+            .unwrap()
+            .clip(app.viewport, composition),
+        clip
+    );
+    assert_eq!(donor_layout::layout_work_snapshot()[1], built);
+    let mut compared = 0;
+    for card in before.iter().filter(|c| c.card.opacity > 0.01) {
+        let next = reversed.iter().find(|entry| entry.id == card.id).unwrap();
+        assert_eq!(
+            (next.card.center, next.card.size, next.card.opacity),
+            (card.card.center, card.card.size, card.card.opacity)
+        );
+        assert_eq!(
+            (next.source.as_path(), next.readiness),
+            (card.source.as_path(), card.readiness)
+        );
+        compared += 1;
+    }
+    assert!(compared > 1);
+    let mut settled = false;
+    for _ in 0..120 {
+        if !app.wall_presentation.as_mut().unwrap().tick(1.0 / 60.0) {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled);
+    let geometry = |frame: Vec<donor_scene::CardPresentation>| {
+        frame
+            .into_iter()
+            .map(|c| (c.id, c.card.center, c.card.size, c.card.opacity))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(geometry(app.ordinary_frame()), geometry(original_frame));
+    assert_eq!(donor_layout::layout_work_snapshot()[1], built);
+}
+
+#[test]
+fn video_demand_and_draw_do_not_read_source_metadata_per_frame() {
+    let mut app = fixture(40);
+    app.wall_presentation.as_mut().unwrap().settle();
+    for item in &mut app.wallpapers {
+        item.source = WallpaperSource::LocalVideo;
+    }
+    let reads = crate::scanner::VIDEO_STAMP_READS.with(std::cell::Cell::get);
+    for _ in 0..100 {
+        std::hint::black_box(app.ordinary_frame());
+        std::hint::black_box(app.ordinary_poster_demand());
+    }
+    let additional = crate::scanner::VIDEO_STAMP_READS.with(std::cell::Cell::get) - reads;
+    eprintln!(
+        "100 repeated video draw/demand frame pairs: {additional} source metadata observations"
+    );
+    assert_eq!(additional, 0);
 }

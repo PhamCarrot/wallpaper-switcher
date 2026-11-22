@@ -335,7 +335,7 @@ pub(in crate::candidate_app) fn position_content(app: &GpuCandidate) -> Element<
     content.into()
 }
 
-fn windows_display_content(app: &GpuCandidate) -> Element<'_, Message> {
+pub(super) fn windows_display_content(app: &GpuCandidate) -> Element<'_, Message> {
     use super::sheets::{panel_button, panel_text};
     use composed::{SettingsSource, KEY_BINDINGS};
     let scale = bridge::effective_ui_scale(app);
@@ -347,7 +347,10 @@ fn windows_display_content(app: &GpuCandidate) -> Element<'_, Message> {
         palette,
         scale
     )
-    .on_press(Message::Wake(Wake::Tray(TrayAction::OpenConfig)))
+    .on_press_maybe(
+        (!app.launch_policy.is_preview())
+            .then_some(Message::Wake(Wake::Tray(TrayAction::OpenConfig)))
+    )
     .style(move |_, status| donor_ui::action_style(palette, false, false, status))]
     .spacing(8.0 * scale);
     for diagnostic in &map.native_diagnostics {
@@ -469,7 +472,7 @@ pub(in crate::candidate_app) fn motion_settings_content(
     }
 }
 
-fn playback_settings_content(app: &GpuCandidate) -> Element<'_, Message> {
+pub(super) fn playback_settings_content(app: &GpuCandidate) -> Element<'_, Message> {
     let scale = crate::candidate_app::view::settings::bridge::effective_ui_scale(app);
     use super::sheets::{panel_button, panel_text};
     let palette = donor_palette(app);
@@ -585,19 +588,101 @@ fn library_settings_content(app: &GpuCandidate) -> Element<'_, Message> {
         .as_ref()
         .map(|o| o.status())
         .unwrap_or(("Watch owner unavailable".into(), false));
-    let mut content = column![
+    let catalog = row![
+        panel_text(format!("{} wallpapers", app.wallpapers.len()), scale)
+            .size(12.0 * crate::donor_folio::source_ui::legible_type_scale(scale))
+            .width(Fill),
+        panel_button(
+            panel_text(app.settings_locale.text_static("r5-catalog-refresh"), scale),
+            palette,
+            scale
+        )
+        .on_press(Message::RefreshCatalog)
+    ]
+    .spacing(8.0 * scale);
+    let folder_label = app
+        .filter_rule
+        .folders
+        .iter()
+        .next()
+        .and_then(|folder| folder.file_name())
+        .map_or_else(
+            || {
+                app.settings_locale
+                    .text_static("r5-all-folders")
+                    .to_string()
+            },
+            |name| name.to_string_lossy().into_owned(),
+        );
+    let mut source_filters = row![].spacing(6.0 * scale);
+    for source_filter in [
+        SourceFilter::All,
+        SourceFilter::Pictures,
+        SourceFilter::Videos,
+        SourceFilter::WallpaperEngine,
+    ] {
+        source_filters = source_filters.push(
+            panel_button(panel_text(source_filter.label(), scale), palette, scale)
+                .on_press(Message::SetSourceFilter(source_filter))
+                .style(move |_, status| {
+                    donor_ui::action_style(
+                        palette,
+                        app.source_filter == source_filter,
+                        false,
+                        status,
+                    )
+                }),
+        );
+    }
+    let library_toolbar = column![
+        text_input("Search wallpapers", &app.filter_rule.text)
+            .font(UI_FONT)
+            .size(12.0 * crate::donor_folio::source_ui::legible_type_scale(scale))
+            .padding([8.0 * scale, 10.0 * scale])
+            .style(move |_, _| donor_ui::ghost_input_style(palette))
+            .id(app.search_input_id.clone())
+            .on_input(Message::SearchChanged)
+            .width(Fill),
         row![
-            panel_text(format!("{} wallpapers", app.wallpapers.len()), scale)
-                .size(12.0 * crate::donor_folio::source_ui::legible_type_scale(scale))
-                .width(Fill),
+            source_filters,
             panel_button(
-                panel_text(app.settings_locale.text_static("r5-catalog-refresh"), scale),
+                panel_text(format!("Folder · {folder_label} ⌄"), scale),
                 palette,
                 scale
             )
-            .on_press(Message::RefreshCatalog)
+            .on_press(Message::ToggleFolderMenu)
+            .style(move |_, status| donor_ui::action_style(
+                palette,
+                !app.filter_rule.folders.is_empty(),
+                false,
+                status
+            )),
+            panel_button(
+                panel_text(
+                    if app.filter_rule.favorites_only {
+                        "✓ Favorites"
+                    } else {
+                        "Favorites"
+                    },
+                    scale
+                ),
+                palette,
+                scale
+            )
+            .on_press(Message::ToggleFavoritesFilter)
+            .style(move |_, status| {
+                donor_ui::action_style(palette, app.filter_rule.favorites_only, false, status)
+            })
         ]
-        .spacing(8.0 * scale),
+        .spacing(8.0 * scale)
+        .wrap(),
+    ]
+    .spacing(8.0 * scale);
+    let mut catalog_tools = column![catalog, library_toolbar].spacing(10.0 * scale);
+    if app.folder_menu_open {
+        catalog_tools = catalog_tools.push(folder_popup_view(folder_popup_model(app)));
+    }
+    let mut content = column![
         panel_text(watch_status, scale)
             .size(12.0 * crate::donor_folio::source_ui::legible_type_scale(scale)),
         row![
@@ -670,6 +755,13 @@ fn library_settings_content(app: &GpuCandidate) -> Element<'_, Message> {
     }
     column![
         donor_folio::section(
+            app.settings_locale.text_static("feedback-catalog"),
+            "",
+            catalog_tools.into(),
+            palette,
+            scale
+        ),
+        donor_folio::section(
             app.settings_locale.text_static("repair-library-watching"),
             "",
             content.into(),
@@ -718,37 +810,84 @@ fn library_settings_content(app: &GpuCandidate) -> Element<'_, Message> {
     .into()
 }
 
-/// Retain working Windows controls under the composed Settings owner until
-/// their selected replacement batches adopt the corresponding frontend.
-fn windows_settings_content(
-    app: &GpuCandidate,
-    category: SettingsCategory,
-) -> Element<'_, Message> {
-    let scale = crate::candidate_app::view::settings::bridge::effective_ui_scale(app);
-    match category {
-        SettingsCategory::Picker => gallery_picker_content(app),
-        SettingsCategory::CatalogFilters => search_filter_content(app),
-        SettingsCategory::Position => position_content(app),
-        SettingsCategory::WallpapersDisplays => windows_display_content(app),
-        SettingsCategory::Motion => motion_settings_content(app),
-        SettingsCategory::Playback => playback_settings_content(app),
-        SettingsCategory::Library => column![
-            donor_folio::section(
-                app.settings_locale.text_static("r5-library-paths"),
-                app.settings_locale.text_static("r5-config-note"),
-                source_settings_content(app),
-                donor_palette(app),
-                scale
-            ),
-            library_settings_content(app)
-        ]
-        .spacing(28.0 * scale)
-        .into(),
-        SettingsCategory::Sources => source_settings_content(app),
-        SettingsCategory::Automation => automation_settings_content(app),
-        SettingsCategory::Theme => theme_settings_content(app),
-    }
+pub(super) fn library_platform_form(app: &GpuCandidate) -> Element<'_, Message> {
+    column![folder_ledger(app), library_settings_content(app)]
+        .spacing(28.0 * bridge::effective_ui_scale(app))
+        .into()
 }
+
+fn folder_ledger(app: &GpuCandidate) -> Element<'_, Message> {
+    use super::sheets::{panel_button, panel_text};
+    let scale = bridge::effective_ui_scale(app);
+    let palette = donor_palette(app);
+    let mut content = column![
+        panel_text(
+            format!("Local folders ({})", app.config.catalog.local_folders.len()),
+            scale
+        ),
+        iced::widget::rule::horizontal(1)
+    ]
+    .spacing(6.0 * scale);
+    for path in &app.config.catalog.local_folders {
+        content = content
+            .push(
+                row![
+                    panel_text(
+                        format!(
+                            "{}{}",
+                            path.display(),
+                            if path.is_dir() { "" } else { " · unavailable" }
+                        ),
+                        scale
+                    )
+                    .width(Fill),
+                    panel_button(
+                        panel_text(app.settings_locale.text_static("r5-panel-copy-37"), scale),
+                        palette,
+                        scale
+                    )
+                    .on_press(Message::UnlistLocalRoot(path.clone()))
+                ]
+                .align_y(iced::Alignment::Center)
+                .padding([8.0 * scale, 0.0])
+                .spacing(8.0 * scale),
+            )
+            .push(iced::widget::rule::horizontal(1));
+    }
+    content
+        .push(
+            column![
+                row![
+                    text_input(
+                        app.settings_locale.text_static("r5-panel-copy-34"),
+                        &app.folder_path_input
+                    )
+                    .font(UI_FONT)
+                    .size(11.0 * crate::donor_folio::source_ui::legible_type_scale(scale))
+                    .padding([7.0 * scale, 10.0 * scale])
+                    .style(move |_, _| donor_ui::ghost_input_style(palette))
+                    .on_input(Message::FolderPathChanged)
+                    .on_submit(Message::AddLocalRoot)
+                    .width(Fill),
+                    panel_button(
+                        panel_text(app.settings_locale.text_static("r5-panel-copy-35"), scale),
+                        palette,
+                        scale
+                    )
+                    .on_press(Message::AddLocalRoot)
+                ]
+                .spacing(8.0 * scale),
+                checkbox(app.config.behavior.include_default_projects)
+                    .text_size(11)
+                    .size(14.0 * crate::donor_folio::source_ui::legible_type_scale(scale))
+                    .label(app.settings_locale.text_static("r5-panel-copy-36"))
+                    .on_toggle(Message::SetInstalledDiscovery),
+            ]
+            .spacing(10.0 * scale),
+        )
+        .into()
+}
+
 fn source_settings_content(app: &GpuCandidate) -> Element<'_, Message> {
     let scale = crate::candidate_app::view::settings::bridge::effective_ui_scale(app);
     use super::sheets::{panel_button, panel_text};
@@ -806,31 +945,7 @@ fn source_settings_content(app: &GpuCandidate) -> Element<'_, Message> {
             scale
         ),
         panel_text(app.settings_locale.text_static("r5-panel-copy-33"), scale),
-        row![
-            text_input(
-                app.settings_locale.text_static("r5-panel-copy-34"),
-                &app.folder_path_input
-            )
-            .font(UI_FONT)
-            .size(11.0 * crate::donor_folio::source_ui::legible_type_scale(scale))
-            .padding([7.0 * scale, 10.0 * scale])
-            .style(move |_, _| donor_ui::ghost_input_style(palette))
-            .on_input(Message::FolderPathChanged)
-            .on_submit(Message::AddLocalRoot)
-            .width(Fill),
-            panel_button(
-                panel_text(app.settings_locale.text_static("r5-panel-copy-35"), scale),
-                palette,
-                scale
-            )
-            .on_press(Message::AddLocalRoot)
-        ]
-        .spacing(8.0 * scale),
-        checkbox(app.config.behavior.include_default_projects)
-            .text_size(11)
-            .size(14.0 * crate::donor_folio::source_ui::legible_type_scale(scale))
-            .label(app.settings_locale.text_static("r5-panel-copy-36"))
-            .on_toggle(Message::SetInstalledDiscovery),
+        folder_ledger(app),
         sources,
         panel_button(
             panel_text(format!("Folder · {folder_label} ⌄"), scale),
@@ -841,28 +956,6 @@ fn source_settings_content(app: &GpuCandidate) -> Element<'_, Message> {
         .style(move |_, status| donor_ui::action_style(palette, false, false, status)),
     ]
     .spacing(8.0 * scale);
-    for path in &app.config.catalog.local_folders {
-        content = content.push(
-            row![
-                panel_text(
-                    format!(
-                        "{}{}",
-                        path.display(),
-                        if path.is_dir() { "" } else { " · unavailable" }
-                    ),
-                    scale
-                )
-                .width(Fill),
-                panel_button(
-                    panel_text(app.settings_locale.text_static("r5-panel-copy-37"), scale),
-                    palette,
-                    scale
-                )
-                .on_press(Message::UnlistLocalRoot(path.clone()))
-            ]
-            .spacing(8.0 * scale),
-        );
-    }
     if app.folder_menu_open {
         content = content.push(folder_popup_view(folder_popup_model(app)));
     }
@@ -870,15 +963,17 @@ fn source_settings_content(app: &GpuCandidate) -> Element<'_, Message> {
 }
 
 fn automation_settings_content(app: &GpuCandidate) -> Element<'_, Message> {
+    automation_settings_content_with_palette(app, donor_palette(app))
+}
+
+pub(super) fn automation_settings_content_with_palette(
+    app: &GpuCandidate,
+    palette: donor_ui::Palette,
+) -> Element<'_, Message> {
     let scale = crate::candidate_app::view::settings::bridge::effective_ui_scale(app);
     use super::sheets::{panel_button, panel_text};
-    let palette = donor_palette(app);
-    let active_name = app
-        .state
-        .active_playlist_id
-        .as_deref()
-        .and_then(|id| app.state.playlists.iter().find(|p| p.id == id))
-        .map_or("No active playlist", |p| p.name.as_str());
+    let active_playlist = app.active_schedule_playlist();
+    let active_name = active_playlist.map_or("No active playlist", |p| p.name.as_str());
     let mut days = row![].spacing(5.0 * scale);
     for (day, label) in ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
         .into_iter()
@@ -959,7 +1054,7 @@ fn automation_settings_content(app: &GpuCandidate) -> Element<'_, Message> {
         .on_press_maybe(
             (!app.schedule_name.trim().is_empty()
                 && parse_schedule_time(&app.schedule_time).is_some()
-                && app.state.active_playlist_id.is_some()
+                && active_playlist.is_some()
                 && app.schedule_days != 0)
                 .then_some(Message::CreateSchedule)
         )
@@ -1028,7 +1123,6 @@ fn automation_settings_content(app: &GpuCandidate) -> Element<'_, Message> {
             palette,
             scale
         ),
-        display_settings_content(app),
     ]
     .spacing(28.0 * scale)
     .into()
@@ -1061,8 +1155,8 @@ fn settings_category_content(app: &GpuCandidate) -> Element<'_, Message> {
         SettingsCategory::Library => column![
             donor_folio::section(
                 app.settings_locale.text_static("r5-library-paths"),
-                app.settings_locale.text_static("r5-config-note"),
-                source_settings_content(app),
+                "",
+                folder_ledger(app),
                 donor_palette(app),
                 scale
             ),

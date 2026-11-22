@@ -16,10 +16,11 @@ fn w4_hidden_real_watch_publication_preserves_tags_selection_and_stops_visual_de
     let (tx, rx) = mpsc::channel();
     app.catalog_watch = Some(
         catalog_watch::CatalogWatch::spawn(
+            crate::scanner::default_catalog_scan_threads(),
             vec![root.clone()],
             false,
             Default::default(),
-            app.catalog_generation.clone(),
+            app.catalog_scan_generation.clone(),
             move |wake| tx.send(wake).is_ok(),
         )
         .unwrap(),
@@ -109,7 +110,7 @@ fn w4_hidden_real_watch_publication_preserves_tags_selection_and_stops_visual_de
     assert!(!app.poster_loading);
     assert!(app.poster_worker.is_none());
     assert!(app.poster_request_key.is_none());
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let _ = update(
         &mut app,
         Message::Wake(Wake::CatalogLoaded {
@@ -130,10 +131,11 @@ fn w4_reloaded_watch_preferences_reconfigure_only_after_successful_reconciliatio
     let (tx, _rx) = mpsc::channel();
     app.catalog_watch = Some(
         catalog_watch::CatalogWatch::spawn(
+            crate::scanner::default_catalog_scan_threads(),
             Vec::new(),
             false,
             Default::default(),
-            app.catalog_generation.clone(),
+            app.catalog_scan_generation.clone(),
             move |w| tx.send(w).is_ok(),
         )
         .unwrap(),
@@ -142,10 +144,10 @@ fn w4_reloaded_watch_preferences_reconfigure_only_after_successful_reconciliatio
     saved.frontend_preferences.library.automatic_watch = Some(false);
     saved.frontend_preferences.library.polling_seconds = Some(19);
     candidate_state::persist_candidate_state(&mut saved, &app.state_path).unwrap();
-    let prior = app.catalog_generation.load(Ordering::Acquire);
+    let prior = app.catalog_scan_generation.load(Ordering::Acquire);
     app.reload_local_state().unwrap();
     assert!(!app.state.frontend_preferences.library.watching());
-    assert!(app.catalog_generation.load(Ordering::Acquire) > prior);
+    assert!(app.catalog_scan_generation.load(Ordering::Acquire) > prior);
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         if app.catalog_watch.as_ref().unwrap().status().0 == "Automatic watching off" {
@@ -154,9 +156,9 @@ fn w4_reloaded_watch_preferences_reconfigure_only_after_successful_reconciliatio
         assert!(Instant::now() < deadline);
         std::thread::yield_now();
     }
-    let before = app.catalog_generation.load(Ordering::Acquire);
+    let before = app.catalog_scan_generation.load(Ordering::Acquire);
     std::fs::write(&app.state_path, "version = 999\n").unwrap();
     assert!(app.reload_local_state().is_err());
-    assert_eq!(before, app.catalog_generation.load(Ordering::Acquire));
+    assert_eq!(before, app.catalog_scan_generation.load(Ordering::Acquire));
     assert!(!app.state.frontend_preferences.library.watching());
 }

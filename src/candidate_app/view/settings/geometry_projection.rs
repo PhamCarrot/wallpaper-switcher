@@ -179,6 +179,7 @@ pub(in crate::candidate_app) fn write(
         | K::HEX_STAGE_SHEAR_X
         | K::HEX_STAGE_SHEAR_Y
         | K::HEX_STAGE_DEPTH_ANGLE => GalleryKind::Geometric,
+        K::DEPTH_STAGE_X | K::DEPTH_STAGE_Y => GalleryKind::Depth,
         K::GRID_ROUND_CORNERS
         | K::GRID_BORDER_WIDTH
         | K::GRID_SELECTED_SCALE
@@ -250,6 +251,12 @@ pub(in crate::candidate_app) fn write(
         }
         (K::GRID_BORDER_WIDTH, Value::Number(_)) if state.gallery.mode == GalleryKind::Wall => {
             state.gallery.wall.border_width = Some((number.unwrap() / 1.0))
+        }
+        (K::DEPTH_STAGE_X, Value::Number(_)) => {
+            state.gallery.depth.offset_x = number.unwrap() / 100.0
+        }
+        (K::DEPTH_STAGE_Y, Value::Number(_)) => {
+            state.gallery.depth.offset_y = number.unwrap() / 100.0
         }
         (K::SLICE_STAGE_X, Value::Number(_)) => {
             state.gallery.slices.offset_x = number.unwrap() / 100.0

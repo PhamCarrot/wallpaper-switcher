@@ -1,12 +1,28 @@
 //! Ordinary-mode current presentation. Catalog, clock, worker and atlas stay app-owned.
-use super::gallery::{
-    poster_slot_matches_source, poster_source_for_item, prioritized_poster_indices,
-};
+use super::gallery::{poster_media_for_item, poster_slot_matches_source};
 use super::*;
 use candidate_state::mode_profiles::{SlicesProfileSnapshot, Snapshot};
 use donor_scene::{CardPresentation, CardReadiness, LaunchAnimation, SurfacePayload};
 use gpu_gallery::SliceCard;
 use view::settings::composed::SettingsSource;
+
+/// Rebuilt by the existing catalog/filter owners, never by a motion tick.
+#[derive(Debug, Clone)]
+pub(super) struct PresentationInputs {
+    revision: u64,
+    pub ids: Arc<[String]>,
+    pub aspects: Arc<[f32]>,
+    positions: Arc<HashMap<usize, usize>>,
+}
+
+fn id_positions(ids: &[String]) -> Arc<HashMap<String, usize>> {
+    Arc::new(
+        ids.iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect(),
+    )
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SceneMotion {
@@ -14,6 +30,8 @@ pub(super) struct SceneMotion {
     layout_reveal: GalleryMotionState,
     inset: GalleryMotionState,
     inset_ms: f32,
+    settings_opacity: GalleryMotionState,
+    playlist_opacity: GalleryMotionState,
     pub generation: u64,
 }
 
@@ -24,6 +42,8 @@ impl Default for SceneMotion {
             layout_reveal: GalleryMotionState::absolute_camera(1.0, 1.0, 250.0, 100.0, 1.0),
             inset: GalleryMotionState::source(0.0, 0.0, 250.0, 1.0),
             inset_ms: 250.0,
+            settings_opacity: GalleryMotionState::absolute_camera(0.0, 0.0, 0.0, 100.0, 1.0),
+            playlist_opacity: GalleryMotionState::absolute_camera(0.0, 0.0, 0.0, 100.0, 1.0),
             generation: 0,
         }
     }
@@ -62,19 +82,59 @@ impl SceneMotion {
         self.layout_reveal = GalleryMotionState::absolute_camera(0.0, 1.0, duration, 100.0, 1.0);
     }
 
+    fn retarget_overlays(&mut self, settings: bool, playlist: bool, duration: f32) -> bool {
+        let mut changed = false;
+        for (motion, open) in [
+            (&mut self.settings_opacity, settings),
+            (&mut self.playlist_opacity, playlist),
+        ] {
+            let target = f32::from(open);
+            if motion.target != target || (duration <= 0.0 && !motion.settled()) {
+                let current = motion.value().clamp(0.0, 1.0);
+                let from = if duration <= 0.0 || (open && current <= 0.0) {
+                    target
+                } else {
+                    current
+                };
+                *motion = GalleryMotionState::absolute_camera(from, target, duration, 100.0, 1.0);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub(super) fn settings_opacity(self) -> f32 {
+        self.settings_opacity.value().clamp(0.0, 1.0)
+    }
+
+    pub(super) fn playlist_opacity(self) -> f32 {
+        self.playlist_opacity.value().clamp(0.0, 1.0)
+    }
+
     pub fn tick(&mut self, dt: f32) -> bool {
         let fading = self.visibility.tick(dt);
         let revealing = self.layout_reveal.tick(dt);
-        self.inset.tick(dt) || fading || revealing
+        let settings = self.settings_opacity.tick(dt);
+        let playlist = self.playlist_opacity.tick(dt);
+        self.inset.tick(dt) || fading || revealing || settings || playlist
     }
 
     pub fn settle(&mut self) {
         self.retarget(self.visibility.target == 1.0, self.inset.target, 0.0, 0.0);
+        self.retarget_overlays(
+            self.settings_opacity.target == 1.0,
+            self.playlist_opacity.target == 1.0,
+            0.0,
+        );
         self.layout_reveal = GalleryMotionState::absolute_camera(1.0, 1.0, 0.0, 100.0, 1.0);
     }
 
     pub fn unsettled(self) -> bool {
-        !self.visibility.settled() || !self.inset.settled() || !self.layout_reveal.settled()
+        !self.visibility.settled()
+            || !self.inset.settled()
+            || !self.layout_reveal.settled()
+            || !self.settings_opacity.settled()
+            || !self.playlist_opacity.settled()
     }
 
     pub fn opacity(self) -> f32 {
@@ -95,12 +155,18 @@ impl SceneMotion {
 #[derive(Debug, Clone)]
 pub(super) struct GalleryPresentation {
     pub ids: Arc<[String]>,
+    positions: Arc<HashMap<String, usize>>,
+    layout: std::cell::RefCell<Option<Arc<SliceLayoutWindow>>>,
     pub selected: String,
     pub hover: Option<String>,
     pub camera: GalleryMotionState,
     pub widths: HashMap<String, GalleryMotionState>,
     pub selection: HashMap<String, GalleryMotionState>,
     pub slices: SlicesProfileSnapshot,
+    visible_count: f32,
+    style_from: Option<(bool, bool, bool, u64)>,
+    parallax: GalleryMotionState,
+    style_progress: f32,
     rounding: f32,
     pub target: SlicesProfileSnapshot,
     pub viewport: [f32; 2],
@@ -109,24 +175,34 @@ pub(super) struct GalleryPresentation {
     pub launch: LaunchAnimation,
 }
 
+#[derive(Debug)]
+struct SliceLayoutWindow {
+    narrow: f32,
+    spacing: f32,
+    starts: Vec<f32>,
+}
+
 fn layout_width(width: f32, skew: f32) -> f32 {
     (width - skew.abs()).max(1.0)
 }
 
 impl GalleryPresentation {
     pub fn new(
-        ids: Vec<String>,
+        ids: impl Into<Arc<[String]>>,
         selected: String,
         mut p: SlicesProfileSnapshot,
         viewport: [f32; 2],
         duration: f32,
     ) -> Self {
+        let ids = ids.into();
         // beta.24 clamps the effective getter, preserving configured legacy values.
         p.wobble_strength = p.wobble_strength.clamp(0.0, 2.0);
         let position = ids.iter().position(|id| *id == selected).unwrap_or(0);
         let center = position as f32 * (layout_width(p.width, p.skew_distance) + p.spacing)
             + layout_width(p.expanded_width, p.skew_distance) * 0.5;
         Self {
+            layout: Default::default(),
+            positions: id_positions(&ids),
             ids: ids.into(),
             selected,
             hover: None,
@@ -139,6 +215,10 @@ impl GalleryPresentation {
             widths: HashMap::new(),
             selection: HashMap::new(),
             slices: p.clone(),
+            visible_count: p.visible_count.max(1) as f32,
+            style_from: None,
+            parallax: parallax_motion(f32::from(p.parallax), p.parallax, duration),
+            style_progress: 1.0,
             rounding: f32::from(p.round_corners),
             target: p,
             viewport,
@@ -150,27 +230,40 @@ impl GalleryPresentation {
 
     pub fn sync(
         &mut self,
-        ids: Vec<String>,
+        ids: impl Into<Arc<[String]>>,
         selected: String,
         mut p: SlicesProfileSnapshot,
         viewport: [f32; 2],
         duration: f32,
     ) -> bool {
+        let ids = ids.into();
         p.wobble_strength = p.wobble_strength.clamp(0.0, 2.0);
-        let geometry = self.target != p || self.viewport != viewport;
+        let anchor = !Arc::ptr_eq(&self.ids, &ids) && self.ids != ids;
+        let mut current_geometry = self.target.clone();
+        current_geometry.parallax = p.parallax;
+        let geometry = current_geometry != p || self.viewport != viewport;
+        let target_style = (p.wobble, p.shadows, p.round_corners, p.visible_count.max(1));
+        let current_style = self.style_values();
+        let style_changed = current_style != target_style;
         let changed = geometry
-            || self.ids.as_ref() != ids.as_slice()
+            || anchor
             || self.selected != selected
-            || self.duration != duration;
+            || self.duration != duration
+            || self.parallax.target != f32::from(p.parallax);
         if !changed {
+            self.ids = ids;
             return false;
         }
-        let anchor = self.ids.as_ref() != ids.as_slice();
-        self.widths.retain(|id, _| ids.contains(id));
-        self.selection.retain(|id, _| ids.contains(id));
+        if anchor {
+            self.positions = id_positions(&ids);
+            *self.layout.borrow_mut() = None;
+            self.widths.retain(|id, _| self.positions.contains_key(id));
+            self.selection
+                .retain(|id, _| self.positions.contains_key(id));
+        }
         if self.selected != selected {
             for (id, was_selected) in [(self.selected.clone(), true), (selected.clone(), false)] {
-                if !ids.contains(&id) {
+                if !self.positions.contains_key(&id) {
                     continue;
                 }
                 self.widths.entry(id.clone()).or_insert_with(|| {
@@ -212,14 +305,50 @@ impl GalleryPresentation {
             }
         }
         if anchor {
-            self.ids = ids.into();
+            self.ids = ids;
         }
         self.selected = selected;
+        if self.parallax.target != f32::from(p.parallax) || self.duration != duration {
+            self.parallax = parallax_motion(self.parallax.value(), p.parallax, duration);
+        }
         self.target = p;
         self.viewport = viewport;
         self.duration = duration;
+        if style_changed {
+            self.style_from = Some(current_style);
+            self.style_progress = 0.0;
+        }
         self.retarget(anchor || geometry);
         true
+    }
+
+    fn style_values(&self) -> (bool, bool, bool, u64) {
+        let target = (
+            self.target.wobble,
+            self.target.shadows,
+            self.target.round_corners,
+            self.target.visible_count.max(1),
+        );
+        if let Some(from) = self.style_from {
+            if self.style_progress < 0.5 {
+                return (from.0, from.1, from.2, self.visible_count.round() as u64);
+            }
+            return target;
+        }
+        (
+            self.slices.wobble,
+            self.slices.shadows,
+            self.slices.round_corners,
+            self.visible_count.round() as u64,
+        )
+    }
+
+    fn render_wobble(&self) -> bool {
+        self.style_values().0
+    }
+
+    pub(super) fn render_shadows(&self) -> bool {
+        self.style_values().1
     }
 
     fn retarget(&mut self, anchor: bool) {
@@ -235,11 +364,7 @@ impl GalleryPresentation {
         for (id, spring) in &mut self.selection {
             spring.retarget_source(f32::from(*id == self.selected));
         }
-        let position = self
-            .ids
-            .iter()
-            .position(|id| *id == self.selected)
-            .unwrap_or(0);
+        let position = self.positions.get(&self.selected).copied().unwrap_or(0);
         let target = position as f32 * (layout_width(p.width, p.skew_distance) + p.spacing)
             + layout_width(p.expanded_width, p.skew_distance) * 0.5;
         self.camera.set_zeta(if p.wobble { 0.45 } else { 1.0 });
@@ -256,9 +381,32 @@ impl GalleryPresentation {
     }
 
     pub fn tick(&mut self, dt: f32) -> bool {
-        let morphing = morph_slices(&mut self.slices, &self.target, dt, self.duration);
+        let morphing = morph_slices(
+            &mut self.slices,
+            &mut self.visible_count,
+            &self.target,
+            dt,
+            self.duration,
+        );
+        let style_moving = if self.style_from.is_some() {
+            let k = 1.0 - (-dt.min(0.05) * 1000.0 / (self.duration / 4.0).max(1.0)).exp();
+            self.style_progress += (1.0 - self.style_progress) * k;
+            if self.style_progress >= 0.995 {
+                self.style_progress = 1.0;
+                self.slices.wobble = self.target.wobble;
+                self.slices.shadows = self.target.shadows;
+                self.slices.round_corners = self.target.round_corners;
+                self.visible_count = self.target.visible_count.max(1) as f32;
+                self.style_from = None;
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
         self.retarget(morphing);
-        let mut moving = self.camera.tick(dt) || morphing;
+        let mut moving = self.camera.tick(dt) || morphing || style_moving;
         let rounding = f32::from(self.target.round_corners);
         if (self.rounding - rounding).abs() > 1e-5 {
             self.rounding = crate::donor_folio::source_ui::motion::approach(
@@ -271,7 +419,10 @@ impl GalleryPresentation {
         } else {
             self.rounding = rounding;
         }
-        moving |= self.entrance.tick(dt);
+        moving |= self.entrance.tick(dt) | self.parallax.tick(dt);
+        if self.parallax.settled() {
+            self.slices.parallax = self.target.parallax;
+        }
         for spring in self.widths.values_mut().chain(self.selection.values_mut()) {
             moving |= spring.tick(dt);
         }
@@ -285,6 +436,14 @@ impl GalleryPresentation {
 
     pub fn settle(&mut self) {
         self.slices = self.target.clone();
+        self.parallax = parallax_motion(
+            f32::from(self.target.parallax),
+            self.target.parallax,
+            self.duration,
+        );
+        self.visible_count = self.target.visible_count.max(1) as f32;
+        self.style_from = None;
+        self.style_progress = 1.0;
         self.rounding = f32::from(self.target.round_corners);
         self.widths.clear();
         self.selection.clear();
@@ -297,18 +456,80 @@ impl GalleryPresentation {
         [center, available]: [f32; 2],
     ) -> Vec<(SliceCard, f32, bool, [f32; 4], SurfacePayload)> {
         let p = &self.slices;
+        let wobble = self.render_wobble();
+        let visible_count = self.visible_count.max(1.0);
         let stride = layout_width(p.width, p.skew_distance) + p.spacing;
         let strip = (layout_width(p.expanded_width, p.skew_distance)
-            + p.visible_count.saturating_sub(1) as f32 * stride)
+            + (visible_count - 1.0).max(0.0) * stride)
             .min(available - 40.0)
             .max(1.0);
         let half = strip * 0.5;
         let cx = center + self.viewport[0] * p.offset_x * 0.5;
         // Source TOP_BAR=50, 60px chrome and 15px inset place the body 10px below center.
         let cy = self.viewport[1] * (0.5 + p.offset_y * 0.5) + 10.0;
-        let mut acc = 0.0;
+        let current = self.positions.get(&self.selected).copied().unwrap_or(0);
+        // All but the sparse selection springs share one stride. Keep dynamic
+        // widths separate from the immutable ID index and visit only the window.
+        let narrow = layout_width(p.width.max(1.0), p.skew_distance);
+        let mut layout = self.layout.borrow_mut();
+        if layout.as_ref().is_none_or(|c| {
+            c.narrow != narrow || c.spacing != p.spacing || c.starts.len() != self.ids.len()
+        }) {
+            // Preserve the source's accumulated f32 strip positions once, rather
+            // than introducing an index*stride drift on large fractional layouts.
+            let mut acc = 0.0;
+            let starts = (0..self.ids.len())
+                .map(|_| {
+                    let x = acc;
+                    acc += narrow + p.spacing;
+                    x
+                })
+                .collect();
+            donor_layout::layout_work(1, self.ids.len());
+            *layout = Some(Arc::new(SliceLayoutWindow {
+                narrow,
+                spacing: p.spacing,
+                starts,
+            }));
+        }
+        let layout = layout.as_ref().unwrap();
+        let mut changes: Vec<_> = self
+            .widths
+            .iter()
+            .filter_map(|(id, spring)| {
+                self.positions.get(id).map(|&i| {
+                    (
+                        i,
+                        layout_width(spring.value().max(1.0), p.skew_distance) - narrow,
+                    )
+                })
+            })
+            .collect();
+        if !self.widths.contains_key(&self.selected) && self.positions.contains_key(&self.selected)
+        {
+            changes.push((
+                current,
+                layout_width(p.expanded_width.max(1.0), p.skew_distance) - narrow,
+            ));
+        }
+        changes.sort_by_key(|c| c.0);
+        let padding = changes.iter().map(|c| c.1.abs()).sum::<f32>() + narrow + 1.0;
+        let window = donor_layout::monotone_window(
+            self.ids.len(),
+            |i| layout.starts[i],
+            self.camera.value() - half * 1.2 - padding,
+            self.camera.value() + half * 1.2 + padding,
+        );
+        let mut acc = layout.starts.get(window.start).copied().unwrap_or(0.0)
+            + changes
+                .iter()
+                .filter(|c| c.0 < window.start)
+                .map(|c| c.1)
+                .sum::<f32>();
+        donor_layout::layout_work(2, window.len());
         let mut cards = Vec::new();
-        for (index, id) in self.ids.iter().enumerate() {
+        for index in window {
+            let id = &self.ids[index];
             let selected = *id == self.selected;
             let width = self
                 .widths
@@ -358,7 +579,7 @@ impl GalleryPresentation {
                 .get(id)
                 .map_or(f32::from(selected), |s| s.value())
                 .clamp(0.0, 1.0);
-            let payload = if p.wobble {
+            let payload = if wobble {
                 SurfacePayload::Wobble {
                     pad: 1.05 + 0.30 * p.wobble_strength.max(1.0),
                     bend: (self.camera.velocity / (p.expanded_width * 2.2).max(1.0))
@@ -377,11 +598,6 @@ impl GalleryPresentation {
                 payload,
             ));
         }
-        let current = self
-            .ids
-            .iter()
-            .position(|id| *id == self.selected)
-            .unwrap_or(0);
         cards.sort_by_key(|(card, _, hover, _, _)| {
             if card.selected {
                 i64::MAX
@@ -397,6 +613,7 @@ impl GalleryPresentation {
 
 fn morph_slices(
     current: &mut SlicesProfileSnapshot,
+    visible_count: &mut f32,
     target: &SlicesProfileSnapshot,
     dt: f32,
     duration: f32,
@@ -429,11 +646,12 @@ fn morph_slices(
             *v = t;
         }
     }
-    current.visible_count = target.visible_count;
-    current.wobble = target.wobble;
-    current.shadows = target.shadows;
-    current.parallax = target.parallax;
-    current.round_corners = target.round_corners;
+    if (*visible_count - target.visible_count.max(1) as f32).abs() > 0.01 {
+        *visible_count += (target.visible_count.max(1) as f32 - *visible_count) * k;
+        moving = true;
+    } else {
+        *visible_count = target.visible_count.max(1) as f32;
+    }
     moving
 }
 
@@ -452,6 +670,34 @@ pub(super) fn launch_entrance(
 }
 
 impl GpuCandidate {
+    pub(super) fn presentation_inputs(&mut self) -> PresentationInputs {
+        let revision = self.catalog_generation.load(Ordering::Acquire);
+        if self
+            .presentation_inputs
+            .as_ref()
+            .is_none_or(|p| p.revision != revision)
+        {
+            donor_layout::layout_work(0, self.filtered_indices.len());
+            self.presentation_inputs = Some(PresentationInputs {
+                revision,
+                ids: self
+                    .filtered_indices
+                    .iter()
+                    .filter_map(|i| self.wallpapers.get(*i).map(|w| w.id.clone()))
+                    .collect(),
+                aspects: filtered_poster_aspects(&self.catalog, &self.filtered_indices).into(),
+                positions: Arc::new(
+                    self.filtered_indices
+                        .iter()
+                        .enumerate()
+                        .map(|(p, &i)| (i, p))
+                        .collect(),
+                ),
+            });
+        }
+        self.presentation_inputs.as_ref().unwrap().clone()
+    }
+
     pub(super) fn sync_gallery_presentation(&mut self) -> bool {
         if self.gallery_mode == GalleryMode::Wall {
             return self.sync_wall_presentation();
@@ -465,11 +711,7 @@ impl GpuCandidate {
         let Snapshot::Slices(p) = view::settings::profile_projection::capture(self) else {
             return false;
         };
-        let ids: Vec<_> = self
-            .filtered_indices
-            .iter()
-            .filter_map(|i| self.wallpapers.get(*i).map(|w| w.id.clone()))
-            .collect();
+        let ids = self.presentation_inputs().ids;
         let selected = self
             .selected
             .and_then(|i| self.wallpapers.get(i))
@@ -541,12 +783,17 @@ impl GpuCandidate {
         } else {
             (0.0, 0.0)
         };
+        let overlay_changed = self.scene_motion.retarget_overlays(
+            self.visible && self.panel_state.settings_open,
+            self.visible && self.playlist_panel_open,
+            inset_ms,
+        );
         let changed = self
             .scene_motion
             .retarget(visible, inset, fade_ms, inset_ms);
         let interrupted = self.scene_motion.unsettled()
             && self.scene_motion.generation != self.motion_generation.load(Ordering::Acquire);
-        if self.visible && (changed || interrupted) {
+        if self.visible && (changed || overlay_changed || interrupted) {
             self.start_motion(0.0);
             self.rebuild_depth_frame();
         }
@@ -601,14 +848,16 @@ impl GpuCandidate {
 
     /// One current frame supplies the snapshot and the poster requester.
     pub(super) fn ordinary_base_frame(&self) -> Vec<CardPresentation> {
-        self.ordinary_base_frame_with_source_selector(poster_source_for_item)
+        self.ordinary_base_frame_with_source_selector(poster_media_for_item)
     }
 
     pub(super) fn ordinary_base_frame_with_source_selector(
         &self,
-        mut select_source: impl FnMut(&WallpaperItem) -> std::path::PathBuf,
+        mut select_source: impl FnMut(&WallpaperItem) -> (std::path::PathBuf, poster_worker::PosterKind),
     ) -> Vec<CardPresentation> {
         let slices = self.gallery_mode == GalleryMode::Slices;
+        let wall_params = (self.gallery_mode == GalleryMode::Wall)
+            .then(|| gallery_layout_params_for_app(self).wall);
         let fallback = if slices && self.gallery_presentation.is_none() {
             let Snapshot::Slices(p) = view::settings::profile_projection::capture(self) else {
                 unreachable!()
@@ -645,7 +894,7 @@ impl GpuCandidate {
             self.wall_presentation
                 .as_ref()
                 .unwrap()
-                .cards(self.viewport, gallery_layout_params_for_app(self).wall)
+                .cards(self.viewport, wall_params.unwrap())
         } else {
             gpu_gallery::layout_gallery_with_aspects(
                 self.gallery_mode,
@@ -687,11 +936,11 @@ impl GpuCandidate {
                     radii = radii.map(|v| v * k);
                 }
             }
-            let source = select_source(wallpaper);
+            let (source, kind) = select_source(wallpaper);
             let poster = self
                 .poster_slots
                 .get(&index)
-                .filter(|s| poster_slot_matches_source(s, wallpaper, &source))
+                .filter(|s| poster_slot_matches_source(s, wallpaper, &source, kind))
                 .and_then(|s| {
                     self.posters
                         .iter()
@@ -709,7 +958,8 @@ impl GpuCandidate {
             let mut crop = donor_scene::poster_crop_uv(card.poster_aspect_ratio, card.size);
             if slices {
                 let p = &slice_state.unwrap().slices;
-                if p.parallax {
+                let weight = slice_state.unwrap().parallax.value().clamp(0.0, 1.0);
+                if weight > 0.0 {
                     let [center, available] = self.gallery_composition();
                     let cx = center + self.viewport[0] * p.offset_x * 0.5;
                     let half = (layout_width(p.expanded_width, p.skew_distance)
@@ -718,32 +968,36 @@ impl GpuCandidate {
                         .min(available - 40.0)
                         .max(1.0)
                         * 0.5;
-                    crop = position_crop(
+                    let enabled = position_crop(
                         card.poster_aspect_ratio,
                         crop,
                         (card.center[0] - cx) / (half * 1.2).max(1.0),
                         1.4,
                     );
+                    crop = blend_crop(crop, enabled, weight);
                 }
             }
             if self.gallery_mode == GalleryMode::Geometric {
                 if let Some(p) = &self.hex_presentation {
-                    if p.parallax {
+                    let disabled = position_crop(card.poster_aspect_ratio, crop, 0.0, 1.3);
+                    let weight = p.parallax.value().clamp(0.0, 1.0);
+                    crop = if weight > 0.0 {
                         let center = p.center_x();
                         let span = if card.center[0] < center {
                             center
                         } else {
                             self.viewport[0] - center
                         };
-                        crop = position_crop(
+                        let enabled = position_crop(
                             card.poster_aspect_ratio,
                             crop,
                             (card.center[0] - center) / (span + card.size[0] * 0.5).max(1.0),
                             1.4,
                         );
+                        blend_crop(disabled, enabled, weight)
                     } else {
-                        crop = position_crop(card.poster_aspect_ratio, crop, 0.0, 1.3);
-                    }
+                        disabled
+                    };
                 }
             }
             if card.selected && (self.detail_open || self.detail_progress > 0.001) {
@@ -755,7 +1009,8 @@ impl GpuCandidate {
             });
             let readiness = if card.layer.is_some() {
                 CardReadiness::Ready
-            } else if queued && self.poster_loading {
+            } else if queued && self.poster_loading && !self.poster_failed_indices.contains(&index)
+            {
                 CardReadiness::Loading
             } else {
                 CardReadiness::Unavailable
@@ -778,14 +1033,10 @@ impl GpuCandidate {
                 source_style: slices,
                 hex_style: self.gallery_mode == GalleryMode::Geometric
                     && self.hex_presentation.is_some(),
-                wall_border: (self.gallery_mode == GalleryMode::Wall).then_some((
-                    selection,
-                    gallery_layout_params_for_app(self).wall.border_width,
-                )),
-                shadows: (slices && slice_state.is_some_and(|p| p.slices.shadows))
+                wall_border: wall_params.map(|p| (selection, p.border_width)),
+                shadows: (slices && slice_state.is_some_and(|p| p.render_shadows()))
                     || (self.gallery_mode == GalleryMode::Geometric && selection > 0.01),
-                loading_eligible: self.gallery_mode == GalleryMode::Wall
-                    && wallpaper.source != WallpaperSource::LocalVideo,
+                loading_eligible: wallpaper.source != WallpaperSource::LocalVideo,
                 entrance: if self.gallery_mode == GalleryMode::Geometric {
                     self.hex_presentation
                         .as_ref()
@@ -813,7 +1064,12 @@ impl GpuCandidate {
         result
     }
 
+    #[cfg(test)]
     pub(super) fn ordinary_poster_indices(&self) -> Vec<usize> {
+        self.ordinary_poster_demand().0
+    }
+
+    pub(super) fn ordinary_poster_demand(&self) -> (Vec<usize>, usize) {
         let mut indices = Vec::new();
         let limit = gpu_gallery::ordinary_poster_limit();
         if let Some(card) = self.external_detail_card() {
@@ -827,19 +1083,75 @@ impl GpuCandidate {
                 indices.push(entry.card.index);
             }
         }
-        for index in prioritized_poster_indices(&self.filtered_indices, self.selected.unwrap_or(0))
-        {
-            let union: HashSet<_> = indices
-                .iter()
-                .copied()
-                .chain(self.gallery_pins().iter().map(|g| g.index))
-                .collect();
+        let visible = indices.len();
+        let (prefetch, request_limit) = match self.gallery_mode {
+            GalleryMode::Wall => (
+                self.wall_presentation
+                    .as_ref()
+                    .map_or_else(Vec::new, |wall| {
+                        wall.prefetch_indices(
+                            self.viewport,
+                            gallery_layout_params_for_app(self).wall,
+                        )
+                        .into_iter()
+                        .filter_map(|slot| self.filtered_indices.get(slot).copied())
+                        .collect()
+                    }),
+                limit,
+            ),
+            GalleryMode::Geometric => (
+                self.hex_presentation
+                    .as_ref()
+                    .map_or_else(Vec::new, |geometric| {
+                        geometric
+                            .prefetch_indices()
+                            .into_iter()
+                            .filter_map(|slot| self.filtered_indices.get(slot).copied())
+                            .collect()
+                    }),
+                limit,
+            ),
+            _ => {
+                let selected_position = self.presentation_inputs.as_ref().map_or_else(
+                    || {
+                        self.filtered_indices
+                            .iter()
+                            .position(|i| Some(*i) == self.selected)
+                            .unwrap_or(0)
+                    },
+                    |p| {
+                        self.selected
+                            .and_then(|i| p.positions.get(&i).copied())
+                            .unwrap_or(0)
+                    },
+                );
+                (
+                    gallery::prioritized_poster_indices_at(
+                        &self.filtered_indices,
+                        selected_position,
+                    ),
+                    limit.min(gpu_gallery::MAX_POSTERS),
+                )
+            }
+        };
+        let mut union: HashSet<_> = indices
+            .iter()
+            .copied()
+            .chain(self.gallery_pins().iter().map(|pin| pin.index))
+            .collect();
+        for index in prefetch {
+            if indices.len() >= request_limit {
+                break;
+            }
             if !union.contains(&index) && union.len() >= limit {
                 break;
             }
-            gallery::push_unique_poster_index(&mut indices, index);
+            if !indices.contains(&index) {
+                union.insert(index);
+                indices.push(index);
+            }
         }
-        indices
+        (indices, visible)
     }
 
     pub(super) fn ordinary_capacity_issue(&self) -> Option<String> {
@@ -874,6 +1186,72 @@ impl GpuCandidate {
 }
 
 /// Position operates within decoded content, never within square letterboxing.
+/// Rebase an interrupted layout on the visible cards. Indices belong to the
+/// unchanged presentation catalog; poster identity is resolved by the frame owner.
+pub(super) fn blend_layout_cards(
+    source: &[SliceCard],
+    destination: Vec<SliceCard>,
+    selected: usize,
+    amount: f32,
+) -> Vec<SliceCard> {
+    let mut by_index = std::collections::BTreeMap::new();
+    for &card in source {
+        by_index.entry(card.index).or_insert((None, None)).0 = Some(card);
+    }
+    for card in destination {
+        by_index.entry(card.index).or_insert((None, None)).1 = Some(card);
+    }
+    by_index
+        .into_iter()
+        .filter_map(|(index, pair)| {
+            let mut card = match pair {
+                (Some(mut old), Some(new)) => {
+                    for axis in 0..2 {
+                        old.center[axis] += (new.center[axis] - old.center[axis]) * amount;
+                        old.size[axis] += (new.size[axis] - old.size[axis]) * amount;
+                    }
+                    old.opacity += (new.opacity - old.opacity) * amount;
+                    old.corner_radius += (new.corner_radius - old.corner_radius) * amount;
+                    if amount >= 0.5 {
+                        old.shape = new.shape;
+                        old.triangle_direction = new.triangle_direction;
+                    }
+                    old
+                }
+                (Some(mut old), None) => {
+                    old.opacity *= 1.0 - amount;
+                    old
+                }
+                (None, Some(mut new)) => {
+                    new.opacity *= amount;
+                    new
+                }
+                (None, None) => return None,
+            };
+            card.selected = index == selected;
+            Some(card)
+        })
+        .collect()
+}
+
+pub(super) fn parallax_motion(value: f32, enabled: bool, duration_ms: f32) -> GalleryMotionState {
+    let target = f32::from(enabled);
+    let from = if duration_ms > 0.0 {
+        value.clamp(0.0, 1.0)
+    } else {
+        target
+    };
+    GalleryMotionState::absolute_camera(from, target, duration_ms, 1000.0, 1.0)
+}
+
+fn blend_crop(from: [f32; 4], to: [f32; 4], weight: f32) -> [f32; 4] {
+    if weight >= 1.0 {
+        to
+    } else {
+        std::array::from_fn(|index| from[index] + (to[index] - from[index]) * weight)
+    }
+}
+
 pub(super) fn position_crop(aspect: f32, crop: [f32; 4], position: f32, zoom: f32) -> [f32; 4] {
     let aspect = if aspect.is_finite() && aspect > 0.0 {
         aspect

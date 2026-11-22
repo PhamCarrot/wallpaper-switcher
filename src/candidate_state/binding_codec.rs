@@ -92,10 +92,29 @@ pub struct MouseSpec {
     pub button: MouseButton,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelDirection {
+    Up,
+    Down,
+}
+
+impl WheelDirection {
+    pub fn from_delta(delta: f32) -> Option<Self> {
+        (delta.is_finite() && delta != 0.0).then(|| if delta > 0.0 { Self::Up } else { Self::Down })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WheelSpec {
+    pub mods: Mods,
+    pub direction: WheelDirection,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Trigger {
     Key(KeySpec),
     Mouse(MouseSpec),
+    Wheel(WheelSpec),
 }
 
 pub const UNBOUND: &str = "none";
@@ -142,6 +161,14 @@ impl Trigger {
         };
         if let Some(button) = button {
             return Some(Self::Mouse(MouseSpec { mods, button }));
+        }
+        let wheel = match *last {
+            "wheel-up" => Some(WheelDirection::Up),
+            "wheel-down" => Some(WheelDirection::Down),
+            _ => None,
+        };
+        if let Some(direction) = wheel {
+            return Some(Self::Wheel(WheelSpec { mods, direction }));
         }
         let id = match *last {
             "left" => KeyId::Left,
@@ -203,6 +230,13 @@ impl Trigger {
                     MouseButton::Middle => "Middle-click",
                 });
             }
+            Self::Wheel(spec) => {
+                spec.mods.label(&mut output);
+                output.push_str(match spec.direction {
+                    WheelDirection::Up => "Wheel up",
+                    WheelDirection::Down => "Wheel down",
+                });
+            }
         }
         output
     }
@@ -238,12 +272,19 @@ impl Trigger {
                     MouseButton::Middle => "middle-click",
                 });
             }
+            Self::Wheel(spec) => {
+                spec.mods.config(&mut output);
+                output.push_str(match spec.direction {
+                    WheelDirection::Up => "wheel-up",
+                    WheelDirection::Down => "wheel-down",
+                });
+            }
         }
         output
     }
 
     pub const fn is_mouse(&self) -> bool {
-        matches!(self, Self::Mouse(_))
+        matches!(self, Self::Mouse(_) | Self::Wheel(_))
     }
 }
 

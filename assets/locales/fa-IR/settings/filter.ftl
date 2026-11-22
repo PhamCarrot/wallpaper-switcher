@@ -1,7 +1,7 @@
 settings-filter-appearance-card = ظاهر
 settings-filter-appearance-card-desc = نوار فیلتر را با چیدمان هر انتخابگر هماهنگ کنید یا همه‌جا یک سبک را به کار ببرید.
 settings-filter-visual-style-label = سبک ظاهری
-settings-filter-visual-style-desc = «هماهنگ با انتخابگر» در برش‌ها و شنی نوار مورب، در هندسی نوار هندسی و در دیوار نوار صاف را به کار می‌برد.
+settings-filter-visual-style-desc = «هماهنگ با انتخابگر» در برش‌ها نوار مورب، در هندسی نوار هندسی و در دیوار نوار صاف را به کار می‌برد.
 settings-filter-visual-style-match = هماهنگ با انتخابگر
 settings-filter-visual-style-slices = برش‌ها
 settings-filter-visual-style-hex = هندسی

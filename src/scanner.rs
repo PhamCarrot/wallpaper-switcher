@@ -1,16 +1,98 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// I/O can overlap even on one core. An explicit 1 is useful for slow-storage comparisons.
+pub(crate) fn catalog_scan_threads(logical: usize, configured: Option<u8>) -> usize {
+    configured.map_or_else(
+        || if logical <= 1 { 2 } else { logical.clamp(4, 8) },
+        |threads| usize::from(threads).clamp(1, 8),
+    )
+}
+
+pub(crate) fn default_catalog_scan_threads() -> usize {
+    configured_catalog_scan_threads(None)
+}
+
+pub(crate) fn configured_catalog_scan_threads(configured: Option<u8>) -> usize {
+    catalog_scan_threads(crate::poster_worker::process_parallelism().0, configured)
+}
+
+/// Non-overlapping scan phases share this ceiling, including the calling worker.
+/// Claims are bounded; ordered gathering keeps discovery precedence independent of I/O timing.
+pub(crate) fn scan_ordered<T: Sync, R: Send>(
+    inputs: &[T],
+    threads: usize,
+    cancelled: &(dyn Fn() -> bool + Sync),
+    operation: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    let traced = crate::apply_trace::enabled();
+    let started = std::time::Instant::now();
+    let next = AtomicUsize::new(0);
+    let active = AtomicUsize::new(0);
+    let peak = AtomicUsize::new(0);
+    let work = || {
+        let mut results = Vec::new();
+        while !cancelled() {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            if index >= inputs.len() || cancelled() {
+                break;
+            }
+            if traced {
+                peak.fetch_max(
+                    active.fetch_add(1, Ordering::Relaxed) + 1,
+                    Ordering::Relaxed,
+                );
+            }
+            let result = operation(&inputs[index]);
+            if traced {
+                active.fetch_sub(1, Ordering::Relaxed);
+            }
+            if cancelled() {
+                break;
+            }
+            results.push((index, result));
+        }
+        results
+    };
+    let mut results = std::thread::scope(|scope| {
+        let handles: Vec<_> = (1..threads.clamp(1, 8).min(inputs.len()))
+            .filter_map(|_| {
+                // On thread allocation failure the remaining lanes still drain the claims.
+                std::thread::Builder::new()
+                    .name("catalog-io".into())
+                    .spawn_scoped(scope, &work)
+                    .ok()
+            })
+            .collect();
+        let mut results = work();
+        for handle in handles {
+            results.extend(handle.join().expect("catalog I/O worker panicked"));
+        }
+        results
+    });
+    let stopped = cancelled();
+    crate::apply_trace::event_lazy("catalog-io-phase", || {
+        format!("io_threads={} candidates={} completed={} peak_active={} cancelled={stopped} elapsed_us={}",
+            threads.clamp(1, 8), inputs.len(), results.len(), peak.load(Ordering::Relaxed), started.elapsed().as_micros())
+    });
+    if stopped {
+        return Vec::new();
+    }
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WallpaperSource {
     LocalImage,
     LocalVideo,
     WallpaperEngine,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WallpaperItem {
     pub id: String,
     pub title: String,
@@ -20,9 +102,156 @@ pub struct WallpaperItem {
     pub preview_path: Option<PathBuf>,
     pub wallpaper_type: String,
     pub source: WallpaperSource,
+    /// Captured by the scanner. None is reserved for synthetic/legacy callers.
+    pub scan_metadata: Option<ScanMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceStamp {
+    pub bytes: u64,
+    pub modified: Option<std::time::SystemTime>,
+}
+impl SourceStamp {
+    fn capture(path: &Path) -> Option<Self> {
+        let metadata = path.metadata().ok()?;
+        metadata.is_file().then(|| Self {
+            bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanMetadata {
+    pub tags: std::collections::BTreeSet<String>,
+    pub project: Option<SourceStamp>,
+    pub target: Option<SourceStamp>,
+    pub preview: Option<SourceStamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) video: Option<VideoStamp>,
+}
+
+/// Scheduling identity from a single open handle, including NTFS changes that
+/// preserve last-write time. A volume without this information cannot seed disk reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct VideoStamp {
+    bytes: u64,
+    modified: u64,
+    file: Option<VideoFileIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct VideoFileIdentity {
+    volume: u64,
+    id: [u8; 16],
+    changed: i64,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static VIDEO_STAMP_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl VideoStamp {
+    pub(crate) fn capture(path: &Path) -> Option<Self> {
+        #[cfg(test)]
+        VIDEO_STAMP_READS.with(|reads| reads.set(reads.get() + 1));
+        use std::os::windows::{
+            fs::{MetadataExt, OpenOptionsExt},
+            io::AsRawHandle,
+        };
+        use windows_sys::Win32::{Foundation::HANDLE, Storage::FileSystem::*};
+        let file = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(path)
+            .ok()?;
+        let handle = file.as_raw_handle() as HANDLE;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        let mut basic = std::mem::MaybeUninit::<FILE_BASIC_INFO>::uninit();
+        let mut id = std::mem::MaybeUninit::<FILE_ID_INFO>::uninit();
+        let identity = unsafe {
+            if GetFileInformationByHandleEx(
+                handle,
+                FileBasicInfo,
+                basic.as_mut_ptr().cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            ) != 0
+                && GetFileInformationByHandleEx(
+                    handle,
+                    FileIdInfo,
+                    id.as_mut_ptr().cast(),
+                    std::mem::size_of::<FILE_ID_INFO>() as u32,
+                ) != 0
+            {
+                let basic = basic.assume_init();
+                let id = id.assume_init();
+                (basic.ChangeTime > 0 && id.FileId.Identifier != [0; 16]).then_some(
+                    VideoFileIdentity {
+                        volume: id.VolumeSerialNumber,
+                        id: id.FileId.Identifier,
+                        changed: basic.ChangeTime,
+                    },
+                )
+            } else {
+                None
+            }
+        };
+        Some(Self {
+            bytes: metadata.len(),
+            modified: metadata.last_write_time(),
+            file: identity,
+        })
+    }
+
+    pub(crate) fn matches(&self, path: &Path) -> bool {
+        Self::capture(path) == Some(*self)
+    }
+
+    pub(crate) fn cacheable(&self) -> bool {
+        self.file.is_some()
+    }
 }
 
 impl WallpaperItem {
+    fn capture_metadata(&mut self, tags: std::collections::BTreeSet<String>) {
+        self.scan_metadata = Some(ScanMetadata {
+            tags,
+            project: SourceStamp::capture(&self.project_json_path),
+            target: SourceStamp::capture(&self.file_target),
+            preview: self.preview_path.as_deref().and_then(SourceStamp::capture),
+            video: self
+                .poster_video_path()
+                .and_then(|path| VideoStamp::capture(path)),
+        });
+    }
+
+    pub(crate) fn poster_video_path(&self) -> Option<&PathBuf> {
+        if self.source == WallpaperSource::LocalVideo {
+            return Some(&self.file_target);
+        }
+        if self.source == WallpaperSource::WallpaperEngine {
+            return self.preview_path.as_ref().filter(|path| {
+                is_supported_video(path)
+                    && (*path != &self.file_target
+                        || self.wallpaper_type.eq_ignore_ascii_case("video"))
+            });
+        }
+        None
+    }
+
+    pub(crate) fn video_stamp(&self) -> Option<VideoStamp> {
+        match &self.scan_metadata {
+            Some(metadata) => metadata.video,
+            // Synthetic callers have no scanner snapshot. Only resolve this on
+            // submission, after the unchanged-demand return.
+            None => self
+                .poster_video_path()
+                .and_then(|path| VideoStamp::capture(path)),
+        }
+    }
     pub fn engine_target(&self) -> &Path {
         if self.source == WallpaperSource::WallpaperEngine
             && self.wallpaper_type.eq_ignore_ascii_case("scene")
@@ -42,6 +271,7 @@ struct ProjectJson {
     #[serde(rename = "type")]
     wp_type: Option<String>,
     category: Option<String>,
+    tags: Option<serde_json::Value>,
 }
 
 fn find_steam_registry_path() -> Option<PathBuf> {
@@ -130,7 +360,12 @@ fn parse_libraryfolders_vdf(vdf_path: &std::path::Path, libraries: &mut Vec<Path
     }
 }
 
-fn find_steam_libraries() -> Vec<PathBuf> {
+fn find_steam_libraries() -> &'static [PathBuf] {
+    static LIBRARIES: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+    LIBRARIES.get_or_init(discover_steam_libraries)
+}
+
+fn discover_steam_libraries() -> Vec<PathBuf> {
     let mut libraries = Vec::new();
 
     for root in [
@@ -156,12 +391,29 @@ fn find_steam_libraries() -> Vec<PathBuf> {
 }
 
 pub fn wallpaper_engine_install_dir() -> Option<PathBuf> {
-    find_steam_libraries().into_iter().find_map(|library| {
+    find_steam_libraries().iter().find_map(|library| {
         let directory = library
             .join("steamapps")
             .join("common")
             .join("wallpaper_engine");
         directory.is_dir().then_some(directory)
+    })
+}
+
+pub(crate) fn known_wallpaper_engine_executable(executable: &Path) -> bool {
+    let Some(parent) = executable
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+    else {
+        return false;
+    };
+    find_steam_libraries().iter().any(|library| {
+        library
+            .join("steamapps")
+            .join("common")
+            .join("wallpaper_engine")
+            .canonicalize()
+            .is_ok_and(|directory| directory == parent)
     })
 }
 
@@ -184,37 +436,104 @@ pub fn scan_wallpapers(include_default_projects: bool) -> Vec<WallpaperItem> {
 
 fn scan_wallpapers_until(
     include_default_projects: bool,
-    cancelled: &dyn Fn() -> bool,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Vec<WallpaperItem> {
-    let mut items = Vec::new();
-    let mut seen_ids = std::collections::HashSet::new();
+    scan_wallpapers_from_libraries_until(
+        find_steam_libraries(),
+        include_default_projects,
+        cancelled,
+    )
+}
 
-    let mut search_dirs = Vec::new();
-    for lib in find_steam_libraries() {
-        let ws = lib
-            .join("steamapps")
-            .join("workshop")
-            .join("content")
-            .join("431960");
-        if ws.exists() {
-            search_dirs.push(ws);
-        }
-        let we_projects = lib
-            .join("steamapps")
-            .join("common")
-            .join("wallpaper_engine")
-            .join("projects");
-        if we_projects.exists() {
-            search_dirs.push(we_projects.join("myprojects"));
-            if include_default_projects {
-                search_dirs.push(we_projects.join("defaultprojects"));
-            }
+pub(crate) fn scan_wallpapers_from_libraries_until(
+    libraries: &[PathBuf],
+    include_default_projects: bool,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Vec<WallpaperItem> {
+    scan_project_roots(
+        &engine_catalog_roots(libraries, include_default_projects),
+        default_catalog_scan_threads(),
+        cancelled,
+        &read_project,
+    )
+}
+
+/// Keep absent roots: the watcher must poll when a subscription root is not yet present.
+pub(crate) fn engine_catalog_roots(libraries: &[PathBuf], defaults: bool) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for lib in libraries {
+        roots.push(lib.join("steamapps/workshop/content/431960"));
+        let projects = lib.join("steamapps/common/wallpaper_engine/projects");
+        roots.push(projects.join("myprojects"));
+        if defaults {
+            roots.push(projects.join("defaultprojects"));
         }
     }
+    roots
+}
+
+pub(crate) fn catalog_watch_roots(local: &[PathBuf], defaults: bool) -> Vec<PathBuf> {
+    let mut roots = local.to_vec();
+    roots.extend(engine_catalog_roots(find_steam_libraries(), defaults));
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+struct Utf8Reader<R> {
+    reader: R,
+    tail: Vec<u8>,
+}
+impl<R: std::io::Read> std::io::Read for Utf8Reader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        let count = self.reader.read(buffer)?;
+        let chunk = if self.tail.is_empty() {
+            &buffer[..count]
+        } else {
+            self.tail.extend_from_slice(&buffer[..count]);
+            self.tail.as_slice()
+        };
+        let remaining = match std::str::from_utf8(chunk) {
+            Ok(_) => 0,
+            Err(error) if count > 0 && error.error_len().is_none() => {
+                chunk.len() - error.valid_up_to()
+            }
+            Err(error) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        };
+        if remaining == 0 {
+            self.tail.clear();
+        } else {
+            self.tail = chunk[chunk.len() - remaining..].to_vec();
+        }
+        Ok(count)
+    }
+}
+
+fn read_project(path: &Path) -> Option<ProjectJson> {
+    // Avoid one whole-file UTF-8 buffer per lane. Owned JSON fields still scale with
+    // metadata size; no new size limit rejects previously supported projects.
+    // serde_json skips UTF-8 validation in ignored fields; retain read_to_string's rule.
+    let reader = Utf8Reader {
+        reader: fs::File::open(path).ok()?,
+        tail: Vec::new(),
+    };
+    serde_json::from_reader(std::io::BufReader::new(reader)).ok()
+}
+
+fn scan_project_roots(
+    search_dirs: &[PathBuf],
+    threads: usize,
+    cancelled: &(dyn Fn() -> bool + Sync),
+    parse: &(dyn Fn(&Path) -> Option<ProjectJson> + Sync),
+) -> Vec<WallpaperItem> {
+    let mut candidates = Vec::new();
 
     for dir in search_dirs {
         if cancelled() {
-            return items;
+            return Vec::new();
         }
         if !dir.exists() {
             continue;
@@ -226,86 +545,107 @@ fn scan_wallpapers_until(
 
         for entry in entries.flatten() {
             if cancelled() {
-                return items;
+                return Vec::new();
             }
             let path = entry.path();
             if !path.is_dir() {
                 continue;
             }
 
-            let id = entry.file_name().to_string_lossy().to_string();
-            if seen_ids.contains(&id) {
-                continue;
-            }
+            candidates.push(path);
+        }
+    }
+    let results = scan_ordered(&candidates, threads, cancelled, |path| {
+        scan_project(path, parse)
+    });
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut items: Vec<_> = results
+        .into_iter()
+        .flatten()
+        .filter(|item| seen_ids.insert(item.id.clone()))
+        .collect();
+    sort_items(&mut items);
+    items
+}
 
-            let pj_path = path.join("project.json");
-            if !pj_path.exists() {
-                continue;
-            }
+fn scan_project(
+    path: &Path,
+    parse: &(dyn Fn(&Path) -> Option<ProjectJson> + Sync),
+) -> Option<WallpaperItem> {
+    let id = path.file_name()?.to_string_lossy().to_string();
+    let pj_path = path.join("project.json");
+    let pj = parse(&pj_path)?;
 
-            let pj_content = fs::read_to_string(&pj_path).unwrap_or_default();
-            let pj: ProjectJson = match serde_json::from_str(&pj_content) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-
-            // Filter out non-wallpaper assets (editor effects, presets, shaders, templates)
-            if let Some(ref cat) = pj.category {
-                let cat_lower = cat.to_lowercase();
-                if cat_lower == "asset" || cat_lower == "preset" || cat_lower == "template" {
-                    continue;
-                }
-            }
-
-            // Skip items with missing or blank title (templates, internal assets)
-            let title = match pj.title {
-                Some(t) if !t.trim().is_empty() => t,
-                _ => continue,
-            };
-
-            let file_rel = pj.file.unwrap_or_else(|| "scene.json".to_string());
-            let file_lower = file_rel.to_lowercase();
-            if file_lower.ends_with("effect.json") || file_lower.ends_with("shader.json") {
-                continue;
-            }
-            let file_target = path.join(&file_rel);
-
-            let preview_rel = pj.preview.unwrap_or_else(|| "preview.jpg".to_string());
-            let mut preview_path = Some(path.join(preview_rel));
-
-            if let Some(ref p) = preview_path {
-                if !p.exists() {
-                    preview_path = None;
-                    for cand in &["preview.jpg", "preview.gif", "preview.png", "preview.jpeg"] {
-                        let cp = path.join(cand);
-                        if cp.exists() {
-                            preview_path = Some(cp);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            seen_ids.insert(id.clone());
-            items.push(WallpaperItem {
-                id,
-                title,
-                folder_path: path,
-                project_json_path: pj_path.clone(),
-                file_target: if file_target.exists() {
-                    file_target
-                } else {
-                    pj_path
-                },
-                preview_path,
-                wallpaper_type: pj.wp_type.unwrap_or_else(|| "scene".to_string()),
-                source: WallpaperSource::WallpaperEngine,
-            });
+    // Filter out non-wallpaper assets (editor effects, presets, shaders, templates)
+    if let Some(ref cat) = pj.category {
+        let cat_lower = cat.to_lowercase();
+        if cat_lower == "asset" || cat_lower == "preset" || cat_lower == "template" {
+            return None;
         }
     }
 
-    items.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-    items
+    // Skip items with missing or blank title (templates, internal assets)
+    let title = match pj.title {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => return None,
+    };
+
+    let file_rel = pj.file.unwrap_or_else(|| "scene.json".to_string());
+    let file_lower = file_rel.to_lowercase();
+    if file_lower.ends_with("effect.json") || file_lower.ends_with("shader.json") {
+        return None;
+    }
+    let file_target = path.join(&file_rel);
+
+    let preview_rel = pj.preview.unwrap_or_else(|| "preview.jpg".to_string());
+    let mut preview_path = Some(path.join(preview_rel));
+
+    if let Some(ref p) = preview_path {
+        if !p.is_file() {
+            preview_path = None;
+            for cand in &[
+                "preview.jpg",
+                "preview.gif",
+                "preview.png",
+                "preview.jpeg",
+                "preview.mp4",
+            ] {
+                let cp = path.join(cand);
+                if cp.is_file() {
+                    preview_path = Some(cp);
+                    break;
+                }
+            }
+        }
+    }
+
+    let tags = crate::library::normalized_project_tags(pj.tags.as_ref());
+    let mut item = WallpaperItem {
+        id,
+        title,
+        folder_path: path.to_path_buf(),
+        project_json_path: pj_path.clone(),
+        file_target: if file_target.exists() {
+            file_target
+        } else {
+            pj_path
+        },
+        preview_path,
+        wallpaper_type: pj.wp_type.unwrap_or_else(|| "scene".to_string()),
+        source: WallpaperSource::WallpaperEngine,
+        scan_metadata: None,
+    };
+    item.capture_metadata(tags);
+    Some(item)
+}
+
+fn sort_items(items: &mut [WallpaperItem]) {
+    items.sort_by(|a, b| {
+        a.title
+            .to_lowercase()
+            .cmp(&b.title.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 fn is_supported_local_image(path: &Path) -> bool {
@@ -320,7 +660,7 @@ fn is_supported_local_image(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn is_supported_local_video(path: &Path) -> bool {
+pub(crate) fn is_supported_video(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .map(|extension| {
@@ -364,7 +704,7 @@ pub fn local_image_item(path: &Path) -> Result<WallpaperItem, String> {
         .map(Path::to_path_buf)
         .unwrap_or_default();
 
-    Ok(WallpaperItem {
+    let mut item = WallpaperItem {
         id: format!("local:{file_key}"),
         title,
         folder_path,
@@ -373,26 +713,34 @@ pub fn local_image_item(path: &Path) -> Result<WallpaperItem, String> {
         preview_path: Some(canonical_file),
         wallpaper_type: "image".to_string(),
         source: WallpaperSource::LocalImage,
-    })
+        scan_metadata: None,
+    };
+    item.capture_metadata(Default::default());
+    Ok(item)
 }
 
 fn scan_local_media_impl(roots: &[PathBuf], include_videos: bool) -> Vec<WallpaperItem> {
-    scan_local_media_until(roots, include_videos, &|| false)
+    scan_local_media_until(
+        roots,
+        include_videos,
+        default_catalog_scan_threads(),
+        &|| false,
+    )
 }
 
 fn scan_local_media_until(
     roots: &[PathBuf],
     include_videos: bool,
-    cancelled: &dyn Fn() -> bool,
+    threads: usize,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Vec<WallpaperItem> {
-    let mut items = Vec::new();
+    let mut candidates = Vec::new();
     let mut visited_directories = std::collections::HashSet::new();
-    let mut seen_files = std::collections::HashSet::new();
     let mut pending: Vec<PathBuf> = roots.to_vec();
 
     while let Some(directory) = pending.pop() {
         if cancelled() {
-            return items;
+            return Vec::new();
         }
         let canonical_directory = match directory.canonicalize() {
             Ok(path) => path,
@@ -410,7 +758,7 @@ fn scan_local_media_until(
 
         for entry in entries.flatten() {
             if cancelled() {
-                return items;
+                return Vec::new();
             }
             let path = entry.path();
             let metadata = match fs::symlink_metadata(&path) {
@@ -426,52 +774,58 @@ fn scan_local_media_until(
             }
             if !metadata.is_file()
                 || (!is_supported_local_image(&path)
-                    && !(include_videos && is_supported_local_video(&path)))
+                    && !(include_videos && is_supported_video(&path)))
             {
                 continue;
             }
 
-            let canonical_file = path.canonicalize().unwrap_or(path);
-            let file_key = canonical_file.to_string_lossy().to_ascii_lowercase();
-            if !seen_files.insert(file_key.clone()) {
-                continue;
-            }
-
-            let title = canonical_file
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .filter(|stem| !stem.trim().is_empty())
-                .unwrap_or("Untitled wallpaper")
-                .to_string();
-            let folder_path = canonical_file
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| canonical_directory.clone());
-
-            let source = if is_supported_local_video(&canonical_file) {
-                WallpaperSource::LocalVideo
-            } else {
-                WallpaperSource::LocalImage
-            };
-            items.push(WallpaperItem {
-                id: format!("local:{file_key}"),
-                title,
-                folder_path,
-                project_json_path: canonical_file.clone(),
-                file_target: canonical_file.clone(),
-                preview_path: (source == WallpaperSource::LocalImage)
-                    .then_some(canonical_file.clone()),
-                wallpaper_type: if source == WallpaperSource::LocalVideo {
-                    "video".to_string()
-                } else {
-                    "image".to_string()
-                },
-                source,
-            });
+            candidates.push(path);
         }
     }
+    let results = scan_ordered(&candidates, threads, cancelled, |path| {
+        let canonical_file = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let file_key = canonical_file.to_string_lossy().to_ascii_lowercase();
+        let title = canonical_file
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.trim().is_empty())
+            .unwrap_or("Untitled wallpaper")
+            .to_string();
+        let folder_path = canonical_file
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
 
-    items.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+        let source = if is_supported_video(&canonical_file) {
+            WallpaperSource::LocalVideo
+        } else {
+            WallpaperSource::LocalImage
+        };
+        let mut item = WallpaperItem {
+            id: format!("local:{file_key}"),
+            title,
+            folder_path,
+            project_json_path: canonical_file.clone(),
+            file_target: canonical_file.clone(),
+            preview_path: (source == WallpaperSource::LocalImage).then_some(canonical_file.clone()),
+            wallpaper_type: if source == WallpaperSource::LocalVideo {
+                "video".to_string()
+            } else {
+                "image".to_string()
+            },
+            source,
+            scan_metadata: None,
+        };
+        item.capture_metadata(Default::default());
+        item
+    });
+    let mut seen_files = std::collections::HashSet::new();
+    let mut items: Vec<_> = results
+        .into_iter()
+        .filter(|item| seen_files.insert(item.id.clone()))
+        .collect();
+
+    sort_items(&mut items);
     items
 }
 
@@ -490,13 +844,35 @@ pub fn scan_catalog(local_roots: &[PathBuf], include_default_projects: bool) -> 
 pub fn scan_catalog_until(
     local_roots: &[PathBuf],
     include_default_projects: bool,
-    cancelled: &dyn Fn() -> bool,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Vec<WallpaperItem> {
-    let mut items = scan_local_media_until(local_roots, true, cancelled);
+    scan_catalog_with_threads_until(
+        local_roots,
+        include_default_projects,
+        default_catalog_scan_threads(),
+        cancelled,
+    )
+}
+
+pub(crate) fn scan_catalog_with_threads_until(
+    local_roots: &[PathBuf],
+    include_default_projects: bool,
+    threads: usize,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Vec<WallpaperItem> {
+    let mut items = scan_local_media_until(local_roots, true, threads, cancelled);
     if !cancelled() {
-        items.extend(scan_wallpapers_until(include_default_projects, cancelled));
+        items.extend(scan_project_roots(
+            &engine_catalog_roots(find_steam_libraries(), include_default_projects),
+            threads,
+            cancelled,
+            &read_project,
+        ));
     }
-    items.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    if cancelled() {
+        return Vec::new();
+    }
+    sort_items(&mut items);
     items
 }
 
@@ -661,16 +1037,105 @@ pub fn find_active_wallpaper_index(
 }
 
 #[cfg(test)]
+#[path = "scanner_concurrency_tests.rs"]
+mod concurrency_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn test_dir(name: &str) -> PathBuf {
+    pub(super) fn test_dir(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("wallpaper-switcher-{name}-{nonce}"))
+    }
+
+    #[test]
+    fn p43_project_is_parsed_once_with_permissive_tags_and_precise_stamps() {
+        let root = test_dir("p43");
+        let project = root.join("431960/owned");
+        fs::create_dir_all(&project).unwrap();
+        let json = project.join("project.json");
+        fs::write(&json, r#"{"title":"Owned","type":"image","file":"preview.png","tags":[" Sky ",42,null,"sky","夜空",""]}"#).unwrap();
+        image::RgbaImage::new(2, 3)
+            .save(project.join("preview.png"))
+            .unwrap();
+        let parses = AtomicUsize::new(0);
+        let parse = |path: &Path| {
+            parses.fetch_add(1, Ordering::Relaxed);
+            read_project(path)
+        };
+        let items = scan_project_roots(&[root.join("431960")], 2, &|| false, &parse);
+        assert_eq!(items.len(), 1);
+        assert_eq!(parses.load(Ordering::Relaxed), 1);
+        let first = &items[0];
+        assert_eq!(first.wallpaper_type, "image");
+        let metadata = first.scan_metadata.as_ref().unwrap();
+        assert_eq!(metadata.tags, ["sky".into(), "夜空".into()].into());
+        assert!(
+            metadata.project.is_some() && metadata.target.is_some() && metadata.preview.is_some()
+        );
+        fs::remove_file(&json).unwrap();
+        let entry = crate::library::CatalogEntry::from_wallpaper(first);
+        assert_eq!(
+            entry.source_tags, metadata.tags,
+            "conversion must not reopen project JSON"
+        );
+        assert_eq!(parses.load(Ordering::Relaxed), 1);
+
+        fs::write(
+            &json,
+            br#"{"title":"Owned","type":"image","file":"preview.png","tags":false}"#,
+        )
+        .unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&json).unwrap();
+        let time = UNIX_EPOCH + std::time::Duration::new(1_800_000_000, 123_400_000);
+        file.set_times(fs::FileTimes::new().set_modified(time))
+            .unwrap();
+        let empty = scan_project_roots(&[root.join("431960")], 2, &|| false, &parse).remove(0);
+        assert!(empty.scan_metadata.as_ref().unwrap().tags.is_empty());
+        assert_eq!(
+            empty
+                .scan_metadata
+                .as_ref()
+                .unwrap()
+                .project
+                .as_ref()
+                .unwrap()
+                .modified,
+            Some(time)
+        );
+        let later = time + std::time::Duration::from_millis(100);
+        file.set_times(fs::FileTimes::new().set_modified(later))
+            .unwrap();
+        let changed = scan_project_roots(&[root.join("431960")], 2, &|| false, &parse).remove(0);
+        assert_ne!(
+            empty.scan_metadata, changed.scan_metadata,
+            "subsecond same-path changes must differ"
+        );
+        fs::write(&json, br#"{"tags":["must not reread"]}"#).unwrap();
+        assert!(crate::library::CatalogEntry::from_wallpaper(&empty)
+            .tags
+            .is_empty());
+        assert_eq!(parses.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn p42_steam_roots_include_missing_workshop_myprojects_and_optional_defaults() {
+        let library = test_dir("p42-libraries");
+        let roots = engine_catalog_roots(&[library.clone()], false);
+        assert_eq!(
+            roots,
+            vec![
+                library.join("steamapps/workshop/content/431960"),
+                library.join("steamapps/common/wallpaper_engine/projects/myprojects")
+            ]
+        );
+        assert!(roots.iter().all(|r| !r.exists()));
+        assert_eq!(engine_catalog_roots(&[library], true).len(), 3);
     }
 
     #[test]
@@ -855,6 +1320,7 @@ mod tests {
         let project_1000 = PathBuf::from(r"C:\\projects\\1000");
         let items = vec![
             WallpaperItem {
+                scan_metadata: None,
                 id: "100".into(),
                 title: "100".into(),
                 folder_path: project_100.clone(),
@@ -865,6 +1331,7 @@ mod tests {
                 source: WallpaperSource::WallpaperEngine,
             },
             WallpaperItem {
+                scan_metadata: None,
                 id: "1000".into(),
                 title: "1000".into(),
                 folder_path: project_1000.clone(),
@@ -897,6 +1364,7 @@ mod tests {
     #[test]
     fn id_substrings_and_unrelated_provider_paths_remain_unresolved() {
         let item = WallpaperItem {
+            scan_metadata: None,
             id: "42".into(),
             title: "known".into(),
             folder_path: PathBuf::from(r"C:\projects\known"),
@@ -921,6 +1389,7 @@ mod tests {
     fn engine_matching_normalizes_extended_unc_paths() {
         let folder = PathBuf::from(r"\\server\share\projects\wall");
         let item = WallpaperItem {
+            scan_metadata: None,
             id: "wall".into(),
             title: "wall".into(),
             folder_path: folder.clone(),
@@ -946,6 +1415,7 @@ mod tests {
         let outer = PathBuf::from(r"C:\projects\outer");
         let inner = outer.join("inner");
         let item = |id: &str, folder: PathBuf| WallpaperItem {
+            scan_metadata: None,
             id: id.into(),
             title: id.into(),
             project_json_path: folder.join("project.json"),
@@ -1012,6 +1482,7 @@ mod tests {
         let source = root.join("gone.png");
         let cache_dir = root.join("native-images");
         let item = WallpaperItem {
+            scan_metadata: None,
             id: "missing-source".into(),
             title: "missing-source".into(),
             folder_path: root.clone(),
@@ -1041,6 +1512,7 @@ mod tests {
     fn installed_engine_identity_resolves_id_and_exact_project_paths() {
         let root = PathBuf::from(r"C:\projects\engine-scene");
         let item = WallpaperItem {
+            scan_metadata: None,
             id: "scene-42".into(),
             title: "Scene 42".into(),
             folder_path: root.clone(),
@@ -1082,6 +1554,7 @@ mod tests {
         let outer = PathBuf::from(r"C:\projects\outer");
         let inner = outer.join("inner");
         let item = |id: &str, folder: PathBuf, source| WallpaperItem {
+            scan_metadata: None,
             id: id.into(),
             title: id.into(),
             project_json_path: folder.join("project.json"),

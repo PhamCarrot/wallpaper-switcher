@@ -48,7 +48,7 @@ fn titles<'a>(cards: &'a [(Card, Vec<Row>)]) -> Vec<&'static str> {
 }
 
 #[test]
-fn ten_actual_categories_build_source_sections_and_only_four_public_modes() {
+fn actual_categories_build_source_sections_and_only_four_public_modes() {
     let source = FakeSettingsSource::default();
     let tabs = visible_tabs(&source);
     assert_eq!(
@@ -57,6 +57,7 @@ fn ten_actual_categories_build_source_sections_and_only_four_public_modes() {
             "picker",
             "filter",
             "position",
+            "displays",
             "motion",
             "playback",
             "performance",
@@ -87,7 +88,6 @@ fn ten_actual_categories_build_source_sections_and_only_four_public_modes() {
             [
                 "General",
                 "Layout & presets",
-                "Tag panel",
                 "Controls",
                 "Windows",
                 "Appearance"
@@ -120,6 +120,29 @@ fn ten_actual_categories_build_source_sections_and_only_four_public_modes() {
 }
 
 #[test]
+fn p1_copy_contract_uses_pacing_and_random_rotation_language() {
+    let source = FakeSettingsSource::default();
+    let performance = cards("performance", &source);
+    let pacing = performance
+        .iter()
+        .flat_map(|(_, rows)| rows)
+        .find(|row| row.title == "Animation pacing")
+        .expect("pacing row");
+    assert_eq!(pacing.desc, "Maximum frame rate for picker motion.");
+
+    let automation = cards("automation", &source);
+    let mut rows = automation.iter().flat_map(|(_, rows)| rows);
+    let random = rows
+        .find(|row| row.title == "Enable random rotation")
+        .expect("random rotation row");
+    assert!(random.desc.is_empty());
+    assert!(automation[0]
+        .1
+        .iter()
+        .all(|row| row.desc.is_empty() && row.title != "Execution policy"));
+}
+
+#[test]
 fn moved_motion_and_removed_performance_duplicates_follow_composition() {
     let source = FakeSettingsSource::default();
     let picker = cards("picker", &source);
@@ -145,10 +168,12 @@ fn moved_motion_and_removed_performance_duplicates_follow_composition() {
     assert!(!performance_paths.contains(&keys::transition::PREVIEW_FPS));
     assert!(!performance_paths.contains(&keys::selector::LIVE_PREVIEW));
     let position = cards("position", &source);
-    assert_eq!(position.len(), 4);
+    assert_eq!(position.len(), 5);
+    assert!(all_paths(&position).contains(&keys::selector::DEPTH_STAGE_X));
+    assert!(all_paths(&position).contains(&keys::selector::DEPTH_STAGE_Y));
     assert!(all_paths(&position)
         .iter()
-        .all(|path| !path.contains("depth") && !path.contains("sandy") && !path.contains("hand")));
+        .all(|path| !path.contains("sandy") && !path.contains("hand")));
     let public: Vec<_> = visible_tabs(&source)
         .iter()
         .flat_map(|(tab, _)| {
@@ -163,6 +188,10 @@ fn moved_motion_and_removed_performance_duplicates_follow_composition() {
         keys::general::APPLY_ON_PICKER_MONITOR,
         keys::general::NOTIFY_ON_WALLPAPER_CHANGE,
         "filterBar.show.tagcloud",
+        keys::selector::TAG_CLOUD_ROWS,
+        keys::selector::TAG_CLOUD_OFFSET_X,
+        keys::selector::TAG_CLOUD_OFFSET_Y,
+        keys::selector::TAG_CLOUD_WIDTH,
         keys::schedule::ENABLED,
         keys::schedule::APPLY_ON_START,
     ] {
@@ -180,10 +209,6 @@ fn moved_motion_and_removed_performance_duplicates_follow_composition() {
         keys::general::RANDOM_INCLUDE_FAVOURITES,
         keys::filter_bar::DEFAULT_FOLDER,
         keys::filter_bar::STICKY,
-        keys::selector::TAG_CLOUD_ROWS,
-        keys::selector::TAG_CLOUD_OFFSET_X,
-        keys::selector::TAG_CLOUD_OFFSET_Y,
-        keys::selector::TAG_CLOUD_WIDTH,
     ] {
         assert_eq!(
             public
@@ -208,7 +233,10 @@ fn sources_remain_expandable_and_false_execution_preferences_do_not_remove_local
         .with_flag(keys::features::WALLHAVEN, false)
         .with_flag(keys::features::STEAM, false);
     assert!(cards("sources", &source).is_empty());
-    assert!(cards("displays", &source).is_empty());
+    assert!(cards("displays", &source)[0]
+        .1
+        .iter()
+        .any(|row| matches!(row.control, Control::PlatformForm)));
     assert!(cards("integrations", &source).is_empty());
     assert!(!all_paths(&cards("playback", &source)).contains(&keys::we_render::FPS));
 }
@@ -224,12 +252,49 @@ fn e3_retired_transitions_never_compose_and_theme_controls_remain_conditional() 
             let motion = cards("motion", &source);
             assert_eq!(
                 motion.len(),
-                3,
-                "only shared speeds, launch and Picker motion"
+                4,
+                "shared, launch, Picker and wallpaper transition motion"
             );
             let paths = all_paths(&motion);
             assert!(paths.contains(&keys::launch::ANIMATION));
             assert!(paths.contains(&keys::selector::FLIP_DURATION_MS));
+            assert!(paths.contains(&keys::wallpaper_transition::ENABLED));
+            assert!(paths.contains(&keys::wallpaper_transition::DURATION_MS));
+            assert!(paths.contains(&keys::wallpaper_transition::FAMILY));
+            let transition_rows = motion.iter().flat_map(|(_, rows)| rows);
+            let family = transition_rows
+                .clone()
+                .find_map(|row| match &row.control {
+                    Control::Chips {
+                        path,
+                        options,
+                        disabled,
+                        ..
+                    } if path == keys::wallpaper_transition::FAMILY => Some((options, disabled)),
+                    _ => None,
+                })
+                .expect("wallpaper transition family chips");
+            assert_eq!(
+                family
+                    .0
+                    .iter()
+                    .map(|(key, _)| key.as_str())
+                    .collect::<Vec<_>>(),
+                ["random", "fade", "wipe", "warp", "break"]
+            );
+            assert!(family.1.is_empty());
+            assert!(transition_rows.clone().any(|row| matches!(&row.control,
+                Control::Dropdown { path, options, .. } if path == keys::launch::ANIMATION
+                    && options.iter().map(|(key, _)| key.as_str()).eq(["none", "fade", "rise", "zoom"])
+            )));
+            assert!(transition_rows.clone().any(|row| {
+                matches!(
+                    &row.control,
+                    Control::Dropdown { path, options, .. }
+                        if path == keys::wallpaper_transition::EFFECT
+                            && options.iter().any(|(key, _)| key == "crossfade")
+                )
+            }));
             for (tab, _) in visible_tabs(&source) {
                 assert!(all_paths(&cards(tab, &source))
                     .iter()
@@ -249,7 +314,6 @@ fn e3_retired_transitions_never_compose_and_theme_controls_remain_conditional() 
                 "sand-donut",
                 "previewFps",
                 "shaderScopes",
-                "沙粒",
             ] {
                 assert!(
                     search::search_composed(query, &source, |tab| cards(tab, &source)).is_empty(),
@@ -264,12 +328,13 @@ fn e3_retired_transitions_never_compose_and_theme_controls_remain_conditional() 
             let hits =
                 search::search_composed(retained_shader_query, &source, |tab| cards(tab, &source));
             assert!(
-                !hits.is_empty(),
+                hits.iter()
+                    .any(|hit| hit.tab == "motion" && hit.section == 2),
                 "retained card-flip shader remains searchable"
             );
             assert!(hits
                 .iter()
-                .all(|hit| hit.tab == "motion" && hit.section == 2));
+                .all(|hit| hit.tab == "motion" && matches!(hit.section, 2 | 3)));
         }
     }
     let fixed = FakeSettingsSource::default().with_text(keys::theme::POLICY, "fixed");

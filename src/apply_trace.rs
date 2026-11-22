@@ -37,6 +37,13 @@ pub const REQUIRED_STAGE_NAMES: &[&str] = &[
     "readback-start",
     "readback-complete",
     "readback-failure",
+    "provider-endpoint",
+    "provider-command-start",
+    "provider-command-dispatched",
+    "provider-command-complete",
+    "provider-command-failure",
+    "provider-readback",
+    "provider-observation",
     "completion",
     "failure",
     "automation-timer-generation",
@@ -60,10 +67,18 @@ pub const REQUIRED_STAGE_NAMES: &[&str] = &[
     "iced-widget-mouse-publication",
     "iced-widget-mouse-ignored",
     "gallery-mouse-consumption",
+    "gallery-frame-prepare",
+    "gallery-frame-render",
+    "gallery-frame-gpu-complete",
+    "gallery-frame-residency",
+    "gallery-poster-demand",
+    "gallery-screenshot-request",
+    "gallery-screenshot-captured",
 ];
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static WIDGET_MOUSE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static GALLERY_FRAME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static OPERATION_ID: Cell<Option<u64>> = const { Cell::new(None) };
@@ -113,6 +128,18 @@ pub fn next_widget_mouse_sequence() -> u64 {
             current.checked_add(1)
         })
         .expect("widget mouse trace sequence exhausted")
+        + 1
+}
+
+/// Returns the next process-local sequence for an opt-in gallery frame trace.
+/// The sequence identifies one iced primitive from model creation through GPU
+/// command-buffer completion; it is not a compositor presentation counter.
+pub fn next_gallery_frame_sequence() -> u64 {
+    GALLERY_FRAME_SEQUENCE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("gallery frame trace sequence exhausted")
         + 1
 }
 
@@ -185,11 +212,33 @@ fn format_trace_line(operation_id: Option<u64>, stage: &str, details: &str) -> S
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis());
     let details = details.replace(['\r', '\n'], " ");
+    let qpc = qpc_timestamp().map_or_else(
+        || "qpc_ticks=unavailable qpc_frequency=unavailable".to_string(),
+        |(ticks, frequency)| format!("qpc_ticks={ticks} qpc_frequency={frequency}"),
+    );
     format!(
-        "[APPLY-TRACE] timestamp_unix_ms={timestamp_ms} pid={} op={} stage={stage} {details}",
+        "[APPLY-TRACE] timestamp_unix_ms={timestamp_ms} {qpc} pid={} op={} stage={stage} {details}",
         std::process::id(),
         operation_id.map_or_else(|| "none".to_string(), |id| id.to_string()),
     )
+}
+
+// PresentMon's --qpc_time uses the same system clock. Keep raw ticks and the
+// frequency so correlation never guesses a timezone or wall-clock offset.
+fn qpc_timestamp() -> Option<(i64, i64)> {
+    use windows_sys::Win32::System::Performance::{
+        QueryPerformanceCounter, QueryPerformanceFrequency,
+    };
+    static FREQUENCY: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
+    let frequency = (*FREQUENCY.get_or_init(|| {
+        let mut frequency = 0;
+        // SAFETY: the API writes one i64 to this valid local pointer.
+        (unsafe { QueryPerformanceFrequency(&mut frequency) } != 0 && frequency > 0)
+            .then_some(frequency)
+    }))?;
+    let mut ticks = 0;
+    // SAFETY: the API writes one i64 to this valid local pointer.
+    (unsafe { QueryPerformanceCounter(&mut ticks) } != 0).then_some((ticks, frequency))
 }
 
 #[cfg(test)]
@@ -265,5 +314,17 @@ mod tests {
         assert!(line.contains("timestamp_unix_ms="));
         assert!(line.contains(&format!("pid={}", std::process::id())));
         assert!(line.contains("op=42 stage=automation-submission item_id=fixture"));
+    }
+
+    #[test]
+    fn trace_clock_has_positive_frequency_and_monotonic_ticks() {
+        let (before, frequency) = qpc_timestamp().expect("Windows QPC is available");
+        let (after, next_frequency) = qpc_timestamp().unwrap();
+        assert!(frequency > 0);
+        assert_eq!(frequency, next_frequency);
+        assert!(after >= before);
+        let line = format_trace_line(None, "gallery-frame-render", "frame=1");
+        assert!(line.contains(&format!("qpc_frequency={frequency}")));
+        assert!(!line.contains("unavailable"));
     }
 }

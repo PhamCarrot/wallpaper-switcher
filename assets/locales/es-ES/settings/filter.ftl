@@ -1,7 +1,7 @@
 settings-filter-appearance-card = Apariencia
 settings-filter-appearance-card-desc = Adapta la barra de filtros a cada diseño del selector o fuerza un estilo en todos.
 settings-filter-visual-style-label = Estilo visual
-settings-filter-visual-style-desc = Coincidir con el selector usa la barra inclinada en Slices y Sandy, la barra geométrica en Geometric y la barra recta en Wall.
+settings-filter-visual-style-desc = Coincidir con el selector usa la barra inclinada en Slices, la barra geométrica en Geometric y la barra recta en Wall.
 settings-filter-visual-style-match = Coincidir con el selector
 settings-filter-visual-style-slices = Slices
 settings-filter-visual-style-hex = Geometric

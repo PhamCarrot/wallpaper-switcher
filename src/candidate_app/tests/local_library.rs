@@ -59,7 +59,7 @@ fn w3_production_tag_edit_query_playlist_reload_orphan_and_source_preservation()
         .iter()
         .map(library::CatalogEntry::from_wallpaper)
         .collect();
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let wallpapers = app.wallpapers.clone();
     let _ = update(
         &mut app,
@@ -150,7 +150,7 @@ fn w3_partial_tag_publication_keeps_overlay_until_deliberate_reconciliation() {
 #[test]
 fn w3_config_and_tag_failures_remain_separate_and_refresh_requires_config_success() {
     let mut app = fixture();
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let before = app.config.catalog.local_folders.clone();
     let mut config = app.config.clone();
     config
@@ -166,7 +166,10 @@ fn w3_config_and_tag_failures_remain_separate_and_refresh_requires_config_succes
         ))
     });
     assert_eq!(app.config.catalog.local_folders, before);
-    assert_eq!(app.catalog_generation.load(Ordering::Acquire), generation);
+    assert_eq!(
+        app.catalog_scan_generation.load(Ordering::Acquire),
+        generation
+    );
     edit(&mut app, TagEdit::Text("independent".into()));
     edit(&mut app, TagEdit::Add);
     assert!(app.catalog[0].tags.contains("independent"));
@@ -187,7 +190,7 @@ fn w3_config_and_tag_failures_remain_separate_and_refresh_requires_config_succes
         config.catalog.local_folders
     );
     assert_eq!(
-        app.catalog_generation.load(Ordering::Acquire),
+        app.catalog_scan_generation.load(Ordering::Acquire),
         generation + 1
     );
     assert_eq!(std::fs::read(blocker).unwrap(), b"retain");
@@ -246,27 +249,24 @@ fn w3_drawer_uses_source_sized_controls_with_media_filters_retained() {
     assert_eq!(app.wallpapers[2].source, WallpaperSource::WallpaperEngine);
     for viewport in [[1920.0, 1080.0], [2560.0, 1440.0]] {
         app.viewport = viewport;
+        let before = app.tag_panel_bounds(app.search_panel_width(), 145.0);
         app.state.frontend_preferences.tag_panel.width = Some(540.0);
-        let mut limits = vec![];
         for rows in ["1", "2", "3"] {
             app.state.frontend_preferences.tag_panel.rows = Some(rows.into());
             let b = app.tag_panel_bounds(app.search_panel_width(), 145.0);
-            assert_eq!(b[2], 540.0);
+            assert_eq!(b, before);
             assert!(
                 b[0] >= 0.0
                     && b[1] >= 0.0
                     && b[0] + b[2] <= viewport[0]
                     && b[1] + b[3] <= viewport[1]
             );
-            limits.push(app.search_panel_row_limit());
+            assert_eq!(app.search_panel_row_limit(), 2);
         }
-        assert_eq!(limits, [1, 2, 3]);
-        let before = app.tag_panel_bounds(app.search_panel_width(), 145.0);
         app.state.frontend_preferences.tag_panel.offset_x = Some(20.0);
         app.state.frontend_preferences.tag_panel.offset_y = Some(-20.0);
         let after = app.tag_panel_bounds(app.search_panel_width(), 145.0);
-        assert_eq!(after[0], before[0] + 20.0);
-        assert_eq!(after[1], before[1] - 20.0);
+        assert_eq!(after, before);
         app.state.frontend_preferences.tag_panel.offset_x = None;
         app.state.frontend_preferences.tag_panel.offset_y = None;
     }
@@ -415,7 +415,7 @@ fn w3_old_same_item_drawer_session_cannot_replay_text_add_or_remove() {
 fn w3_config_partial_primary_failure_requires_reconciliation_and_retains_tag_owner() {
     let mut app = fixture();
     let previous = app.config.catalog.local_folders.clone();
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let mut proposed = app.config.clone();
     proposed
         .catalog
@@ -442,7 +442,10 @@ fn w3_config_partial_primary_failure_requires_reconciliation_and_retains_tag_own
     assert!(app.library_config_reconcile);
     assert!(app.status.as_deref().unwrap().contains("reconciliation"));
     assert_eq!(app.config.catalog.local_folders, previous);
-    assert_eq!(app.catalog_generation.load(Ordering::Acquire), generation);
+    assert_eq!(
+        app.catalog_scan_generation.load(Ordering::Acquire),
+        generation
+    );
     app.publish_library_config_using(proposed, |_| {
         panic!("must not republish before reconciliation")
     });
@@ -469,7 +472,7 @@ fn w3_actual_scanner_raw_config_root_and_default_reach_canonical_catalog() {
         .collect();
     let canonical = root.canonicalize().unwrap();
     app.config.catalog.local_folders = vec![raw.clone()];
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let _ = update(
         &mut app,
         Message::Wake(Wake::CatalogLoaded {
@@ -507,7 +510,7 @@ fn w3_catalog_publication_revokes_an_editor_minted_during_the_same_scan_generati
     edit(&mut app, TagEdit::Text("old-scan-body".into()));
     let owner = app.tag_owner().unwrap();
     let before = app.state.clone();
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let wallpapers = app.wallpapers.clone();
     let entries = app.catalog.clone();
     let _ = update(
@@ -535,8 +538,9 @@ fn w3_installed_folder_picker_and_retained_smart_playlist_preserve_raw_intent() 
     let mut app = fixture();
     let root = app.state_path.with_file_name("installed-style-root");
     std::fs::create_dir_all(&root).unwrap();
-    let ordinary = std::path::PathBuf::from(root.to_string_lossy().trim_start_matches(r"\\?\"));
     let canonical = root.canonicalize().unwrap();
+    let ordinary =
+        std::path::PathBuf::from(canonical.to_string_lossy().trim_start_matches(r"\\?\"));
     let mut item = app.wallpapers[0].clone();
     item.source = WallpaperSource::WallpaperEngine;
     item.folder_path = ordinary.clone();
@@ -544,7 +548,7 @@ fn w3_installed_folder_picker_and_retained_smart_playlist_preserve_raw_intent() 
     let file = item.file_target.clone();
     let entry = library::CatalogEntry::from_wallpaper(&item);
     assert_eq!(entry.folder, ordinary);
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let _ = update(
         &mut app,
         Message::Wake(Wake::CatalogLoaded {

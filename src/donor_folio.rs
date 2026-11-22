@@ -363,7 +363,7 @@ pub(crate) fn sheet_with_scroll_capture<'a, M: Clone + 'a>(
         container(Space::new())
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(move |_| donor_ui::scrim_style(1.0)),
+            .style(move |_| donor_ui::scrim_style(palette.surface.a)),
     )
     .interaction(iced::mouse::Interaction::Idle)
     .on_press(capture)
@@ -377,8 +377,8 @@ pub(crate) fn sheet_with_scroll_capture<'a, M: Clone + 'a>(
     .into()
 }
 
-/// Capture wheel input at the sheet boundary when the nested body cannot
-/// consume it. The panel stays above the scrim, but the wrapper is sized to
+/// Shield blank panel presses and capture wheel input when the nested body
+/// cannot consume it. The panel stays above the scrim, but the wrapper is sized to
 /// the panel rather than the whole viewport so scrim events remain owned by
 /// the backdrop instead of levitating the cursor through `Stack`.
 pub(crate) fn sheet_panel<'a, M, Renderer>(
@@ -390,7 +390,7 @@ where
     Renderer: iced::advanced::Renderer + 'a,
 {
     let panel_scroll_capture = capture;
-    mouse_area(panel)
+    mouse_area(iced::widget::opaque(panel))
         .on_scroll(move |_| panel_scroll_capture.clone())
         .into()
 }
@@ -405,6 +405,7 @@ mod tests {
         BackdropScroll,
         InnerScroll(i32),
         PanelPress,
+        BackdropPress,
     }
 
     fn probe_modal() -> iced::Element<'static, ProbeMessage, iced::Theme, ()> {
@@ -419,6 +420,7 @@ mod tests {
                 .height(Length::Fill),
         )
         .interaction(iced::mouse::Interaction::Idle)
+        .on_press(ProbeMessage::BackdropPress)
         .on_scroll(|_| ProbeMessage::BackdropScroll);
 
         stack![
@@ -721,6 +723,38 @@ mod tests {
             ))],
         );
         assert_eq!(messages, vec![vec![ProbeMessage::PanelPress]]);
+    }
+
+    #[test]
+    fn sheet_blank_panel_press_does_not_dismiss_or_publish_capture_message() {
+        use iced::advanced::mouse;
+
+        let mut modal = probe_modal();
+        let messages = dispatch_events(
+            &mut modal,
+            Point::new(199.0, 185.0),
+            vec![
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+        );
+        assert_eq!(messages, vec![vec![], vec![]]);
+    }
+
+    #[test]
+    fn sheet_press_just_outside_panel_still_dismisses() {
+        use iced::advanced::mouse;
+
+        let mut modal = probe_modal();
+        let messages = dispatch_events(
+            &mut modal,
+            Point::new(201.0, 185.0),
+            vec![
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+        );
+        assert_eq!(messages, vec![vec![ProbeMessage::BackdropPress], vec![]]);
     }
 
     #[test]

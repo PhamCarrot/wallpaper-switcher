@@ -353,7 +353,7 @@ fn pk05_catalog_membership_and_smart_tag_refresh_follow_current_ids_not_indices(
     entries.reverse();
     let mut wallpapers = app.wallpapers.clone();
     wallpapers.reverse();
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let _ = update(
         &mut app,
         Message::Wake(Wake::CatalogLoaded {
@@ -785,7 +785,7 @@ fn pk05_production_compositions_and_public_routes() {
     fn is_manager(message: &Message) -> bool {
         match message {
             Message::TogglePlaylistPanel => true,
-            Message::SettingsLegacy { message, .. } => is_manager(message),
+            Message::SettingsPageAction { message, .. } => is_manager(message),
             _ => false,
         }
     }
@@ -1319,23 +1319,24 @@ fn pk05_production_compositions_and_public_routes() {
         }
         app.settings_workbench.folio_entrance = None;
         app.settings_workbench.tab_reveal = None;
-        let label = app.settings_locale.text_static("r5-windows-controls");
-        let messages = root_label(&app, &renderer, label, |m| {
+        let section = view::settings::controller::cards(&app)
+            .iter()
+            .position(|(_, rows)| {
+                rows.iter().any(|row| {
+                    matches!(row.control, view::settings::composed::Control::PlatformForm)
+                })
+            })
+            .expect("Playback controls section");
+        let messages = root_label(&app, &renderer, "Playback controls", |m| {
             matches!(
-                m,
-                Message::SettingsWindowsOpen {
-                    category: SettingsCategory::Playback,
-                    ..
-                }
+                m, Message::SettingsIntent { intent: Intent::Settings(SettingsMsg::SelectSection(index)), .. } if *index == section
             )
         });
-        for m in messages {
-            let _ = update(&mut app, m);
+        for message in messages {
+            let _ = update(&mut app, message);
         }
-        assert_eq!(
-            app.settings_workbench.windows_panel,
-            Some(SettingsCategory::Playback)
-        );
+        assert_eq!(app.settings_workbench.tab, "playback");
+        assert_eq!(app.settings_workbench.navigation.section, section);
         let entry = output.join(format!("settings-playback-entry-{width}-{scale}.png"));
         snapshot(&app, &mut renderer, &entry);
         let label = app.settings_locale.text_static("r5-playlists");
@@ -1346,7 +1347,7 @@ fn pk05_production_compositions_and_public_routes() {
         assert!(app.playlist_panel_open && !app.playlist_picker && !app.playlist_chooser);
         let manager = output.join(format!("settings-manager-{width}-{scale}.png"));
         snapshot(&app, &mut renderer, &manager);
-        index.push(serde_json::json!({"path":entry,"route":"rail Settings -> Playback tab -> Windows controls -> wrapped Playlists","manager_path":manager,"actual_hits":true,"scale":scale}));
+        index.push(serde_json::json!({"path":entry,"route":"rail Settings -> Playback tab -> Playback controls -> Playlists","manager_path":manager,"actual_hits":true,"scale":scale}));
         assert_eq!(calls.load(Ordering::Acquire), 0);
     }
     // Real detail action -> captured membership picker; no chooser predicate mutation.

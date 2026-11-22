@@ -62,6 +62,7 @@ fn keyboard_parity_filtered_sorted_identity_empty_and_single_are_preserved() {
         app.state.gallery.wall.columns = 3;
         // Deliberately non-catalog order, as produced by filters and sorting.
         app.filtered_indices = vec![11, 2, 8, 5, 1];
+        app.presentation_inputs = None;
         app.selected = Some(2);
         d3_key(&mut app, ArrowRight);
         assert_eq!(app.selected, Some(8));
@@ -86,6 +87,7 @@ fn keyboard_parity_filtered_sorted_identity_empty_and_single_are_preserved() {
         for indices in [vec![5], vec![]] {
             app.selected = indices.first().copied();
             app.filtered_indices = indices;
+            app.presentation_inputs = None;
             let before = app.selected;
             for key in [ArrowLeft, ArrowRight, ArrowUp, ArrowDown] {
                 d3_key(&mut app, key);

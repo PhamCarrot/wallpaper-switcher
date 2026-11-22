@@ -2,7 +2,7 @@ use super::pk07::{renderer, Scene};
 use super::*;
 use std::path::PathBuf;
 use view::settings::{
-    composed::{self, keys::selector as tag, ActionId, Control, PICKER_CONTROLS_SECTION},
+    composed::{self, ActionId, Control, PICKER_CONTROLS_SECTION},
     folio::intent::{Message as Intent, SettingsMsg},
 };
 
@@ -144,7 +144,6 @@ fn pk08_public_composition_uses_supported_controls_and_keeps_compatibility_value
     open(&mut app);
     p3_settings_intent(&mut app, SettingsMsg::SelectTab("picker".into()));
     let cards = view::settings::controller::cards(&app);
-    let tag_index = section(&app, "settings-section-tag-panel");
     let windows_index = section(&app, "settings-section-windows");
     assert_eq!(
         section(&app, "settings-section-controls"),
@@ -152,11 +151,11 @@ fn pk08_public_composition_uses_supported_controls_and_keeps_compatibility_value
     );
     assert!(!cards[0].1.iter().any(|row| matches!(&row.control,
         Control::Toggle { path, .. } if path == composed::keys::general::APPLY_ON_PICKER_MONITOR)));
-    assert_eq!(cards[tag_index].1.len(), 4);
+    assert!(cards.iter().all(|(card, _)| card.title != "Tag panel"));
     assert!(cards[windows_index].1.iter().any(|row| matches!(
         row.control,
         Control::ActionBtn {
-            id: ActionId::OpenWindowsDisplays,
+            id: ActionId::OpenDisplays,
             ..
         }
     )));
@@ -171,7 +170,7 @@ fn pk08_public_composition_uses_supported_controls_and_keeps_compatibility_value
     for binding in composed::KEY_BINDINGS {
         assert_eq!(
             control_paths.contains(&binding.path),
-            binding.action.local_available()
+            binding.action.local_available() || binding.group == composed::KeyBindingGroup::Global
         );
     }
     assert!(!cards[PICKER_CONTROLS_SECTION]
@@ -399,68 +398,35 @@ fn pk08_production_settings_compositions_and_actions() {
             |m| settings(m, |i| matches!(i, SettingsMsg::SearchInput(_))),
         );
         assert_eq!(app.settings_search, "Clickable tag rows");
-        let tag_index = section(&app, "settings-section-tag-panel");
         let mut scene = Scene::new(&app, &renderer);
-        let hit = scene.hit_label(&renderer, "Clickable tag rows", |m|
-            settings(m, |i| matches!(i, SettingsMsg::OpenSearchResult(tab, index, _) if tab == "picker" && *index == tag_index)));
-        save(&mut scene, &mut renderer, &app, "tag-search-result");
+        assert!(app.settings_workbench.results.is_empty());
+        save(&mut scene, &mut renderer, &app, "retired-tag-search");
         drop(scene);
-        let _ = update(&mut app, hit);
-        assert_eq!(app.settings_workbench.navigation.section, tag_index);
-        assert!(!app.settings_workbench.layout_studio());
 
-        let hit = Scene::new(&app, &renderer).hit_label(&renderer, "3 rows", |m|
-            settings(m, |i| matches!(i, SettingsMsg::Pick(path, choice) if path == tag::TAG_CLOUD_ROWS && choice == "3")));
-        let _ = update(&mut app, hit);
-        for (key, raw) in [
-            (tag::TAG_CLOUD_WIDTH, "515"),
-            (tag::TAG_CLOUD_OFFSET_X, "18"),
-            (tag::TAG_CLOUD_OFFSET_Y, "-22"),
-        ] {
-            input(
-                &mut app,
-                &renderer,
-                composed::workbench_input_id(key),
-                raw,
-                |m| {
-                    settings(
-                        m,
-                        |i| matches!(i, SettingsMsg::Input(path, value) if path == key && value == raw),
-                    )
-                },
-            );
-        }
-        p3_settings_intent(&mut app, SettingsMsg::Commit);
+        let before = app.tag_panel_bounds(app.search_panel_width(), 145.0);
+        let values = &mut app.state.frontend_preferences.tag_panel;
+        values.width = Some(515.0);
+        values.rows = Some("3".into());
+        values.offset_x = Some(18.0);
+        values.offset_y = Some(-22.0);
+        let expected = values.clone();
+        app.persist_state_outcome().unwrap();
         let state = CandidateState::load(&app.state_path);
-        let values = &state.frontend_preferences.tag_panel;
+        assert_eq!(state.frontend_preferences.tag_panel, expected);
+        assert_eq!(app.search_panel_row_limit(), 2);
         assert_eq!(
-            (
-                values.width,
-                values.rows.as_deref(),
-                values.offset_x,
-                values.offset_y
-            ),
-            (Some(515.0), Some("3"), Some(18.0), Some(-22.0))
-        );
-        assert_eq!(app.search_panel_row_limit(), 3);
-        assert_eq!(
-            app.search_panel_width(),
-            (515.0 * scale as f32).min(width as f32 - 40.0)
-        );
-        save(
-            &mut Scene::new(&app, &renderer),
-            &mut renderer,
-            &app,
-            "tag-panel",
+            app.tag_panel_bounds(app.search_panel_width(), 145.0),
+            before
         );
         receipts.push(format!(
-            "{width}x{height} {scale} Tag panel search/hit/reload {values:?}"
+            "{width}x{height} {scale} legacy tag layout remained inert"
         ));
 
         app.selected = Some(1);
         let _ = update(&mut app, Message::SettingsSearchChanged(String::new()));
         assert!(app.settings_workbench.preview_image().is_none());
         complete(&mut app);
+        p3_settings_intent(&mut app, SettingsMsg::SearchClose);
         hit_section(&mut app, &renderer, "settings-section-general");
         save(
             &mut Scene::new(&app, &renderer),
@@ -489,8 +455,9 @@ fn pk08_production_settings_compositions_and_actions() {
                     index,
                     PosterSlot {
                         layer,
-                        is_video: false,
+                        kind: crate::poster_worker::PosterKind::Still,
                         generation,
+                        last_requested: generation,
                         catalog_generation,
                         item_id: item.id.clone(),
                         source,
@@ -527,23 +494,16 @@ fn pk08_production_settings_compositions_and_actions() {
         let mut scene = Scene::new(&app, &renderer);
         let message = scene.hit_label(
             &renderer,
-            app.settings_locale.text_static("r5-windows-controls"),
-            |m| {
-                settings(m, |i| {
-                    matches!(i, SettingsMsg::Run(ActionId::OpenWindowsDisplays))
-                })
-            },
+            app.settings_locale.text_static("settings-tab-displays"),
+            |m| settings(m, |i| matches!(i, SettingsMsg::Run(ActionId::OpenDisplays))),
         );
         save(&mut scene, &mut renderer, &app, "windows-entry");
         drop(scene);
         let _ = update(&mut app, message);
-        assert_eq!(
-            app.settings_workbench.windows_panel,
-            Some(SettingsCategory::WallpapersDisplays)
-        );
+        assert_eq!(app.settings_workbench.tab, "displays");
         let mut scene = Scene::new(&app, &renderer);
         let lock = scene.hit_label(&renderer, "Lock STABLE-A", |m|
-            matches!(m, Message::SettingsLegacy { message, .. } if matches!(&**message, Message::ToggleMonitorLock(id) if id == "STABLE-A")));
+            matches!(m, Message::SettingsPageAction { message, .. } if matches!(&**message, Message::ToggleMonitorLock(id) if id == "STABLE-A")));
         save(&mut scene, &mut renderer, &app, "windows-lock");
         drop(scene);
         let _ = update(&mut app, lock);
@@ -557,18 +517,44 @@ fn pk08_production_settings_compositions_and_actions() {
             .texts
             .iter()
             .any(|(label, _)| label.contains("Invalid Config: monitor")));
-        let _config = scene.hit_label(&renderer, app.settings_locale.text_static("settings-windows-open-config"), |m|
-            matches!(m, Message::SettingsLegacy { message, .. } if matches!(&**message, Message::Wake(Wake::Tray(TrayAction::OpenConfig)))));
-        save(&mut scene, &mut renderer, &app, "windows-config-hit");
-        let back = scene.hit_label(
-            &renderer,
-            app.settings_locale.text_static("r5-back-settings"),
-            |m| matches!(m, Message::SettingsWindowsClose { .. }),
+        let config_label = app
+            .settings_locale
+            .text_static("settings-windows-open-config");
+        let config_click = |message: &Message| {
+            matches!(message, Message::SettingsPageAction { message, .. }
+                if matches!(&**message, Message::Wake(Wake::Tray(TrayAction::OpenConfig))))
+        };
+        let point = scene
+            .probe(&renderer)
+            .texts
+            .iter()
+            .find(|(label, _)| label == config_label)
+            .unwrap()
+            .1
+            .center();
+        assert!(!scene
+            .click(&renderer, point, iced::mouse::Button::Left)
+            .iter()
+            .any(config_click));
+        save(
+            &mut scene,
+            &mut renderer,
+            &app,
+            "windows-config-preview-disabled",
         );
         drop(scene);
-        let _ = update(&mut app, back);
+        app.launch_policy = runtime::parse_launch_policy(&["candidate.exe".into()]).unwrap();
+        let _ = Scene::new(&app, &renderer).hit_label(&renderer, config_label, config_click);
+        app.launch_policy = p1_preview_policy();
+        let display_still = app.settings_workbench.preview_image().unwrap().id();
+        p3_settings_intent(&mut app, SettingsMsg::SelectTab("picker".into()));
         assert!(app.settings_workbench.windows_panel.is_none());
-        complete(&mut app);
+        assert_eq!(
+            app.settings_workbench.preview_image().unwrap().id(),
+            display_still
+        );
+        assert!(app.settings_workbench.preview_completion().is_none());
+        app.settings_workbench.tab_reveal = None;
         hit_section(&mut app, &renderer, "settings-section-controls");
         let mut scene = Scene::new(&app, &renderer);
         assert!(!scene

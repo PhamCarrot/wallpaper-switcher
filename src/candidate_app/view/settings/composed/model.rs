@@ -76,6 +76,7 @@ pub enum Control {
     },
     Segment,
     Static,
+    PlatformForm,
     Code {
         snippet: &'static str,
     },
@@ -119,7 +120,7 @@ impl Control {
     }
 
     pub fn is_focusable(&self) -> bool {
-        !matches!(self, Self::Segment)
+        !matches!(self, Self::Segment | Self::PlatformForm)
     }
 }
 

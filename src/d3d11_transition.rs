@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 
 use windows::core::BOOL;
-use windows::Win32::Foundation::{HMODULE, HWND};
+use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, HMODULE, HWND};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
 };
@@ -246,7 +246,11 @@ impl D3d11TransitionRenderer {
     }
 
     pub fn present(&self) -> Result<(), String> {
-        unsafe { self.swap_chain.Present(0, DXGI_PRESENT(0)) }
+        let result = unsafe { self.swap_chain.Present(0, DXGI_PRESENT(0)) };
+        if result == DXGI_STATUS_OCCLUDED {
+            return Err("DXGI reported the desktop transition surface was occluded".into());
+        }
+        result
             .ok()
             .map_err(|error| format!("Could not present the D3D11 transition frame: {error}"))
     }

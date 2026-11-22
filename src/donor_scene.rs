@@ -13,7 +13,7 @@
 //! that shape through a later presentation branch.
 
 use crate::donor_layout::StageParams;
-use crate::gpu_gallery::{GalleryColors, SliceCard};
+use crate::gpu_gallery::{GalleryColors, SliceCard, POSTER_MATTE_RGB};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CardReadiness {
@@ -696,6 +696,9 @@ pub(crate) fn instance_for_card(
     // Setting it here interpreted the flip seed as parallax, clamped the
     // poster edge and bypassed the back-facing shader handoff entirely.
 
+    // The poster textures decode sRGB on sampling. Match that linear value
+    // when a card body has no resident texture to sample.
+    let [r, g, b] = POSTER_MATTE_RGB;
     InstanceRaw {
         rect: [
             card.center[0] * scale,
@@ -704,7 +707,7 @@ pub(crate) fn instance_for_card(
             card.size[1] * 0.5 * scale,
         ],
         radii: [card.corner_radius * scale; 4],
-        fill: [colors.surface[0], colors.surface[1], colors.surface[2], 1.0],
+        fill: iced::Color::from_rgb8(r, g, b).into_linear(),
         tint: [colors.surface[0], colors.surface[1], colors.surface[2], 0.0],
         border: [
             colors.accent[0],
@@ -830,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn donor_instance_omits_poster_and_border_for_unselected_card() {
+    fn donor_instance_uses_poster_matte_for_unselected_card_without_texture() {
         let card = SliceCard {
             triangle_direction: 0,
             index: 0,
@@ -846,7 +849,17 @@ mod tests {
             shape: 0,
             poster_aspect_ratio: 1.0,
         };
-        let instance = instance_for_card(&card, &GalleryColors::default(), 1.0, 0.0);
+        let colors = GalleryColors {
+            surface: [0.7, 0.4, 0.3],
+            accent: [0.3, 0.6, 0.9],
+            ..GalleryColors::default()
+        };
+        let instance = instance_for_card(&card, &colors, 1.0, 0.0);
+        assert_eq!(
+            instance.fill,
+            iced::Color::from_rgb8(30, 30, 46).into_linear()
+        );
+        assert_eq!(instance.border, [0.3, 0.6, 0.9, 0.0]);
         assert_eq!(instance.misc[0], 0);
         assert_eq!(instance.misc[3] & 2, 0);
         assert_eq!(instance.params[3], 0.0);
@@ -950,7 +963,7 @@ pub(crate) fn roll_raw(raw: &mut InstanceRaw, fraction: f32, incoming: bool) {
 }
 
 pub(crate) fn presented_hit_card(entry: &CardPresentation) -> Option<SliceCard> {
-    if entry.outgoing {
+    if entry.outgoing || entry.card.opacity <= 0.0 || entry.entrance <= 0.0 {
         return None;
     }
     let mut card = entry.card;
@@ -967,7 +980,7 @@ pub(crate) fn presented_slice_contains(
     viewport: [f32; 2],
     point: [f32; 2],
 ) -> bool {
-    if entry.outgoing {
+    if entry.outgoing || entry.card.opacity <= 0.0 || entry.entrance <= 0.0 {
         return false;
     }
     let mut raw = instance_for_card(&entry.card, colors, 1.0, 0.0);

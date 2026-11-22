@@ -210,7 +210,7 @@ pub fn field_input_style(pal: &Palette) -> iced::widget::text_input::Style {
 
 pub fn workbench_input_style(foreground: Color, accent: Color) -> iced::widget::text_input::Style {
     iced::widget::text_input::Style {
-        background: with_alpha(Color::BLACK, 0.58).into(),
+        background: with_alpha(Color::BLACK, 0.58 * foreground.a).into(),
         border: Border {
             color: with_alpha(foreground, 0.28),
             width: 1.0,

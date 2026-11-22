@@ -144,6 +144,7 @@ pub struct FocusCtx<'a> {
     pub expanded_details: &'a HashSet<String>,
     pub bar_reveals: &'a HashMap<String, Tween>,
     pub active_input: Option<&'a str>,
+    pub validation: &'a HashMap<String, String>,
     pub armed: Option<ActionId>,
 }
 
@@ -157,6 +158,33 @@ impl FocusCtx<'_> {
         self.bar_reveals
             .get(id)
             .map_or((false, 0.0), |reveal| (reveal.target > 0.5, reveal.x))
+    }
+
+    fn validation_for(self, control: &Control) -> Option<String> {
+        match control {
+            Control::Number { path, .. } | Control::TextField { path, .. } => {
+                self.validation.get(path).cloned()
+            }
+            Control::Resolution { path, .. } => [format!("{path}.width"), format!("{path}.height")]
+                .iter()
+                .find_map(|key| self.validation.get(key).cloned()),
+            _ => None,
+        }
+    }
+}
+
+fn with_validation<'a>(
+    field: Element<'a, Message>,
+    error: Option<String>,
+    scale: f32,
+    palette: &Palette,
+) -> Element<'a, Message> {
+    if let Some(error) = error {
+        column![field, label(error, TYPE_SMALL, scale, palette.tertiary)]
+            .spacing(3.0 * scale)
+            .into()
+    } else {
+        field
     }
 }
 
@@ -173,6 +201,7 @@ pub struct KeybindCaptureView {
     pub title: String,
     pub binding: String,
     pub edited: bool,
+    pub wheel: bool,
     pub conflict: Option<String>,
 }
 
@@ -182,6 +211,7 @@ pub struct ProcessPickerView {
     pub running: Vec<String>,
     pub query: String,
     pub manual: String,
+    pub manual_error: Option<String>,
     pub scroll: f32,
 }
 
@@ -198,7 +228,8 @@ pub struct WorkbenchInput<'a, 's> {
     pub search_results: &'a [SettingsSearchResult],
     pub keybind_capture: Option<KeybindCaptureView>,
     pub process_picker: Option<ProcessPickerView>,
-    pub status: &'a str,
+    pub save_status: SaveStatus,
+    pub platform_form: Option<Element<'a, Message>>,
 }
 
 pub fn settings_workbench<'a>(input: WorkbenchInput<'a, '_>) -> Element<'a, Message> {
@@ -219,7 +250,8 @@ pub fn settings_workbench<'a>(input: WorkbenchInput<'a, '_>) -> Element<'a, Mess
         search_results,
         keybind_capture,
         process_picker,
-        status,
+        save_status,
+        platform_form,
     } = input;
     let ChromeCtx {
         viewport,
@@ -279,6 +311,7 @@ pub fn settings_workbench<'a>(input: WorkbenchInput<'a, '_>) -> Element<'a, Mess
             stash_available: source.config.stash_available(),
             card,
             settings,
+            platform_form,
             values: source.values,
             has_selected_preset,
             available_width: panel_width - FOLIO_INDEX_WIDTH * scale.max(0.9),
@@ -294,13 +327,18 @@ pub fn settings_workbench<'a>(input: WorkbenchInput<'a, '_>) -> Element<'a, Mess
             .width(Length::Fill)
             .height(Length::Fill)
             .content_fit(iced::ContentFit::Cover)
-            .opacity(0.045 * reveal)
+            .opacity(0.045 * reveal * palette.surface.a)
             .into()
     } else {
         iced::widget::Space::new()
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    };
+    let page_status = if process_picker.is_some() || keybind_capture.is_some() {
+        SaveStatus::default()
+    } else {
+        save_status.clone()
     };
     let page = container(stack![
         atmosphere,
@@ -311,7 +349,7 @@ pub fn settings_workbench<'a>(input: WorkbenchInput<'a, '_>) -> Element<'a, Mess
         })
         .width(Length::Fill)
         .height(Length::Fill),
-        column![reading, status_footer(status, scale, palette)].height(Length::Fill),
+        column![reading, status_footer(page_status, scale, palette)].height(Length::Fill),
     ])
     .width(Length::Fill)
     .height(Length::Fill)
@@ -337,50 +375,90 @@ pub fn settings_workbench<'a>(input: WorkbenchInput<'a, '_>) -> Element<'a, Mess
             container(text(""))
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(move |_| crate::donor_folio::source_ui::folio_scrim_style(reveal)),
+                .style(move |_| crate::donor_folio::source_ui::folio_scrim_style(
+                    reveal * palette.surface.a
+                )),
         )
-        .on_press(Message::ToggleSettings)
+        .on_press(Message::Backdrop)
         .on_scroll(|_| Message::Noop),
-        container(crate::donor_folio::sheet_panel(
-            iced::widget::opaque(panel),
-            Message::Noop
-        ))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill),
+        container(crate::donor_folio::sheet_panel(panel.into(), Message::Noop))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill),
     ];
     if let Some(capture) = keybind_capture {
         layers = layers.push(keybind_capture_layer(
-            catalog, capture, scale, palette, reveal,
+            catalog,
+            capture,
+            scale,
+            palette,
+            reveal,
+            save_status.clone(),
         ));
     }
     if let Some(picker) = process_picker {
         layers = layers.push(process_picker_layer(
-            catalog, picker, scale, palette, reveal, status,
+            catalog,
+            picker,
+            scale,
+            palette,
+            reveal,
+            save_status,
         ));
     }
     layers.into()
 }
 
-fn status_footer<'a>(status: &'a str, scale: f32, palette: &'a Palette) -> Element<'a, Message> {
-    if status.is_empty() {
+#[derive(Clone, Default)]
+pub struct SaveStatus {
+    pub notice: Option<String>,
+    pub details: Option<String>,
+    pub expanded: bool,
+}
+
+pub(in crate::candidate_app::view::settings) fn status_footer<'a>(
+    status: SaveStatus,
+    scale: f32,
+    palette: &'a Palette,
+) -> Element<'a, Message> {
+    let Some(notice) = status.notice else {
         return iced::widget::Space::new().height(0.0).into();
+    };
+    let mut strip = iced::widget::row![text(notice)
+        .font(crate::donor_folio::source_ui::UI_FONT)
+        .size(12.0 * legible_type_scale(scale))
+        .color(palette.surface_text)
+        .width(Length::Fill),]
+    .align_y(Alignment::Center);
+    let mut details = None;
+    if let Some(message) = status.details {
+        strip = strip.push(
+            button(text(if status.expanded {
+                "Hide details"
+            } else {
+                "Details"
+            }))
+            .on_press(Message::Settings(SettingsMsg::ToggleSaveDetails)),
+        );
+        if status.expanded {
+            details = Some(
+                scrollable(text(message).size(12.0 * legible_type_scale(scale)))
+                    .height(Length::Fixed(86.0 * scale)),
+            );
+        }
     }
-    container(scrollable(
-        text(status)
-            .font(crate::donor_folio::source_ui::UI_FONT)
-            .size(12.0 * crate::donor_folio::source_ui::legible_type_scale(scale))
-            .color(palette.surface_text)
-            .width(Length::Fill),
-    ))
-    .height(Length::Fixed(60.0 * scale))
-    .width(Length::Fill)
-    .padding([8.0 * scale, 14.0 * scale])
-    .style(move |_| {
-        crate::donor_folio::source_ui::bg_style(Background::Color(palette.surface_container))
-    })
-    .into()
+    let mut body = column![strip];
+    if let Some(details) = details {
+        body = body.push(details);
+    }
+    container(body)
+        .padding([5.0 * scale, 12.0 * scale])
+        .width(Length::Fill)
+        .style(move |_| {
+            crate::donor_folio::source_ui::bg_style(Background::Color(palette.surface_container))
+        })
+        .into()
 }
 
 fn process_picker_layer<'a>(
@@ -389,7 +467,7 @@ fn process_picker_layer<'a>(
     scale: f32,
     palette: &'a Palette,
     reveal: f32,
-    status: &'a str,
+    status: SaveStatus,
 ) -> Element<'a, Message> {
     let tr = |key| catalog.text_static(key);
     let rtl = catalog.language.rtl;
@@ -399,6 +477,7 @@ fn process_picker_layer<'a>(
         running,
         query,
         manual,
+        manual_error,
         scroll,
     } = picker;
     let rail_count = running.len().max(2);
@@ -526,6 +605,10 @@ fn process_picker_layer<'a>(
         scale * 0.82,
         palette,
     );
+    let manual_error: Element<'a, Message> = match manual_error {
+        Some(error) => label(error, TYPE_SMALL, scale, palette.tertiary).into(),
+        None => iced::widget::Space::new().height(0.0).into(),
+    };
     let body = column![
         flow![rtl;
             label(
@@ -609,6 +692,7 @@ fn process_picker_layer<'a>(
         ]
         .spacing(8.0 * scale)
         .align_y(Alignment::Center),
+        manual_error,
         flow![rtl;
             scrollable(running_rows)
                 .height(Length::Fixed(142.0 * scale))
@@ -652,7 +736,9 @@ fn process_picker_layer<'a>(
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
-            .style(move |_| crate::donor_folio::source_ui::folio_scrim_style(0.6 * reveal)),
+            .style(move |_| {
+                crate::donor_folio::source_ui::folio_scrim_style(0.6 * reveal * palette.surface.a)
+            }),
     )
     .on_press(Message::Settings(SettingsMsg::ProcessPickerClose))
     .into()
@@ -664,6 +750,7 @@ fn keybind_capture_layer<'a>(
     scale: f32,
     palette: &'a Palette,
     reveal: f32,
+    status: SaveStatus,
 ) -> Element<'a, Message> {
     let tr = |key| catalog.text_static(key);
     let rtl = catalog.language.rtl;
@@ -672,6 +759,7 @@ fn keybind_capture_layer<'a>(
         title,
         binding,
         edited,
+        wheel,
         conflict,
     } = capture;
     let action_scale = scale * 0.82;
@@ -689,7 +777,7 @@ fn keybind_capture_layer<'a>(
             palette,
         )
     };
-    let pad = mouse_area(
+    let mut pad = mouse_area(
         container(label(
             binding,
             22.0,
@@ -729,6 +817,18 @@ fn keybind_capture_layer<'a>(
     .on_middle_press(Message::Settings(SettingsMsg::KeybindCaptureClick(
         crate::candidate_app::view::settings::composed::input::MouseButton::Middle,
     )));
+    if wheel {
+        pad = pad.on_scroll(|delta| {
+            use crate::candidate_app::view::settings::composed::input::WheelDirection;
+            let amount = match delta {
+                iced::mouse::ScrollDelta::Pixels { y, .. }
+                | iced::mouse::ScrollDelta::Lines { y, .. } => y,
+            };
+            WheelDirection::from_delta(amount).map_or(Message::Noop, |direction| {
+                Message::Settings(SettingsMsg::KeybindCaptureWheel(direction))
+            })
+        });
+    }
     let mut body = column![
         label(
             title,
@@ -738,7 +838,11 @@ fn keybind_capture_layer<'a>(
         ),
         pad,
         label(
-            tr("settings-keybind-capture-hint"),
+            tr(if wheel {
+                "settings-keybind-wheel-capture-hint"
+            } else {
+                "settings-keybind-capture-hint"
+            }),
             TYPE_SMALL,
             scale,
             with_alpha(palette.surface_text, 0.58),
@@ -773,6 +877,7 @@ fn keybind_capture_layer<'a>(
         .spacing(8.0 * scale)
         .align_y(Alignment::Center),
     );
+    body = body.push(status_footer(status, scale, palette));
     let panel = mouse_area(
         container(body)
             .width(Length::Fixed(390.0 * scale.max(0.9)))
@@ -788,7 +893,9 @@ fn keybind_capture_layer<'a>(
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
-            .style(move |_| crate::donor_folio::source_ui::folio_scrim_style(0.6 * reveal)),
+            .style(move |_| {
+                crate::donor_folio::source_ui::folio_scrim_style(0.6 * reveal * palette.surface.a)
+            }),
     )
     .on_press(Message::Settings(SettingsMsg::KeybindCaptureCancel))
     .into()
@@ -821,11 +928,15 @@ pub fn picker_layout_workbench<'a>(
     let reveal = crate::donor_folio::source_ui::motion::smoothstep(entrance.clamp(0.0, 1.0));
     let panel_width = crate::donor_folio::source_ui::picker_layout_studio_width(viewport.0, scale);
     let panel_height = (viewport.1 - 36.0 * scale).max(360.0);
+    let compact_height = panel_height < 370.0 * scale;
 
     let mut pinned = column![].spacing(10.0 * scale);
     let mut controls = column![].spacing(13.0 * scale);
+    let mut compact_mode = None;
     for (index, setting) in rows.into_iter().enumerate() {
-        let is_pinned = setting.title == tr("settings-selector-display-mode-label")
+        let validation = focus.validation_for(&setting.control);
+        let is_mode = setting.title == tr("settings-selector-display-mode-label");
+        let is_pinned = is_mode
             || matches!(
                 &setting.control,
                 Control::TextField { key, .. } if key == crate::candidate_app::view::settings::composed::PRESET_NAME_KEY
@@ -838,13 +949,16 @@ pub fn picker_layout_workbench<'a>(
             source.values,
             has_selected_preset,
             focus,
-            panel_width - 42.0 * scale,
+            panel_width - if compact_height { 54.0 } else { 42.0 } * scale,
             scale,
             palette,
             GLYPH_FADE,
             motion,
         );
-        if is_pinned {
+        let field = with_validation(field, validation, scale, palette);
+        if is_mode && compact_height {
+            compact_mode = Some(field);
+        } else if is_pinned {
             pinned = pinned.push(field);
         } else {
             controls = controls.push(field);
@@ -880,23 +994,37 @@ pub fn picker_layout_workbench<'a>(
         ),
     ]
     .align_y(Alignment::Center);
-    let intro = column![
-        page_actions,
-        label(
-            tr_args!(catalog, "settings-studio-title", mode => mode),
-            31.0,
-            scale,
-            with_alpha(palette.surface_text, GLYPH_FADE)
-        ),
-        label(
-            tr("settings-studio-intro"),
-            TYPE_SMALL,
-            scale,
-            with_alpha(palette.surface_text, 0.58),
-        )
-        .line_height(iced::widget::text::LineHeight::Relative(1.35)),
-    ]
-    .spacing(7.0 * scale);
+    let intro = if compact_height {
+        column![page_actions]
+    } else {
+        column![
+            page_actions,
+            label(
+                tr_args!(catalog, "settings-studio-title", mode => mode),
+                31.0,
+                scale,
+                with_alpha(palette.surface_text, GLYPH_FADE)
+            ),
+            label(
+                tr("settings-studio-intro"),
+                TYPE_SMALL,
+                scale,
+                with_alpha(palette.surface_text, 0.58),
+            )
+            .line_height(iced::widget::text::LineHeight::Relative(1.35)),
+        ]
+        .spacing(7.0 * scale)
+    };
+    // On a short scaled viewport, let the entire form scroll so pinned
+    // preset groups cannot consume all height needed by their own editors.
+    let (pinned, controls) = if compact_height {
+        if let Some(mode) = compact_mode {
+            pinned = pinned.push(mode);
+        }
+        (None, pinned.push(controls))
+    } else {
+        (Some(pinned), controls)
+    };
     let scroll = scrollable(controls.padding(Padding {
         top: 1.0,
         right: 10.0 * scale,
@@ -909,10 +1037,14 @@ pub fn picker_layout_workbench<'a>(
         0.72,
     )))
     .height(Length::Fill);
-    let page = column![intro, pinned, scroll]
-        .spacing(15.0 * scale)
-        .height(Length::Fill)
-        .padding([17.0 * scale, 19.0 * scale]);
+    let page = if let Some(pinned) = pinned {
+        column![intro, pinned, scroll]
+    } else {
+        column![intro, scroll]
+    }
+    .spacing(if compact_height { 7.0 } else { 15.0 } * scale)
+    .height(Length::Fill)
+    .padding([17.0 * scale, 19.0 * scale]);
     let surface = stack![
         container(text(""))
             .width(Length::Fill)
@@ -945,7 +1077,7 @@ pub fn picker_layout_workbench<'a>(
                     with_alpha(palette.outline, 0.72 * reveal),
                 );
                 style.shadow = iced::Shadow {
-                    color: with_alpha(Color::BLACK, 0.4 * reveal),
+                    color: with_alpha(Color::BLACK, 0.4 * reveal * palette.surface.a),
                     offset: iced::Vector::new(8.0, 14.0),
                     blur_radius: 36.0,
                 };
@@ -971,6 +1103,35 @@ pub fn picker_layout_workbench<'a>(
         .into()
 }
 
+fn option_reveal_opacity(progress: f32) -> f32 {
+    // Keep the labels readable and the controls usable throughout the reveal.
+    0.55 + 0.45 * progress.clamp(0.0, 1.0)
+}
+
+pub(in crate::candidate_app::view::settings) fn layout_option_reveal_key(
+    control: &Control,
+) -> Option<String> {
+    use super::super::composed::keys::selector as key;
+    let path = match control {
+        Control::Number { path, .. }
+        | Control::Toggle { path, .. }
+        | Control::Chips { path, .. } => path,
+        _ => return None,
+    };
+    matches!(
+        path.as_str(),
+        key::HEX_ARC_INTENSITY_X10
+            | key::HEX_CURVE_FREQUENCY
+            | key::HEX_ORBIT_RADIUS
+            | key::GRID_STAGGER
+            | key::GRID_CYLINDER_BEND
+            | key::GRID_CYLINDER_RADIUS
+            | key::HEX_PARALLAX
+            | key::SLICE_PARALLAX
+    )
+    .then(|| format!("layout-option:{path}"))
+}
+
 fn picker_layout_field<'a>(
     catalog: &Catalog,
     setting: Row,
@@ -986,6 +1147,9 @@ fn picker_layout_field<'a>(
 ) -> Element<'a, Message> {
     let tr = |key| catalog.text_static(key);
     let rtl = catalog.language.rtl;
+    let fade = layout_option_reveal_key(&setting.control)
+        .and_then(|key| focus.bar_reveals.get(&key))
+        .map_or(fade, |tween| fade * option_reveal_opacity(tween.x));
 
     if let Control::AppTheme { app } = &setting.control {
         return super::app_theme::view(
@@ -1002,7 +1166,8 @@ fn picker_layout_field<'a>(
     }
     if setting.control.is_inline_editor() {
         let (focused, focused_choice) = focus.on(SettingsFocus::Controls, index);
-        return compact_inline_field(
+        let validation = focus.validation_for(&setting.control);
+        let field = compact_inline_field(
             catalog,
             setting,
             index,
@@ -1016,9 +1181,11 @@ fn picker_layout_field<'a>(
             fade,
             motion,
         );
+        return with_validation(field, validation, scale, palette);
     }
     if setting.control.is_group_editor() {
-        return compact_group_field(
+        let validation = focus.validation_for(&setting.control);
+        let field = compact_group_field(
             catalog,
             setting,
             index,
@@ -1031,6 +1198,7 @@ fn picker_layout_field<'a>(
             fade,
             motion,
         );
+        return with_validation(field, validation, scale, palette);
     }
     let (focused, focused_choice) = focus.on(SettingsFocus::Controls, index);
     if setting.control.is_compact_action() {
@@ -1059,6 +1227,8 @@ fn picker_layout_field<'a>(
             } => control_key == key,
             _ => false,
         });
+    let compact_presets =
+        matches!(&setting.control, Control::Presets { .. }) && available_width < 135.0 * scale;
     let title = if setting.title.is_empty() {
         tr("settings-selector-saved-styles-label").to_string()
     } else {
@@ -1084,34 +1254,46 @@ fn picker_layout_field<'a>(
     } else {
         palette.outline
     };
-    mouse_area(
-        container(
-            column![
+    let mut field = column![].spacing(7.0 * scale);
+    if !compact_presets {
+        field = field
+            .push(
                 container(text(""))
                     .width(Length::Fill)
                     .height(Length::Fixed(2.0))
-                    .style(
-                        move |_| crate::donor_folio::source_ui::bg_style(Background::Color(
-                            with_alpha(line, if focused || locked { 0.9 } else { 0.42 },)
-                        ))
-                    ),
-                label(title, 13.0, scale, with_alpha(palette.surface_text, fade)),
-                label(
-                    setting.desc,
-                    TYPE_SMALL,
-                    scale,
-                    with_alpha(palette.surface_text, 0.54)
-                )
-                .line_height(iced::widget::text::LineHeight::Relative(1.3)),
-                container(widget).padding(Padding {
-                    top: 4.0 * scale,
-                    ..Padding::ZERO
-                }),
-            ]
-            .spacing(7.0 * scale),
-        )
-        .width(Length::Fill)
-        .padding([0.0, 3.0 * scale]),
+                    .style(move |_| {
+                        crate::donor_folio::source_ui::bg_style(Background::Color(with_alpha(
+                            line,
+                            if focused || locked { 0.9 } else { 0.42 },
+                        )))
+                    }),
+            )
+            .push(label(
+                title,
+                13.0,
+                scale,
+                with_alpha(palette.surface_text, fade),
+            ));
+    }
+    if !setting.desc.is_empty() {
+        field = field.push(
+            label(
+                setting.desc,
+                TYPE_SMALL,
+                scale,
+                with_alpha(palette.surface_text, 0.54),
+            )
+            .line_height(iced::widget::text::LineHeight::Relative(1.3)),
+        );
+    }
+    field = field.push(container(widget).padding(Padding {
+        top: 4.0 * scale,
+        ..Padding::ZERO
+    }));
+    mouse_area(
+        container(field)
+            .width(Length::Fill)
+            .padding([0.0, 3.0 * scale]),
     )
     .on_press(Message::Settings(SettingsMsg::FocusControl(index)))
     .into()
@@ -1173,13 +1355,13 @@ fn navigation<'a>(
             )
             .width(Length::Fill)
             .padding([8.0 * scale, 8.0 * scale])
-            .on_press(Message::Settings(SettingsMsg::SelectTab(key.to_string())))
-            .style(move |_theme, status| {
+            .on_press(Message::Settings(SettingsMsg::SelectTab(key.to_string())));
+            let category = category.style(move |_, status| {
                 line_button_style(active, index_focused && active, palette, fade, status)
             });
-            tree = tree.push(category);
+            let mut group = column![category].spacing(scale);
             if active {
-                tree = tree.push(section_branch(
+                group = group.push(section_branch(
                     catalog,
                     sections,
                     selected_section,
@@ -1190,6 +1372,7 @@ fn navigation<'a>(
                     branch_reveal,
                 ));
             }
+            tree = tree.push(group);
         }
         tree.into()
     };
@@ -1380,30 +1563,28 @@ fn section_branch<'a>(
     let mut children = column![].spacing(1.0 * scale);
     for (index, title) in sections.iter().copied() {
         let active = index == selected;
-        children = children.push(
-            button(
-                flow![rtl;
-                    label(
-                        if active { "◆" } else { "◇" },
-                        8.0,
-                        scale,
-                        with_alpha(palette.primary, if active { fade } else { 0.44 * fade }),
-                    ),
-                    text(title)
-                        .font(crate::donor_folio::source_ui::UI_FONT)
-                        .size(11.5 * legible_type_scale(scale)),
-                    container(text("")).width(Length::Fill),
-                ]
-                .spacing(9.0 * scale)
-                .align_y(Alignment::Center),
-            )
-            .width(Length::Fill)
-            .padding([7.0 * scale, 7.0 * scale])
-            .on_press(Message::Settings(SettingsMsg::SelectSection(index)))
-            .style(move |_theme, status| {
-                line_button_style(active, keyboard_focused && active, palette, fade, status)
-            }),
-        );
+        let hit = button(
+            flow![rtl;
+                label(
+                    if active { "◆" } else { "◇" },
+                    8.0,
+                    scale,
+                    with_alpha(palette.primary, if active { fade } else { 0.44 * fade }),
+                ),
+                text(title)
+                    .font(crate::donor_folio::source_ui::UI_FONT)
+                    .size(11.5 * legible_type_scale(scale)),
+                container(text("")).width(Length::Fill),
+            ]
+            .spacing(9.0 * scale)
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([7.0 * scale, 7.0 * scale])
+        .on_press(Message::Settings(SettingsMsg::SelectSection(index)));
+        children = children.push(hit.style(move |_, status| {
+            line_button_style(active, keyboard_focused && active, palette, fade, status)
+        }));
     }
     let guide = container(text(""))
         .width(Length::Fixed(1.0))
@@ -1439,6 +1620,7 @@ struct ReadingInput<'a> {
     stash_available: bool,
     card: Card,
     settings: Vec<Row>,
+    platform_form: Option<Element<'a, Message>>,
     values: &'a HashMap<String, String>,
     has_selected_preset: bool,
     available_width: f32,
@@ -1467,6 +1649,7 @@ fn reading_surface<'a>(
         stash_available,
         card,
         settings,
+        platform_form,
         values,
         has_selected_preset,
         available_width,
@@ -1519,19 +1702,26 @@ fn reading_surface<'a>(
     let (_, column_width, single_column) = reading_columns(available_width, scale);
     let narrow_bindings = section_title == tr("settings-section-controls")
         && column_width < 280.0 * legible_type_scale(scale);
-    let controls = field_grid(
-        catalog,
-        settings,
-        tab == "sources" || single_column || narrow_bindings,
-        values,
-        has_selected_preset,
-        focus,
-        column_width,
-        scale,
-        palette,
-        fade,
-        motion,
-    );
+    let controls = if settings
+        .iter()
+        .any(|row| matches!(row.control, Control::PlatformForm))
+    {
+        platform_form.unwrap_or_else(|| iced::widget::Space::new().into())
+    } else {
+        field_grid(
+            catalog,
+            settings,
+            tab == "sources" || single_column || narrow_bindings,
+            values,
+            has_selected_preset,
+            focus,
+            column_width,
+            scale,
+            palette,
+            fade,
+            motion,
+        )
+    };
     let page = column![header, controls].spacing(28.0 * scale);
     scrollable(container(page).width(Length::Fill).padding(Padding {
         top: 34.0 * scale,
@@ -1863,7 +2053,13 @@ fn compact_inline_field<'a>(
         _ => unreachable!("compact inline field requires one scalar editor"),
     };
     let copy_width = (available_width - editor_width - 44.0 * scale).max(72.0 * scale);
-    let copy = compact_field_copy(&title, &desc, copy_width, scale, palette, fade);
+    let stacked = editor_width + copy_width + 27.0 * scale > available_width;
+    let is_preset_name = matches!(&control, Control::TextField { key, .. } if key == crate::candidate_app::view::settings::composed::PRESET_NAME_KEY);
+    let editor_width = if stacked {
+        available_width
+    } else {
+        editor_width
+    };
     let editor = control::widget(
         catalog,
         control,
@@ -1879,6 +2075,23 @@ fn compact_inline_field<'a>(
         motion,
         None,
     );
+    if stacked {
+        let copy = compact_field_copy(
+            &title,
+            if is_preset_name { "" } else { &desc },
+            available_width,
+            scale,
+            palette,
+            fade,
+        );
+        return column![
+            mouse_area(copy).on_press(Message::Settings(SettingsMsg::FocusControl(index))),
+            container(editor).width(Length::Fixed(editor_width)),
+        ]
+        .spacing(4.0 * scale)
+        .into();
+    }
+    let copy = compact_field_copy(&title, &desc, copy_width, scale, palette, fade);
     crate::donor_folio::source_ui::folio_inline_bar(
         rtl,
         copy,
@@ -2632,6 +2845,50 @@ struct Blueprint {
 mod tests {
     use super::*;
     use crate::candidate_app::view::settings::composed::test_source::FakeSettingsSource;
+
+    #[test]
+    fn conditional_layout_option_opacity_reaches_full_strength() {
+        let start = option_reveal_opacity(0.0);
+        let middle = option_reveal_opacity(0.5);
+        let end = option_reveal_opacity(1.0);
+        assert!(start < middle);
+        assert!(middle < end);
+        assert_eq!(end, 1.0);
+    }
+
+    #[test]
+    fn layout_option_reveal_keys_cover_conditional_and_parallax_controls() {
+        use crate::candidate_app::view::settings::composed::keys::selector;
+
+        for path in [
+            selector::HEX_ARC_INTENSITY_X10,
+            selector::HEX_CURVE_FREQUENCY,
+            selector::HEX_ORBIT_RADIUS,
+            selector::GRID_STAGGER,
+            selector::GRID_CYLINDER_BEND,
+            selector::GRID_CYLINDER_RADIUS,
+        ] {
+            assert_eq!(
+                layout_option_reveal_key(&Control::Number {
+                    key: path.into(),
+                    path: path.into(),
+                    unit: "",
+                }),
+                Some(format!("layout-option:{path}"))
+            );
+        }
+        for path in [selector::HEX_PARALLAX, selector::SLICE_PARALLAX] {
+            assert_eq!(
+                layout_option_reveal_key(&Control::Toggle {
+                    path: path.into(),
+                    value: false,
+                }),
+                Some(format!("layout-option:{path}"))
+            );
+        }
+        assert!(layout_option_reveal_key(&Control::Static).is_none());
+    }
+
     fn palette() -> Palette {
         Palette::from_rgb([0.1; 3], [0.2; 3], [0.9; 3], [0.3, 0.6, 0.8])
     }
@@ -2700,6 +2957,7 @@ mod tests {
                             expanded_details: &expanded,
                             bar_reveals: &reveals,
                             active_input: None,
+                            validation: &HashMap::new(),
                             armed: None,
                         };
                         let rows = (0..n)
@@ -2854,6 +3112,7 @@ mod tests {
                 expanded_details: &expanded,
                 bar_reveals: &reveals,
                 active_input: None,
+                validation: &HashMap::new(),
                 armed: None,
             };
             assert_eq!(reading_columns(width, scale).2, full_width);
@@ -2877,6 +3136,7 @@ mod tests {
                     stash_available: false,
                     card,
                     settings,
+                    platform_form: None,
                     values: &values,
                     has_selected_preset: false,
                     available_width: width,
@@ -2999,6 +3259,7 @@ mod tests {
                     expanded_details: &expanded,
                     bar_reveals: &reveals,
                     active_input: None,
+                    validation: &HashMap::new(),
                     armed: None,
                 };
                 let chrome = ChromeCtx {
@@ -3020,7 +3281,12 @@ mod tests {
                     search_results: &[],
                     keybind_capture: None,
                     process_picker: None,
-                    status: "Saved pending. This operation is unavailable in this build.",
+                    save_status: SaveStatus {
+                        notice: Some("Settings saved (execution pending)".into()),
+                        details: Some("This operation is unavailable in this build.".into()),
+                        expanded: false,
+                    },
+                    platform_form: None,
                 });
                 assert!(
                     !iced::advanced::widget::Tree::new(&element)
@@ -3051,6 +3317,7 @@ mod tests {
                 expanded_details: &expanded,
                 bar_reveals: &reveals,
                 active_input: None,
+                validation: &HashMap::new(),
                 armed: None,
             };
             let chrome = ChromeCtx {
@@ -3145,6 +3412,7 @@ mod tests {
                     expanded_details: &expanded,
                     bar_reveals: &reveals,
                     active_input: None,
+                    validation: &HashMap::new(),
                     armed: None,
                 };
                 let mut element = if picker {

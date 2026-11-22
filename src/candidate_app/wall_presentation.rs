@@ -15,22 +15,40 @@ pub(super) struct WallPresentation {
     pub camera: GalleryMotionState,
     pub params: WallParams,
     pub target: WallParams,
-    pub aspects: Vec<f32>,
+    topology_from: Option<WallTopologySource>,
+    topology_progress: f32,
+    pub aspects: Arc<[f32]>,
+    positions: Arc<HashMap<String, usize>>,
+    layouts: std::cell::RefCell<[Option<Arc<gpu_gallery::WallLayoutWindow>>; 2]>,
     pub duration: f32,
     pub morph_ms: f32,
     pub entrance: GalleryMotionState,
     pub launch: donor_scene::LaunchAnimation,
 }
 
+#[derive(Debug, Clone)]
+struct WallTopologySource {
+    cards: Arc<[SliceCard]>,
+    clip: [f32; 4],
+}
+
 impl WallPresentation {
     pub fn new(
-        ids: Vec<String>,
+        ids: impl Into<Arc<[String]>>,
         selected: String,
         params: WallParams,
-        aspects: Vec<f32>,
+        aspects: impl Into<Arc<[f32]>>,
         duration: f32,
     ) -> Self {
+        let ids = ids.into();
         Self {
+            positions: Arc::new(
+                ids.iter()
+                    .enumerate()
+                    .map(|(i, id)| (id.clone(), i))
+                    .collect(),
+            ),
+            layouts: Default::default(),
             ids: ids.into(),
             selected,
             hover: None,
@@ -40,7 +58,9 @@ impl WallPresentation {
             camera: GalleryMotionState::source(0.0, 0.0, duration, 1.0),
             params,
             target: params,
-            aspects,
+            topology_from: None,
+            topology_progress: 1.0,
+            aspects: aspects.into(),
             duration,
             morph_ms: 250.0,
             entrance: GalleryMotionState::source(1.0, 1.0, 250.0, 1.0),
@@ -48,24 +68,40 @@ impl WallPresentation {
         }
     }
 
+    fn layout_for(&self, params: WallParams) -> Arc<gpu_gallery::WallLayoutWindow> {
+        let mut layouts = self.layouts.borrow_mut();
+        if layouts[1].as_ref().is_some_and(|p| p.matches(params)) {
+            layouts.swap(0, 1);
+        } else if layouts[0].as_ref().is_none_or(|p| !p.matches(params)) {
+            layouts[1] = layouts[0].take();
+            layouts[0] = Some(Arc::new(gpu_gallery::WallLayoutWindow::new(
+                self.ids.len(),
+                params,
+                &self.aspects,
+            )));
+        }
+        Arc::clone(layouts[0].as_ref().unwrap())
+    }
+
+    fn layout(&self) -> Arc<gpu_gallery::WallLayoutWindow> {
+        self.layout_for(if self.topology_from.is_some() {
+            self.target
+        } else {
+            self.params
+        })
+    }
+
     fn bounds(&self) -> f32 {
-        let (p, placements) =
-            gpu_gallery::wall_placements(self.ids.len(), self.params, &self.aspects);
-        (placements
-            .iter()
-            .map(|c| c.y + c.height)
-            .fold(0.0, f32::max)
-            - p.total_h())
-        .max(0.0)
+        self.layout().max_scroll
     }
 
     /// Restoration is an explicit anchor; ordinary selection never recenters the camera.
     pub fn restore(&mut self, index: usize, camera: Option<f32>) {
-        let (p, placements) =
-            gpu_gallery::wall_placements(self.ids.len(), self.params, &self.aspects);
-        let anchor = placements
-            .iter()
-            .find(|c| c.index == index)
+        let layout = self.layout();
+        let p = &layout.donor;
+        let anchor = layout
+            .placements
+            .get(index)
             .map_or(0.0, |c| c.y + c.height * 0.5 - p.total_h() * 0.5);
         let value = camera
             .filter(|v| v.is_finite())
@@ -76,8 +112,14 @@ impl WallPresentation {
     }
 
     pub fn follow(&mut self, index: usize) {
-        let (p, _) = gpu_gallery::wall_placements(self.ids.len(), self.params, &self.aspects);
-        let (top, height) = if matches!(self.params.layout, WallLayout::Editorial) {
+        let layout = self.layout();
+        let p = &layout.donor;
+        let (top, height) = if self.topology_from.is_some() {
+            let Some(placement) = layout.placements.get(index) else {
+                return;
+            };
+            (placement.y, placement.height)
+        } else if matches!(self.params.layout, WallLayout::Editorial) {
             let height = p.thumb_h * 2.0 + p.gap_y;
             ((index / 5) as f32 * (height + p.gap_y), height)
         } else {
@@ -91,7 +133,7 @@ impl WallPresentation {
             self.camera.target
         };
         self.camera
-            .retarget_source(target.clamp(0.0, self.bounds()));
+            .retarget_source(target.clamp(0.0, layout.max_scroll));
     }
 
     pub fn wheel(&mut self, delta: f32) {
@@ -123,16 +165,27 @@ impl WallPresentation {
             cylinder_bend,
             cylinder_radius
         );
-        self.params.columns = self.target.columns;
-        self.params.rows = self.target.rows;
-        self.params.layout = self.target.layout;
+        let topology_moving = if self.topology_from.is_some() {
+            self.topology_progress += (1.0 - self.topology_progress)
+                * (1.0 - (-dt.min(0.05) * 1000.0 / (self.morph_ms / 4.0).max(1.0)).exp());
+            if self.topology_progress >= 0.995 {
+                self.topology_progress = 1.0;
+                self.params = self.target;
+                self.topology_from = None;
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
         if !self.params.stage.settled_to(&self.target.stage) {
             self.params.stage.morph_toward(&self.target.stage, amount);
             moving = true;
         }
         self.camera
             .retarget_source(self.camera.target.clamp(0.0, self.bounds()));
-        moving |= self.camera.tick(dt);
+        moving |= self.camera.tick(dt) || topology_moving;
         moving |= self.entrance.tick(dt);
         if let Some(id) = &self.hover {
             self.fades
@@ -150,12 +203,17 @@ impl WallPresentation {
     pub fn settle(&mut self) {
         self.entrance = GalleryMotionState::source(1.0, 1.0, 250.0, 1.0);
         self.params = self.target;
+        self.topology_from = None;
+        self.topology_progress = 1.0;
         let target = self.camera.target.clamp(0.0, self.bounds());
         self.camera = GalleryMotionState::source(target, target, self.duration, 1.0);
     }
 
     pub fn frame_params(&self, composition: WallParams) -> WallParams {
-        let mut p = self.params;
+        self.compose(self.params, composition)
+    }
+
+    fn compose(&self, mut p: WallParams, composition: WallParams) -> WallParams {
         p.rail_height = composition.rail_height;
         p.rail_width = composition.rail_width;
         p.rail_rtl = composition.rail_rtl;
@@ -166,62 +224,114 @@ impl WallPresentation {
         p
     }
 
+    pub fn clip(&self, viewport: [f32; 2], composition: WallParams) -> [f32; 4] {
+        let Some(from) = &self.topology_from else {
+            return gpu_gallery::wall_frame(viewport, composition).clip;
+        };
+        let target = gpu_gallery::wall_frame(viewport, self.compose(self.target, composition));
+        std::array::from_fn(|i| {
+            from.clip[i] + (target.clip[i] - from.clip[i]) * self.topology_progress
+        })
+    }
+
+    fn cards_for_params(
+        &self,
+        params: WallParams,
+        viewport: [f32; 2],
+        composition: WallParams,
+    ) -> Vec<SliceCard> {
+        let frame = self.compose(params, composition);
+        let layout = self.layout_for(frame);
+        let selected = self.positions.get(&self.selected).copied().unwrap_or(0);
+        layout.cards(selected, viewport, frame, &self.aspects)
+    }
+
+    fn placed_frame(&self, viewport: [f32; 2], composition: WallParams) -> Vec<SliceCard> {
+        if let Some(from) = &self.topology_from {
+            let destination = self.cards_for_params(self.target, viewport, composition);
+            let selected = self.positions.get(&self.selected).copied().unwrap_or(0);
+            gallery_presentation::blend_layout_cards(
+                &from.cards,
+                destination,
+                selected,
+                self.topology_progress,
+            )
+        } else {
+            self.cards_for_params(self.params, viewport, composition)
+        }
+    }
+
+    pub(super) fn prefetch_indices(
+        &self,
+        viewport: [f32; 2],
+        composition: WallParams,
+    ) -> Vec<usize> {
+        let params = if self.topology_from.is_some() {
+            self.target
+        } else {
+            self.params
+        };
+        let frame = self.compose(params, composition);
+        let layout = self.layout_for(frame);
+        let selected = self.positions.get(&self.selected).copied().unwrap_or(0);
+        let mut step = layout.donor.cell_h().abs().max(1.0);
+        if params.layout == WallLayout::Editorial {
+            step *= 2.0;
+        }
+        if self.camera.target < frame.scroll_offset {
+            step = -step;
+        }
+        [step, -step]
+            .into_iter()
+            .filter_map(|delta| {
+                let offset = (frame.scroll_offset + delta).clamp(0.0, layout.max_scroll);
+                (offset != frame.scroll_offset).then_some(WallParams {
+                    scroll_offset: offset,
+                    ..frame
+                })
+            })
+            .flat_map(|frame| layout.cards(selected, viewport, frame, &self.aspects))
+            .map(|card| card.index)
+            .collect()
+    }
+
     pub fn cards(
         &self,
         viewport: [f32; 2],
         composition: WallParams,
     ) -> Vec<(SliceCard, f32, bool, [f32; 4], SurfacePayload)> {
-        let p = self.frame_params(composition);
-        let selected = self
-            .ids
-            .iter()
-            .position(|id| *id == self.selected)
-            .unwrap_or(0);
-        gpu_gallery::layout_gallery_with_aspects(
-            GalleryMode::Wall,
-            self.ids.len(),
-            selected,
-            viewport,
-            GalleryLayoutParams {
-                wall: p,
-                ..Default::default()
-            },
-            &self.aspects,
-        )
-        .into_iter()
-        .map(|c| {
-            let id = &self.ids[c.index];
-            let hover = self
-                .fades
-                .get(id)
-                .map_or(f32::from(self.hover.as_ref() == Some(id)), |f| {
-                    f.value().clamp(0.0, 1.0)
-                });
-            let border = if c.selected && self.keyboard {
-                hover.max(0.8)
-            } else {
-                hover
-            };
-            (
-                c,
-                border,
-                self.hover.as_ref() == Some(id),
-                [c.corner_radius.min(c.size[0].min(c.size[1]) * 0.5); 4],
-                SurfacePayload::Plain,
-            )
-        })
-        .collect()
+        self.placed_frame(viewport, composition)
+            .into_iter()
+            .map(|c| {
+                let id = &self.ids[c.index];
+                let hover = self
+                    .fades
+                    .get(id)
+                    .map_or(f32::from(self.hover.as_ref() == Some(id)), |f| {
+                        f.value().clamp(0.0, 1.0)
+                    });
+                let border = if c.selected && self.keyboard {
+                    hover.max(0.8)
+                } else {
+                    hover
+                };
+                (
+                    c,
+                    border,
+                    self.hover.as_ref() == Some(id),
+                    [c.corner_radius.min(c.size[0].min(c.size[1]) * 0.5); 4],
+                    SurfacePayload::Plain,
+                )
+            })
+            .collect()
     }
 }
 
 impl GpuCandidate {
     pub(super) fn sync_wall_presentation(&mut self) -> bool {
         let params = self.configured_wall_params();
-        let ids: Vec<_> = self
-            .filtered_indices
-            .iter()
-            .filter_map(|i| self.wallpapers.get(*i).map(|w| w.id.clone()))
-            .collect();
+        let inputs = self.presentation_inputs();
+        let ids = inputs.ids;
         let selected = self
             .selected
             .and_then(|i| self.wallpapers.get(i))
@@ -229,27 +339,65 @@ impl GpuCandidate {
                 || ids.first().cloned().unwrap_or_default(),
                 |w| w.id.clone(),
             );
-        let aspects = filtered_poster_aspects(&self.catalog, &self.filtered_indices);
+        let aspects = inputs.aspects;
         let source = view::settings::bridge::Source { app: self };
         let duration = source.number("motion.slowMs") as f32;
         let morph_ms = source.number("motion.standardMs") as f32;
+        let restart = self.wall_presentation.as_ref().is_some_and(|p| {
+            p.target.columns != params.columns
+                || p.target.rows != params.rows
+                || p.target.layout != params.layout
+                || (p.topology_from.is_some() && p.target != params)
+        });
+        let composition = restart.then(|| gallery_layout_params_for_app(self).wall);
         if let Some(p) = &mut self.wall_presentation {
-            let catalog = p.ids.as_ref() != ids.as_slice();
+            let catalog = !Arc::ptr_eq(&p.ids, &ids) && p.ids != ids;
+            let aspects_changed = !Arc::ptr_eq(&p.aspects, &aspects) && p.aspects != aspects;
             let changed = catalog
                 || p.selected != selected
                 || p.target != params
-                || p.aspects != aspects
-                || p.duration != duration;
-            p.fades.retain(|id, _| ids.contains(id));
-            if p.hover.as_ref().is_some_and(|id| !ids.contains(id)) {
-                p.hover = None;
+                || aspects_changed
+                || p.duration != duration
+                || p.morph_ms != morph_ms;
+            let mut keep_selected_visible = false;
+            if catalog {
+                p.topology_from = None;
+                p.topology_progress = 1.0;
+                p.params.columns = params.columns;
+                p.params.rows = params.rows;
+                p.params.layout = params.layout;
+            } else if let Some(composition) = composition {
+                let mut source = p.placed_frame(self.viewport, composition);
+                source.retain(|card| card.opacity > 0.0);
+                keep_selected_visible = p.selected == selected && source.iter().any(|c| c.selected);
+                p.topology_from = Some(WallTopologySource {
+                    cards: source.into(),
+                    clip: p.clip(self.viewport, composition),
+                });
+                p.topology_progress = 0.0;
+            }
+            if catalog {
+                p.positions = Arc::new(
+                    ids.iter()
+                        .enumerate()
+                        .map(|(i, id)| (id.clone(), i))
+                        .collect(),
+                );
+                p.fades.retain(|id, _| p.positions.contains_key(id));
+                if p.hover
+                    .as_ref()
+                    .is_some_and(|id| !p.positions.contains_key(id))
+                {
+                    p.hover = None;
+                }
+            }
+            if catalog || aspects_changed {
+                *p.layouts.borrow_mut() = Default::default();
             }
             self.gallery_engaged |= p.engaged;
             p.engaged = self.gallery_engaged;
             p.keyboard = self.gallery_keyboard;
-            if catalog {
-                p.ids = ids.into();
-            }
+            p.ids = ids;
             p.selected = selected;
             p.target = params;
             p.aspects = aspects;
@@ -258,6 +406,31 @@ impl GpuCandidate {
                 p.camera =
                     GalleryMotionState::source(p.camera.value(), p.camera.target, duration, 1.0);
                 p.duration = duration;
+            }
+            if p.topology_from.is_some() {
+                // Prime the immutable endpoint before the UI and motion producer
+                // take separate clones of the presentation.
+                let layout = p.layout();
+                if let Some(composition) = composition.filter(|_| keep_selected_visible) {
+                    let target = p.compose(p.target, composition);
+                    if !p
+                        .cards_for_params(p.target, self.viewport, composition)
+                        .iter()
+                        .any(|c| c.selected)
+                    {
+                        let frame = gpu_gallery::wall_frame(self.viewport, target);
+                        if let Some(card) = p
+                            .positions
+                            .get(&p.selected)
+                            .and_then(|&i| layout.placements.get(i))
+                        {
+                            let center = (frame.clip[1] + frame.clip[3]) * 0.5 - frame.top;
+                            let camera =
+                                (card.y + card.height * 0.5 - center).clamp(0.0, layout.max_scroll);
+                            p.camera = GalleryMotionState::source(camera, camera, duration, 1.0);
+                        }
+                    }
+                }
             }
             changed
         } else {

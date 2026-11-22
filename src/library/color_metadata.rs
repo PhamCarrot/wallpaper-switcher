@@ -57,9 +57,18 @@ pub fn occupied_bin_richness(occupied: usize, valid_samples: usize) -> f32 {
     }
     occupied.min(valid_samples.min(32768)) as f32 / valid_samples.min(32768) as f32
 }
+#[cfg(test)]
 pub fn analyse_sample(
     sample: &image::RgbaImage,
     fingerprint: String,
+) -> Result<ColorMetadata, String> {
+    analyse_sample_cancellable(sample, fingerprint, &|| false)
+}
+
+pub fn analyse_sample_cancellable(
+    sample: &image::RgbaImage,
+    fingerprint: String,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<ColorMetadata, String> {
     if sample.width() == 0
         || sample.height() == 0
@@ -70,7 +79,10 @@ pub fn analyse_sample(
     }
     let mut bins = vec![(0u64, [0u64; 3]); 32768];
     let (mut weight, mut saturation, mut luminance, mut valid) = (0.0f64, 0.0f64, 0.0f64, 0usize);
-    for pixel in sample.pixels() {
+    for (index, pixel) in sample.pixels().enumerate() {
+        if index % 1024 == 0 && cancelled() {
+            return Err("Colour analysis cancelled".into());
+        }
         let [r, g, b, a] = pixel.0;
         if a == 0 {
             continue;

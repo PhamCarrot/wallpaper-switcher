@@ -1,7 +1,7 @@
 settings-filter-appearance-card = চেহারা
 settings-filter-appearance-card-desc = ফিল্টার বার প্রতিটি পিকার লেআউটের সাথে মেলান, বা সর্বত্র একটি স্টাইল বাধ্যতামূলক করুন।
 settings-filter-visual-style-label = দৃশ্য শৈলী
-settings-filter-visual-style-desc = পিকারের সাথে মেলালে Slices ও Sandy-তে তির্যক বার, Geometric-এ জ্যামিতিক বার এবং Wall-এ সোজা বার ব্যবহৃত হয়।
+settings-filter-visual-style-desc = পিকারের সাথে মেলালে Slices-এ তির্যক বার, Geometric-এ জ্যামিতিক বার এবং Wall-এ সোজা বার ব্যবহৃত হয়।
 settings-filter-visual-style-match = পিকারের সাথে মেলান
 settings-filter-visual-style-slices = Slices
 settings-filter-visual-style-hex = Geometric

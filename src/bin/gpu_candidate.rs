@@ -93,5 +93,6 @@ use candidate_app::f7_support::{
 };
 
 fn main() -> iced::Result {
+    engine_ipc::dispatch_readback_helper();
     candidate_app::run()
 }

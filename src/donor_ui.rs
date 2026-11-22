@@ -49,6 +49,21 @@ pub struct Palette {
 }
 
 impl Palette {
+    pub(crate) fn opacity(self, alpha: f32) -> Self {
+        let apply = |color| with_alpha(color, alpha);
+        Self {
+            primary: apply(self.primary),
+            primary_text: apply(self.primary_text),
+            surface: apply(self.surface),
+            surface_text: apply(self.surface_text),
+            surface_variant: apply(self.surface_variant),
+            surface_container: apply(self.surface_container),
+            background: apply(self.background),
+            outline: apply(self.outline),
+            tertiary: apply(self.tertiary),
+        }
+    }
+
     pub fn from_rgb(
         background: [f32; 3],
         surface: [f32; 3],
@@ -152,7 +167,10 @@ pub fn sheet_style(palette: Palette, ease: f32) -> container::Style {
             color: with_alpha(palette.outline, 0.58),
         },
         shadow: Shadow {
-            color: with_alpha(Color::BLACK, 0.52 * ease.clamp(0.0, 1.0)),
+            color: with_alpha(
+                Color::BLACK,
+                0.52 * ease.clamp(0.0, 1.0) * palette.surface.a,
+            ),
             offset: Vector::new(0.0, 16.0),
             blur_radius: 48.0,
         },

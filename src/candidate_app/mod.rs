@@ -3,8 +3,10 @@ use crate::donor_ui;
 #[path = "automation.rs"]
 mod automation_integration;
 mod catalog;
+mod catalog_snapshot;
 mod catalog_watch;
 mod colours;
+mod detail_files;
 mod detail_motion;
 mod diagnostics;
 mod events;
@@ -15,6 +17,7 @@ mod images;
 mod lifecycle;
 mod local_library;
 mod localization;
+mod motion_mailbox;
 mod native_caption;
 mod operations;
 mod ordinary_roll;
@@ -183,7 +186,11 @@ enum Wake {
         entries: Vec<library::CatalogEntry>,
     },
     ColourReady(poster_worker::colour::Completion),
+    CatalogSnapshotSaved(Result<(), String>),
     PostersReady,
+    RetryPosters(u64),
+    PosterWorkerExited(poster_worker::WorkerExit),
+    PosterGpu(gpu_gallery::PosterFeedback),
     BackdropLoaded {
         generation: u64,
         width: u32,
@@ -191,6 +198,7 @@ enum Wake {
         rgba: Vec<u8>,
     },
     CoordinatorFinished(CoordinatorResult),
+    MotionReady,
     MotionFrame {
         generation: u64,
         value: f32,
@@ -296,6 +304,7 @@ enum Message {
     DonorDetail(String, donor_back_layout::DetailIntent),
     DepthDonorDetail(u64, String, donor_back_layout::DetailIntent),
     SetGalleryMode(GalleryMode),
+    CyclePickerMode(GalleryMode),
     DepthDefault,
     OpenSearch,
     ToggleSettingsPanel,
@@ -308,23 +317,28 @@ enum Message {
         generation: u64,
         image: Option<iced_image::Handle>,
     },
-    SettingsLegacy {
+    SettingsPageAction {
         window: Option<window::Id>,
         generation: u64,
         message: Box<Message>,
     },
-    SettingsWindowsOpen {
+    SettingsOpenPage {
         window: Option<window::Id>,
         generation: u64,
         category: SettingsCategory,
     },
-    SettingsWindowsClose {
+    SettingsThemeClose {
         window: Option<window::Id>,
         generation: u64,
     },
     SettingsReloadSavedState {
         window: Option<window::Id>,
         generation: u64,
+    },
+    SettingsRecheckProvider {
+        window: Option<window::Id>,
+        generation: u64,
+        recovery: ProviderRecovery,
     },
     SettingsCapturedKey {
         window: window::Id,
@@ -360,6 +374,7 @@ enum Message {
     ToggleExcluded,
     ToggleShowExcluded,
     OpenFolder,
+    SourceFolderError(detail_files::RequestOwner, String),
     ToggleEngineProperties,
     EnginePropertyValueChanged(String, serde_json::Value),
     EnginePropertyTextChanged(String, String),
@@ -584,6 +599,15 @@ impl SettingsCategory {
 // These labels were observed in the packaged reference. The candidate's
 // existing render modes provide the closest source-supported mapping:
 // Plane->Flat, Bow->Arc, Ribbon->Wave, S sweep->S, and Cylinder->Cylinder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PosterRetry {
+    #[default]
+    Available,
+    SawLock,
+    Waiting,
+    Spent,
+}
+
 struct GpuCandidate {
     launch_policy: runtime::LaunchPolicy,
     config: Config,
@@ -592,6 +616,7 @@ struct GpuCandidate {
     wallpapers: Vec<WallpaperItem>,
     catalog: Vec<library::CatalogEntry>,
     filtered_indices: Vec<usize>,
+    presentation_inputs: Option<gallery_presentation::PresentationInputs>,
     source_filter: SourceFilter,
     filter_rule: SmartRule,
     sort_order: SortOrder,
@@ -605,6 +630,7 @@ struct GpuCandidate {
     browse_playlist_unavailable: bool,
     playlist_session: u64,
     playlist_context: Option<playlists::Owner>,
+    retiring_playlist: Option<playlists::RetiringPlaylist>,
     playlist_delete: Option<playlists::Deletion>,
     playlist_browsing_id: Option<String>,
     engine_properties_open: bool,
@@ -629,6 +655,8 @@ struct GpuCandidate {
     active_monitor_id: Option<String>,
     selected: Option<usize>,
     catalog_loaded: bool,
+    catalog_fresh: bool,
+    catalog_snapshot_issue: Option<String>,
     poster_failure: bool,
     detail_open: bool,
     status: Option<String>,
@@ -653,6 +681,7 @@ struct GpuCandidate {
     exit_requested: bool,
     visible: bool,
     visibility_generation: u64,
+    native_visibility: native_caption::Visibility,
     window: Option<window::Id>,
     window_focused: Option<bool>,
     viewport: [f32; 2],
@@ -670,16 +699,20 @@ struct GpuCandidate {
     search_tags_sort_az: bool,
     poster_cache_dir: std::path::PathBuf,
     catalog_generation: Arc<AtomicU64>,
+    catalog_scan_generation: Arc<AtomicU64>,
     catalog_watch: Option<catalog_watch::CatalogWatch>,
     cache_operation: Option<u64>,
     cache_status: String,
     posters: Arc<Vec<Poster>>,
     poster_slots: HashMap<usize, PosterSlot>,
+    poster_failed_indices: HashSet<usize>,
     poster_request_key: Option<Vec<PosterRequestIdentity>>,
-    poster_assignment_key: Option<Vec<(usize, u32)>>,
+    poster_retry: PosterRetry,
+    poster_assignment_key: Option<(Vec<(usize, u32)>, Vec<usize>)>,
     poster_generation: Arc<AtomicU64>,
     poster_worker: Option<poster_worker::PosterWorker>,
     poster_mailbox: Arc<poster_worker::PosterMailbox>,
+    motion_mailbox: Arc<motion_mailbox::MotionMailbox>,
     backdrop: Option<iced_image::Handle>,
     backdrop_source: Option<std::path::PathBuf>,
     backdrop_generation: Arc<AtomicU64>,
@@ -699,6 +732,7 @@ struct GpuCandidate {
     depth_selection: HashMap<String, GalleryMotionState>,
     depth_hover: Option<String>,
     depth_wheel: f32,
+    preset_wheel: Option<(events::PresetWheelBinding, f32)>,
     depth_revision: u64,
     depth_frame: Option<gpu_gallery::DepthSnapshot>,
     depth_roll: Option<DepthRoll>,
@@ -725,6 +759,7 @@ struct GpuCandidate {
     next_slideshow_unix: u64,
     automation_suspended: bool,
     gallery_mode: GalleryMode,
+    atlas_entry: Option<GalleryMode>,
     benchmark: Option<BenchmarkState>,
     scenario: Option<ScenarioState>,
     screenshot_path: Option<std::path::PathBuf>,

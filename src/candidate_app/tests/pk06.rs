@@ -7,7 +7,10 @@ use iced::advanced::{
 };
 use view::settings::folio::intent::{Message as Intent, SettingsMsg};
 
-struct Scene<'a> {
+#[path = "poster_browse.rs"]
+mod poster_browse;
+
+pub(super) struct Scene<'a> {
     element: Element<'a, Message>,
     tree: Tree,
     node: layout::Node,
@@ -15,13 +18,13 @@ struct Scene<'a> {
 }
 
 #[derive(Default)]
-struct Probe {
+pub(super) struct Probe {
     offset: iced::Vector,
     pending: Option<iced::Vector>,
     texts: Vec<(String, iced::Rectangle)>,
     inputs: Vec<(Option<iced::widget::Id>, iced::Rectangle)>,
     containers: Vec<(Option<iced::widget::Id>, iced::Rectangle)>,
-    scrolls: Vec<(
+    pub(super) scrolls: Vec<(
         Option<iced::widget::Id>,
         iced::Rectangle,
         iced::Rectangle,
@@ -71,7 +74,7 @@ impl Operation for Probe {
 }
 
 impl<'a> Scene<'a> {
-    fn new(app: &'a GpuCandidate, renderer: &iced::Renderer) -> Self {
+    pub(super) fn new(app: &'a GpuCandidate, renderer: &iced::Renderer) -> Self {
         let size = iced::Size::new(app.viewport[0], app.viewport[1]);
         let mut element = view(app, app.window.unwrap());
         let mut tree = Tree::new(&element);
@@ -96,7 +99,7 @@ impl<'a> Scene<'a> {
         );
     }
 
-    fn probe(&mut self, renderer: &iced::Renderer) -> Probe {
+    pub(super) fn probe(&mut self, renderer: &iced::Renderer) -> Probe {
         let mut probe = Probe::default();
         self.operate(renderer, &mut probe);
         probe
@@ -122,7 +125,7 @@ impl<'a> Scene<'a> {
         messages
     }
 
-    fn click(
+    pub(super) fn click(
         &mut self,
         renderer: &iced::Renderer,
         point: iced::Point,
@@ -143,7 +146,7 @@ impl<'a> Scene<'a> {
         .collect()
     }
 
-    fn wheel(&mut self, renderer: &iced::Renderer, point: iced::Point, x: f32, y: f32) {
+    pub(super) fn wheel(&mut self, renderer: &iced::Renderer, point: iced::Point, x: f32, y: f32) {
         let _ = self.event(
             renderer,
             iced::mouse::Cursor::Available(point),
@@ -202,7 +205,26 @@ impl<'a> Scene<'a> {
         panic!("No mounted hit for {label} after scrolling");
     }
 
-    fn save(&mut self, renderer: &mut iced::Renderer, app: &GpuCandidate, path: &std::path::Path) {
+    pub(super) fn save(
+        &mut self,
+        renderer: &mut iced::Renderer,
+        app: &GpuCandidate,
+        path: &std::path::Path,
+    ) {
+        let [width, height] = [self.bounds.width as u32, self.bounds.height as u32];
+        let bytes = self.readback(renderer, app);
+        ::image::save_buffer_with_format(
+            path,
+            &bytes,
+            width,
+            height,
+            ::image::ColorType::Rgba8,
+            ::image::ImageFormat::Png,
+        )
+        .unwrap();
+    }
+
+    fn readback(&mut self, renderer: &mut iced::Renderer, app: &GpuCandidate) -> Vec<u8> {
         let theme = theme(app, app.window.unwrap());
         let style = application_style(app, &theme);
         renderer.reset(self.bounds);
@@ -218,21 +240,12 @@ impl<'a> Scene<'a> {
             &self.bounds,
         );
         let [width, height] = [self.bounds.width as u32, self.bounds.height as u32];
-        let bytes = Headless::screenshot(
+        Headless::screenshot(
             renderer,
             iced::Size::new(width, height),
             1.0,
             style.background_color,
-        );
-        ::image::save_buffer_with_format(
-            path,
-            &bytes,
-            width,
-            height,
-            ::image::ColorType::Rgba8,
-            ::image::ImageFormat::Png,
         )
-        .unwrap();
     }
 }
 
@@ -294,9 +307,50 @@ fn clear_settings_motion(app: &mut GpuCandidate) {
 
 fn wraps(message: &Message, matches: &impl Fn(&Message) -> bool) -> bool {
     match message {
-        Message::SettingsLegacy { message, .. } => wraps(message, matches),
+        Message::SettingsPageAction { message, .. } => wraps(message, matches),
         message => matches(message),
     }
+}
+
+pub(super) fn open_selected_item_tag_editor(
+    app: &mut GpuCandidate,
+    renderer: &iced::Renderer,
+) -> String {
+    app.set_gallery_mode(GalleryMode::Geometric);
+    app.ordinary_roll = None;
+    app.deterministic_animation = true;
+    assert!(app.depth_frame.is_none());
+    app.start_detail(true, "headless-detail-tags");
+    app.detail_progress = 1.0;
+    assert!(app.detail_source.is_some() && view::detail_controls_active(app));
+    let wallpaper = &app.wallpapers[app.selected.unwrap()];
+    let id = wallpaper.id.clone();
+    let actions = view::detail_actions(app, wallpaper);
+    let card = donor_detail::external_target(app.viewport);
+    let detail = donor_back_layout::layout(
+        card,
+        false,
+        donor_back_layout::DETAIL_FACT_COUNT,
+        &actions,
+        view::settings::bridge::effective_ui_scale(app),
+        UI_FONT,
+        &wallpaper.title,
+    );
+    let (_, tags) = detail.source_text_bounds();
+    let [x, y] = card.point([
+        tags.x + tags.width.min(62.0 * detail.content_scale) * 0.5,
+        tags.center_y(),
+    ]);
+    let messages = Scene::new(app, renderer).click(
+        renderer,
+        iced::Point::new(x, y),
+        iced::mouse::Button::Left,
+    );
+    let message = messages.iter().find(|message| matches!(message, Message::DonorDetail(target, donor_back_layout::DetailIntent::LocalTags) if target == &id)).unwrap_or_else(|| panic!("actual detail canvas Tags hit: {messages:?}"));
+    assert_eq!(update(app, message.clone()).units(), 1);
+    assert_eq!(app.tag_drawer_item.as_ref(), Some(&id));
+    assert_eq!(app.tag_owner().unwrap().item_id(), id);
+    id
 }
 
 #[test]
@@ -337,43 +391,49 @@ fn pk06_mounted_settings_and_detail_routes() {
         );
         let _ = update(&mut app, message);
         clear_settings_motion(&mut app);
+        let visibility = view::settings::controller::cards(&app)
+            .iter()
+            .position(|(_, rows)| {
+                rows.iter().any(|row| {
+                    matches!(
+                        row.control,
+                        view::settings::composed::Control::ToggleAction {
+                            id: view::settings::composed::ActionId::ShowExcluded,
+                            ..
+                        }
+                    )
+                })
+            })
+            .expect("Show excluded is in Filter & search");
+        p3_settings_intent(&mut app, SettingsMsg::SelectSection(visibility));
+        clear_settings_motion(&mut app);
         let message = Scene::new(&app, &renderer).hit_label(
             &renderer,
-            app.settings_locale.text_static("r5-windows-controls"),
+            app.settings_locale
+                .text_static("settings-filter-show-excluded"),
             |message| {
                 matches!(
                     message,
-                    Message::SettingsWindowsOpen {
-                        category: SettingsCategory::CatalogFilters,
+                    Message::SettingsIntent {
+                        intent: Intent::Settings(SettingsMsg::Run(
+                            view::settings::composed::ActionId::ShowExcluded
+                        )),
                         ..
                     }
                 )
             },
         );
         let _ = update(&mut app, message);
-        assert_eq!(
-            app.settings_workbench.windows_panel,
-            Some(SettingsCategory::CatalogFilters)
-        );
-        let message = Scene::new(&app, &renderer).hit_label(
-            &renderer,
-            app.settings_locale.text_static("r5-panel-copy-56"),
-            |m| wraps(m, &|m| matches!(m, Message::ToggleShowExcluded)),
-        );
-        let _ = update(&mut app, message);
         assert!(app.show_excluded);
         assert_eq!(app.filtered_indices, [2, 1, 0]);
-        let message = Scene::new(&app, &renderer).hit_label(&renderer, "Any orientation", |m| {
-            wraps(m, &|m| matches!(m, Message::CycleOrientation))
-        });
-        let _ = update(&mut app, message);
+        let _ = update(&mut app, Message::CycleShapeFilter);
         assert_eq!(app.filter_rule.orientation, OrientationFilter::Landscape);
         assert_eq!(app.filtered_indices, [1, 0]);
         let settings_path = output.join(format!("settings-filter-windows-{width}-{scale}.png"));
         Scene::new(&app, &renderer).save(&mut renderer, &app, &settings_path);
         receipts.push(serde_json::json!({
             "path": settings_path, "scale": scale, "viewport": [width, height],
-            "route": "Rail Settings → Filter & search → Windows controls",
+            "route": "Rail Settings → Filter & search → Visibility",
             "before": [&ids[2], &ids[0]], "show_excluded": [&ids[2], &ids[1], &ids[0]],
             "landscape": [&ids[1], &ids[0]], "actual_hits": true,
         }));
@@ -382,42 +442,7 @@ fn pk06_mounted_settings_and_detail_routes() {
         let (mut app, calls) = d4a_fixture(3);
         app.viewport = [width, height];
         app.state.frontend_preferences.interface.ui_scale = Some(scale);
-        app.set_gallery_mode(GalleryMode::Geometric);
-        app.ordinary_roll = None;
-        app.deterministic_animation = true;
-        assert!(app.depth_frame.is_none());
-        app.start_detail(true, "pk06-headless-detail");
-        app.detail_progress = 1.0;
-        assert!(app.detail_source.is_some() && view::detail_controls_active(&app));
-        let wallpaper = &app.wallpapers[app.selected.unwrap()];
-        let id = wallpaper.id.clone();
-        let actions = view::detail_actions(&app, wallpaper);
-        let card = donor_detail::external_target(app.viewport);
-        let detail = donor_back_layout::layout(
-            card,
-            false,
-            donor_back_layout::DETAIL_FACT_COUNT,
-            &actions,
-            view::settings::bridge::effective_ui_scale(&app),
-            UI_FONT,
-            &wallpaper.title,
-        );
-        let (_, tags) = detail.source_text_bounds();
-        let center = iced::Point::new(
-            tags.x + tags.width.min(62.0 * detail.content_scale) * 0.5,
-            tags.center_y(),
-        );
-        let [x, y] = card.point([center.x, center.y]);
-        let messages = Scene::new(&app, &renderer).click(
-            &renderer,
-            iced::Point::new(x, y),
-            iced::mouse::Button::Left,
-        );
-        assert!(messages.iter().any(|message| matches!(message, Message::DonorDetail(target, donor_back_layout::DetailIntent::LocalTags) if target == &id)), "actual detail canvas Tags hit: {messages:?}");
-        let message = messages.into_iter().find(|message| matches!(message, Message::DonorDetail(target, donor_back_layout::DetailIntent::LocalTags) if target == &id)).unwrap();
-        assert_eq!(update(&mut app, message).units(), 1);
-        assert_eq!(app.tag_drawer_item.as_ref(), Some(&id));
-        assert_eq!(app.tag_owner().unwrap().item_id(), id);
+        let id = open_selected_item_tag_editor(&mut app, &renderer);
         use crate::candidate_app::local_library::TagEdit;
         for (key, expected) in [("海", "海"), ("辺", "海辺")] {
             let mut editor = Scene::new(&app, &renderer);
@@ -803,7 +828,7 @@ fn pk06_non_tag_scope_and_current_browse_membership_drive_counts() {
     assert_eq!(calls.load(Ordering::Acquire), 0);
 }
 
-fn fits(outer: iced::Rectangle, inner: iced::Rectangle) -> bool {
+pub(super) fn fits(outer: iced::Rectangle, inner: iced::Rectangle) -> bool {
     inner.width > 0.0
         && inner.height > 0.0
         && outer.x <= inner.x + 0.1
@@ -812,7 +837,7 @@ fn fits(outer: iced::Rectangle, inner: iced::Rectangle) -> bool {
         && outer.y + outer.height + 0.1 >= inner.y + inner.height
 }
 
-fn region(probe: &Probe, id: &'static str) -> iced::Rectangle {
+pub(super) fn region(probe: &Probe, id: &'static str) -> iced::Rectangle {
     probe
         .containers
         .iter()
@@ -832,7 +857,7 @@ fn scroll_region(
         .map(|(_, bounds, content, translation)| (*bounds, *content, *translation))
 }
 
-fn input_bounds(probe: &Probe, id: &iced::widget::Id) -> iced::Rectangle {
+pub(super) fn input_bounds(probe: &Probe, id: &iced::widget::Id) -> iced::Rectangle {
     probe
         .inputs
         .iter()
@@ -841,7 +866,7 @@ fn input_bounds(probe: &Probe, id: &iced::widget::Id) -> iced::Rectangle {
         .1
 }
 
-fn text_bounds(probe: &Probe, label: &str) -> iced::Rectangle {
+pub(super) fn text_bounds(probe: &Probe, label: &str) -> iced::Rectangle {
     probe
         .texts
         .iter()
@@ -850,7 +875,11 @@ fn text_bounds(probe: &Probe, label: &str) -> iced::Rectangle {
         .1
 }
 
-fn hit_toolbar(scene: &mut Scene<'_>, renderer: &iced::Renderer, label: &str) -> Vec<Message> {
+pub(super) fn hit_toolbar(
+    scene: &mut Scene<'_>,
+    renderer: &iced::Renderer,
+    label: &str,
+) -> Vec<Message> {
     for _ in 0..20 {
         let probe = scene.probe(renderer);
         let (bar, _, _) = scroll_region(&probe, "search-tag-toolbar-scroll").unwrap();
@@ -864,7 +893,11 @@ fn hit_toolbar(scene: &mut Scene<'_>, renderer: &iced::Renderer, label: &str) ->
     panic!("unreachable toolbar label {label}");
 }
 
-fn type_text(scene: &mut Scene<'_>, renderer: &iced::Renderer, value: &str) -> Vec<Message> {
+pub(super) fn type_text(
+    scene: &mut Scene<'_>,
+    renderer: &iced::Renderer,
+    value: &str,
+) -> Vec<Message> {
     scene.event(
         renderer,
         iced::mouse::Cursor::Unavailable,

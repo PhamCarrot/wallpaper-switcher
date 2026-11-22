@@ -353,6 +353,71 @@ pub(super) fn automation_timer_enabled(
 }
 
 impl GpuCandidate {
+    pub(super) fn active_schedule_playlist(&self) -> Option<&Playlist> {
+        let id = self.state.active_playlist_id.as_deref()?;
+        self.state
+            .playlists
+            .iter()
+            .find(|playlist| playlist.id == id)
+    }
+
+    pub(super) fn create_schedule(&mut self) {
+        let name = self.schedule_name.trim();
+        let playlist = self.active_schedule_playlist();
+        let minute = parse_schedule_time(&self.schedule_time);
+        let (false, Some(playlist), Some(minute_of_day), days) =
+            (name.is_empty(), playlist, minute, self.schedule_days)
+        else {
+            self.status = Some("A schedule needs a name, valid HH:MM time, at least one day, and an active playlist.".into());
+            return;
+        };
+        if days == 0 {
+            self.status = Some("A schedule needs at least one day.".into());
+            return;
+        }
+        let mut proposed = self.state.clone();
+        let id = unique_schedule_id(name, &proposed.schedules);
+        let creation_order = proposed
+            .schedules
+            .iter()
+            .map(|schedule| schedule.creation_order)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let mut monitor_ids: Vec<_> = self.schedule_monitors.iter().cloned().collect();
+        monitor_ids.sort_unstable();
+        proposed.schedules.push(candidate_state::Schedule {
+            id,
+            name: name.into(),
+            enabled: true,
+            days,
+            minute_of_day,
+            priority: 100,
+            creation_order,
+            playlist_id: playlist.id.clone(),
+            monitor_ids,
+        });
+        if self.publish_automation_change(proposed, false) {
+            self.schedule_name.clear();
+            self.refresh_automation_timer();
+        }
+    }
+
+    pub(super) fn toggle_schedule(&mut self, id: &str) {
+        let mut proposed = self.state.clone();
+        let Some(schedule) = proposed
+            .schedules
+            .iter_mut()
+            .find(|schedule| schedule.id == id)
+        else {
+            return;
+        };
+        schedule.enabled = !schedule.enabled;
+        if self.publish_automation_change(proposed, false) {
+            self.refresh_automation_timer();
+        }
+    }
+
     pub(super) fn random_rotation_state(&self) -> candidate_state::RandomRotationState {
         if self.automation_suspended && self.state.automation_intent().random_enabled {
             candidate_state::RandomRotationState::SafelyStopped
@@ -594,7 +659,7 @@ impl GpuCandidate {
         weekday: u8,
         minute_of_day: u16,
     ) {
-        if generation != self.automation_generation.load(Ordering::Acquire) {
+        if !self.catalog_fresh || generation != self.automation_generation.load(Ordering::Acquire) {
             return;
         }
         if !self.launch_policy.allows_automatic_provider() {
@@ -635,6 +700,10 @@ impl GpuCandidate {
             transition::TransitionConfig,
         ) -> Result<coordinator::ApplySubmission, String>,
     ) -> bool {
+        if !self.catalog_fresh {
+            trace_automation_decision(trace_context, "rejected", "catalog_not_fresh");
+            return false;
+        }
         if trace_context.generation.is_some_and(|generation| {
             generation != self.automation_generation.load(Ordering::Acquire)
         }) {

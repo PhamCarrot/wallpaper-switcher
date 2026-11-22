@@ -1,7 +1,7 @@
 settings-filter-appearance-card = रूप
 settings-filter-appearance-card-desc = फ़िल्टर बार को हर पिकर लेआउट से मिलाएँ, या हर जगह एक ही शैली लागू करें।
 settings-filter-visual-style-label = दृश्य शैली
-settings-filter-visual-style-desc = पिकर से मिलाएँ Slices और Sandy में तिरछा बार, Geometric में ज्यामितीय बार और Wall में सीधा बार उपयोग करता है।
+settings-filter-visual-style-desc = पिकर से मिलाएँ Slices में तिरछा बार, Geometric में ज्यामितीय बार और Wall में सीधा बार उपयोग करता है।
 settings-filter-visual-style-match = पिकर से मिलाएँ
 settings-filter-visual-style-slices = Slices
 settings-filter-visual-style-hex = Geometric

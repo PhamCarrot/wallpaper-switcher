@@ -698,7 +698,7 @@ fn e1_combined_visibility_hydrates_publishes_reloads_and_preserves_tag_rows() {
         );
         app.state = saved;
     }
-    assert_eq!(app.search_panel_row_limit(), 3);
+    assert_eq!(app.search_panel_row_limit(), 2);
     assert!(!app.apply_pending);
 }
 
@@ -771,20 +771,46 @@ fn e1_rail_anchor_follows_current_slices_and_hex_through_morph_reversal() {
 #[test]
 #[ignore = "E1 owned production root layouts and real input contracts; explicit invocation only"]
 fn e1_owned_root_layouts_and_no_selection_engine_input() {
+    exercise_owned_root_layouts(&[
+        "rail-slices",
+        "rail-hex",
+        "rail-wall",
+        "rail-depth",
+        "search",
+        "search-collapsed",
+        "playlist-empty",
+        "playlist-no-match",
+        "playlist-stale",
+        "library",
+        "theme-copy",
+        "theme-designer",
+        "engine",
+        "folder",
+        "search-scale",
+    ]);
+}
+
+#[test]
+#[ignore = "Explicit GPU captures of the Manage library route"]
+fn manage_library_owned_layouts() {
+    exercise_owned_root_layouts(&["library"]);
+}
+
+fn exercise_owned_root_layouts(cases: &[&str]) {
     use iced::advanced::{
         clipboard, layout,
         renderer::{Headless, Renderer as _},
         widget::{operation, Operation, Tree},
         Layout, Shell,
     };
+    const LAST_TAG: &str = "E1 local tag 35";
     #[derive(Default)]
     struct Probe {
         offset: iced::Vector,
         pending: Option<iced::Vector>,
         texts: Vec<(String, iced::Rectangle)>,
         containers: Vec<(Option<iced::widget::Id>, iced::Rectangle)>,
-        scrolls: Vec<(iced::Rectangle, iced::Rectangle)>,
-        inputs: Vec<(Option<iced::widget::Id>, iced::Rectangle)>,
+        scrolls: Vec<(Option<iced::widget::Id>, iced::Rectangle, iced::Rectangle)>,
     }
     impl Operation for Probe {
         fn container(&mut self, id: Option<&iced::widget::Id>, bounds: iced::Rectangle) {
@@ -800,22 +826,15 @@ fn e1_owned_root_layouts_and_no_selection_engine_input() {
         }
         fn scrollable(
             &mut self,
-            _: Option<&iced::widget::Id>,
+            id: Option<&iced::widget::Id>,
             bounds: iced::Rectangle,
             content: iced::Rectangle,
             translation: iced::Vector,
             _: &mut dyn operation::Scrollable,
         ) {
-            self.scrolls.push((bounds - self.offset, content));
+            self.scrolls
+                .push((id.cloned(), bounds - self.offset, content));
             self.pending = Some(translation);
-        }
-        fn text_input(
-            &mut self,
-            id: Option<&iced::widget::Id>,
-            bounds: iced::Rectangle,
-            _: &mut dyn operation::TextInput,
-        ) {
-            self.inputs.push((id.cloned(), bounds - self.offset));
         }
         fn text(&mut self, _: Option<&iced::widget::Id>, bounds: iced::Rectangle, value: &str) {
             self.texts.push((value.into(), bounds - self.offset));
@@ -882,23 +901,7 @@ fn e1_owned_root_layouts_and_no_selection_engine_input() {
     .unwrap();
     let mut receipts = Vec::new();
     for (width, height) in [(1920u32, 1080u32), (2560, 1440)] {
-        for case in [
-            "rail-slices",
-            "rail-hex",
-            "rail-wall",
-            "rail-depth",
-            "search",
-            "search-collapsed",
-            "playlist-empty",
-            "playlist-no-match",
-            "playlist-stale",
-            "library",
-            "theme-copy",
-            "theme-designer",
-            "engine",
-            "folder",
-            "search-scale",
-        ] {
+        for &case in cases {
             if case == "search-scale" && width != 1920 {
                 continue;
             }
@@ -928,13 +931,42 @@ fn e1_owned_root_layouts_and_no_selection_engine_input() {
                 };
                 app.sync_gallery_presentation();
             } else if case.starts_with("search") {
+                app.search_tags_open = false;
                 if case == "search-scale" {
                     app.state.frontend_preferences.interface.ui_scale = Some(1.25);
-                }
-                app.search_tags_open = false;
-                let _ = update(&mut app, Message::OpenSearch);
-                if case != "search-collapsed" {
-                    let _ = update(&mut app, Message::ToggleSearchTags);
+                    let model = gallery_rail_model(&app);
+                    let anchor =
+                        view::gallery_rail_anchor(&app, &model, app.state.gallery.depth.height);
+                    let intent = donor_rail::RailIntent::OpenSearch;
+                    let button = donor_rail::intent_center(&model, intent).unwrap();
+                    let messages = pk06::Scene::new(&app, &renderer).click(
+                        &renderer,
+                        iced::Point::new(anchor[0] + button.x, anchor[1] + button.y),
+                        iced::mouse::Button::Left,
+                    );
+                    let open = messages
+                        .into_iter()
+                        .find(|m| matches!(m, Message::DonorRail(hit) if *hit == intent))
+                        .expect("Search rail hit at 125% scale");
+                    assert_eq!(update(&mut app, open).units(), 1);
+                    assert!(app.panel_state.search_open && !app.search_tags_open);
+                    let mut scene = pk06::Scene::new(&app, &renderer);
+                    let message = pk06::hit_toolbar(
+                        &mut scene,
+                        &renderer,
+                        app.settings_locale.text_static("r5-panel-copy-05"),
+                    )
+                    .into_iter()
+                    .find(|m| matches!(m, Message::ToggleSearchTags))
+                    .expect("Search tags toggle hit at 125% scale");
+                    drop(scene);
+                    assert_eq!(update(&mut app, message).units(), 1);
+                    assert!(app.search_tags_open && app.tag_drawer_item.is_none());
+                } else {
+                    let _ = update(&mut app, Message::OpenSearch);
+                    if case != "search-collapsed" {
+                        let _ = update(&mut app, Message::ToggleSearchTags);
+                    }
                 }
                 app.catalog[0].source_tags =
                     (0..36).map(|i| format!("E1 local tag {i:02}")).collect();
@@ -1017,14 +1049,9 @@ fn e1_owned_root_layouts_and_no_selection_engine_input() {
                     ),
                 );
                 if case == "library" {
-                    p3_settings_intent(
-                        &mut app,
-                        SettingsMsg::Run(composed::ActionId::OpenLibraryTools),
-                    );
-                    assert_eq!(
-                        app.settings_workbench.windows_panel,
-                        Some(SettingsCategory::Library)
-                    );
+                    assert_eq!(app.settings_workbench.tab, "library");
+                    app.config.catalog.local_folders =
+                        vec![output.join("Landscapes"), output.join("Portraits")];
                     app.colours.status = "E1 owned automatic-analysis diagnostic".into();
                 }
                 if case == "theme-designer" {
@@ -1143,13 +1170,17 @@ fn e1_owned_root_layouts_and_no_selection_engine_input() {
             )
             .unwrap();
             if case == "library" || case == "search-scale" {
+                let search_body_id = iced::widget::Id::new("r5-search-body");
                 let pane = probe
                     .scrolls
                     .iter()
-                    .filter(|(b, c)| c.height > b.height + 1.0)
-                    .max_by(|a, b| a.0.width.total_cmp(&b.0.width))
-                    .unwrap()
-                    .0;
+                    .filter(|(id, b, c)| {
+                        c.height > b.height + 1.0
+                            && (case == "library" || id.as_ref() == Some(&search_body_id))
+                    })
+                    .max_by(|a, b| a.1.width.total_cmp(&b.1.width))
+                    .expect("overflowing layout body")
+                    .1;
                 for _ in 0..30 {
                     let mut messages = Vec::new();
                     element.as_widget_mut().update(
@@ -1170,13 +1201,31 @@ fn e1_owned_root_layouts_and_no_selection_engine_input() {
                     .as_widget_mut()
                     .operate(&mut tree, Layout::new(&node), &renderer, &mut end);
                 if case == "search-scale" {
-                    let editor = end
-                        .inputs
+                    let last_chip = format!("{LAST_TAG}  1");
+                    let before = probe
+                        .texts
                         .iter()
-                        .find(|(id, _)| id.as_ref() == Some(&app.local_tag_input_id))
-                        .unwrap()
+                        .find(|(label, _)| label == &last_chip)
+                        .expect("last Search tag chip")
                         .1;
-                    assert!(editor.y >= pane.y && editor.y + editor.height <= pane.y + pane.height);
+                    let after = end
+                        .texts
+                        .iter()
+                        .find(|(label, _)| label == &last_chip)
+                        .expect("last Search tag chip after scrolling")
+                        .1;
+                    assert!(before.y >= pane.y + pane.height && pk06::fits(pane, after));
+                    let messages = click(
+                        &mut element,
+                        &mut tree,
+                        &node,
+                        &renderer,
+                        viewport,
+                        after.center(),
+                    );
+                    assert!(messages
+                        .iter()
+                        .any(|m| matches!(m, Message::SearchTag(tag, false) if tag == LAST_TAG)));
                 } else {
                     assert!(
                         end.texts.iter().any(|(text, b)| text == &app.colours.status
@@ -1218,6 +1267,52 @@ fn e1_owned_root_layouts_and_no_selection_engine_input() {
                 .unwrap();
             }
             drop(element);
+            if case == "search-scale" {
+                use crate::candidate_app::local_library::TagEdit;
+
+                let close = root_click(
+                    &app,
+                    &renderer,
+                    app.settings_locale.text_static("tags-search-mode-tags"),
+                )
+                .into_iter()
+                .find(|m| matches!(m, Message::CloseSearchPanel))
+                .expect("close Search through its mode button");
+                let _ = update(&mut app, close);
+                assert!(!app.panel_state.search_open);
+
+                let item = pk06::open_selected_item_tag_editor(&mut app, &renderer);
+                let mut editor = pk06::Scene::new(&app, &renderer);
+                let first = editor.probe(&renderer);
+                let panel = pk06::region(&first, "local-tag-editor");
+                let input = pk06::input_bounds(&first, &app.local_tag_input_id);
+                let (_, rows, _, _) = *first
+                    .scrolls
+                    .iter()
+                    .find(|(_, b, c, _)| pk06::fits(panel, *b) && c.height > b.height + 1.0)
+                    .expect("overflowing tag editor list");
+                assert!(pk06::fits(viewport, panel) && pk06::fits(panel, input));
+                assert!(rows.y + rows.height <= input.y);
+                assert!(pk06::text_bounds(&first, LAST_TAG).y >= rows.y + rows.height);
+                for _ in 0..30 {
+                    editor.wheel(&renderer, rows.center(), 0.0, -150.0);
+                }
+                let end = editor.probe(&renderer);
+                assert!(pk06::fits(rows, pk06::text_bounds(&end, LAST_TAG)));
+                assert_eq!(pk06::input_bounds(&end, &app.local_tag_input_id), input);
+                let _ = editor.click(&renderer, input.center(), iced::mouse::Button::Left);
+                let draft = pk06::type_text(&mut editor, &renderer, "x").into_iter()
+                    .find(|m| matches!(m, Message::LocalTag { owner, edit: TagEdit::Text(text) } if owner.item_id() == item && text == "x"))
+                    .expect("typing in the reachable editor updates the selected item's draft");
+                editor.save(
+                    &mut renderer,
+                    &app,
+                    &output.join(format!("e1-{width}x{height}-search-scale-editor-end.png")),
+                );
+                drop(editor);
+                let _ = update(&mut app, draft);
+                assert_eq!(app.local_tag_input, "x");
+            }
             if case.starts_with("playlist") {
                 let before = app.state.playlists.len();
                 let label = app.settings_locale.text_static("r5-create");
@@ -1323,7 +1418,7 @@ fn e1_owned_root_layouts_and_no_selection_engine_input() {
                 );
                 assert!(messages
                     .iter()
-                    .any(|m| matches!(m, Message::SettingsWindowsClose { .. })));
+                    .any(|m| matches!(m, Message::SettingsThemeClose { .. })));
                 for message in messages {
                     let _ = update(&mut app, message);
                 }
@@ -1921,8 +2016,9 @@ fn w3_owned_drawer_badges_and_library_1080p_1440p() {
                         index,
                         PosterSlot {
                             layer: index as u32,
-                            is_video: item.source == WallpaperSource::LocalVideo,
+                            kind: gallery::poster_kind_for_item(item),
                             generation: app.poster_generation.load(Ordering::Acquire),
+                            last_requested: app.poster_generation.load(Ordering::Acquire),
                             catalog_generation: app.catalog_generation.load(Ordering::Acquire),
                             item_id: item.id.clone(),
                             source,
@@ -2053,6 +2149,19 @@ fn dense_real_images_and_recreation(mode: GalleryMode) {
         widget::Tree,
         Layout,
     };
+    thread_local! {
+        static FEEDBACK: std::cell::RefCell<Vec<gpu_gallery::PosterFeedback>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+    fn feedback(message: gpu_gallery::PosterFeedback) {
+        FEEDBACK.with_borrow_mut(|messages| messages.push(message));
+    }
+    let worker =
+        poster_worker::PosterWorker::spawn(Arc::new(std::sync::atomic::AtomicU64::new(0)), |_| {
+            true
+        })
+        .unwrap();
     let output =
         std::path::PathBuf::from(std::env::var_os("P5_LAYOUT_OUTPUT").expect("owned output"));
     let media = output.join("media");
@@ -2116,8 +2225,9 @@ fn dense_real_images_and_recreation(mode: GalleryMode) {
                 *index,
                 PosterSlot {
                     layer: layer as u32,
-                    is_video: false,
+                    kind: crate::poster_worker::PosterKind::Still,
                     generation: 1,
+                    last_requested: 1,
                     catalog_generation: app.catalog_generation.load(Ordering::Acquire),
                     item_id: app.wallpapers[*index].id.clone(),
                     source,
@@ -2129,6 +2239,7 @@ fn dense_real_images_and_recreation(mode: GalleryMode) {
         let entries = app.ordinary_frame();
         assert!(entries.iter().all(|e| e.card.layer.is_some()));
         let snapshot = Arc::new(GallerySnapshot {
+            defer_near_restore: false,
             ordinary: Some(entries.clone()),
             cards: entries.iter().map(|e| e.card).collect(),
             posters: app.posters.clone(),
@@ -2158,37 +2269,132 @@ fn dense_real_images_and_recreation(mode: GalleryMode) {
                 <iced::Renderer as Headless>::new(UI_FONT, iced::Pixels(16.0), Some("wgpu")),
             )
             .unwrap();
-            let mut element: Element<'_, GalleryMessage> = shader(GalleryProgram {
-                snapshot: snapshot.clone(),
-            })
-            .width(Fill)
-            .height(Fill)
-            .into();
-            let size = iced::Size::new(width as f32, height as f32);
-            let bounds = iced::Rectangle::with_size(size);
-            let mut tree = Tree::new(&element);
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(size, size),
-            );
-            renderer.reset(bounds);
-            element.as_widget().draw(
-                &tree,
-                &mut renderer,
-                &iced::Theme::Dark,
-                &iced::advanced::renderer::Style {
-                    text_color: iced::Color::WHITE,
-                },
-                Layout::new(&node),
-                iced::mouse::Cursor::Unavailable,
-                &bounds,
-            );
-            let bytes = Headless::screenshot(
-                &mut renderer,
-                iced::Size::new(width, height),
-                1.0,
-                iced::Color::BLACK,
+            let mut render = |frame: Arc<GallerySnapshot>| {
+                let mut element: Element<'_, GalleryMessage> = shader(GalleryProgram {
+                    prewarm: None,
+                    poster_feedback: Some(feedback),
+                    snapshot: frame,
+                })
+                .width(Fill)
+                .height(Fill)
+                .into();
+                let size = iced::Size::new(width as f32, height as f32);
+                let bounds = iced::Rectangle::with_size(size);
+                let mut tree = Tree::new(&element);
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(size, size),
+                );
+                renderer.reset(bounds);
+                element.as_widget().draw(
+                    &tree,
+                    &mut renderer,
+                    &iced::Theme::Dark,
+                    &iced::advanced::renderer::Style {
+                        text_color: iced::Color::WHITE,
+                    },
+                    Layout::new(&node),
+                    iced::mouse::Cursor::Unavailable,
+                    &bounds,
+                );
+                Headless::screenshot(
+                    &mut renderer,
+                    iced::Size::new(width, height),
+                    1.0,
+                    iced::Color::BLACK,
+                )
+            };
+            if pass == 0 {
+                // Seed eight exact resources before the full snapshot fills the
+                // remaining far tiles. Their original CPU pixels are gone.
+                let mut seed = (*snapshot).clone();
+                seed.posters = Arc::new(
+                    snapshot
+                        .posters
+                        .iter()
+                        // Seed far-only resources; a selected canonical canvas now needs worker mip encoding.
+                        .filter(|poster| {
+                            !snapshot
+                                .cards
+                                .iter()
+                                .any(|card| card.selected && card.layer == Some(poster.layer))
+                        })
+                        .take(8)
+                        .cloned()
+                        .collect(),
+                );
+                let seed = Arc::new(seed);
+                let _ = render(seed.clone());
+                assert!(seed.posters.iter().all(|poster| !poster.has_pixels()));
+                assert!(FEEDBACK.with_borrow_mut(std::mem::take).is_empty());
+            }
+            let mut recovered = 0;
+            let mut frames = 0;
+            let bytes = loop {
+                frames += 1;
+                assert!(frames < 40, "a stable snapshot must finish uploading");
+                let bytes = render(snapshot.clone());
+                let remaining = snapshot.posters.iter().filter(|p| p.has_pixels()).count();
+                let mut redraw = false;
+                for message in FEEDBACK.with_borrow_mut(std::mem::take) {
+                    match message {
+                        gpu_gallery::PosterFeedback::Restore {
+                            posters,
+                            near_order,
+                            depth,
+                        } => {
+                            assert!(
+                                pass == 1
+                                    || posters.iter().all(|(_, encoding)| *encoding
+                                        == gpu_gallery::PosterEncoding::NearRgbaMips),
+                                "first fill may request worker mip encoding only"
+                            );
+                            recovered += posters.len();
+                            let has_far = posters.iter().any(|(_, encoding)| !encoding.is_near());
+                            let near_groups: HashSet<_> = posters
+                                .iter()
+                                .filter(|(_, encoding)| encoding.is_near())
+                                .map(|(poster, _)| &poster.source)
+                                .collect();
+                            let restores = usize::from(has_far) + near_groups.len();
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            worker.restore(
+                                &snapshot.posters,
+                                &near_order,
+                                posters,
+                                depth,
+                                move || {
+                                    let _ = tx.send(());
+                                },
+                            );
+                            for _ in 0..restores {
+                                rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+                            }
+                            redraw = true;
+                        }
+                        gpu_gallery::PosterFeedback::Redraw => redraw = true,
+                        gpu_gallery::PosterFeedback::MaintenanceAfter(_) => {}
+                        gpu_gallery::PosterFeedback::Prewarmed { .. } => {
+                            panic!("fixture has no prewarm intent")
+                        }
+                    }
+                }
+                if !redraw {
+                    assert_eq!(remaining, 0);
+                    break bytes;
+                }
+            };
+            // Far tiles fit in one frame; selected canonical pixels need one worker mip-encoding round trip.
+            let near = entries.iter().any(|entry| entry.card.selected);
+            assert_eq!(frames, if pass == 1 || near { 2 } else { 1 });
+            assert_eq!(
+                recovered,
+                if pass == 1 {
+                    snapshot.posters.len() + usize::from(near)
+                } else {
+                    usize::from(near)
+                }
             );
             let samples: HashSet<_> = entries
                 .iter()
@@ -2230,7 +2436,7 @@ fn dense_real_images_and_recreation(mode: GalleryMode) {
                 ::image::ImageFormat::Png,
             )
             .unwrap();
-            receipts.push(serde_json::json!({"width":width,"height":height,"pass":pass,"posters":indices.len(),"distinctImageCenters":samples.len(),"path":path,"source":"production GalleryProgram/material/shader/atlas; real decoded PNGs; new headless device each pass"}));
+            receipts.push(serde_json::json!({"width":width,"height":height,"pass":pass,"posters":indices.len(),"frames":frames,"recovered":recovered,"distinctImageCenters":samples.len(),"path":path,"source":"production GalleryProgram/material/shader/atlas; real decoded PNGs; new headless device each pass"}));
             previous = Some(bytes);
         }
     }
@@ -2548,7 +2754,7 @@ fn p6_owned_pending_layouts_1080p_1440p() {
 fn p5_theme_modal_owns_keyboard_over_previously_focused_name_and_hex() {
     fn editor_message(message: &Message) -> bool {
         match message {
-            Message::SettingsLegacy { message, .. } => editor_message(message),
+            Message::SettingsPageAction { message, .. } => editor_message(message),
             Message::ThemeDesigner(crate::candidate_app::theme_workflow::Action::Name {
                 ..
             })
@@ -3774,16 +3980,13 @@ fn retirement_owned_detail_settings_bindings_1080p_1440p() {
                 let generation = app.settings_workbench.generation;
                 let _ = update(
                     &mut app,
-                    Message::SettingsWindowsOpen {
+                    Message::SettingsOpenPage {
                         window,
                         generation,
                         category: SettingsCategory::WallpapersDisplays,
                     },
                 );
-                assert_eq!(
-                    app.settings_workbench.windows_panel,
-                    Some(SettingsCategory::WallpapersDisplays)
-                );
+                assert_eq!(app.settings_workbench.tab, "displays");
             } else {
                 p3_settings_intent(&mut app, SettingsMsg::SelectTab("picker".into()));
                 p3_settings_intent(
@@ -4658,7 +4861,7 @@ fn r4_owned_theme_designer_layouts_and_reachability() {
     }
     fn unbind(message: Message) -> Message {
         match message {
-            Message::SettingsLegacy { message, .. } => unbind(*message),
+            Message::SettingsPageAction { message, .. } => unbind(*message),
             m => m,
         }
     }
@@ -4859,7 +5062,7 @@ fn r4_owned_theme_designer_layouts_and_reachability() {
                 close_click
                     .into_iter()
                     .map(unbind)
-                    .any(|message| matches!(message, Message::SettingsWindowsClose { .. })),
+                    .any(|message| matches!(message, Message::SettingsThemeClose { .. })),
                 "Theme Close shares the visible corner hit"
             );
             assert!(!initial
@@ -5256,20 +5459,22 @@ fn r4_owned_theme_designer_layouts_and_reachability() {
     .unwrap();
 }
 #[test]
-fn r5_library_reading_action_uses_existing_generation_gateway_and_back() {
-    use view::settings::{
-        composed::ActionId,
-        folio::intent::{Message as Intent, SettingsMsg},
-    };
-    let mut app = p3_composed_editor_app(SettingsCategory::Library);
-    let cards = view::settings::bridge::build(&app, "library");
-    assert!(cards.iter().flat_map(|(_, rows)| rows).any(|row| matches!(
-        row.control,
-        Control::ActionBtn {
-            id: ActionId::OpenLibraryTools,
-            ..
-        }
-    )));
+fn library_search_opens_current_folders_and_rejects_stale_callbacks() {
+    use view::settings::folio::intent::{Message as Intent, SettingsMsg};
+    let mut app = p3_composed_editor_app(SettingsCategory::Picker);
+    p3_settings_intent(&mut app, SettingsMsg::SearchOpen);
+    let query = app
+        .settings_locale
+        .text_static("r5-library-manage")
+        .to_owned();
+    p3_settings_intent(&mut app, SettingsMsg::SearchInput(query));
+    let hit = app
+        .settings_workbench
+        .results
+        .iter()
+        .find(|hit| hit.tab == "library")
+        .unwrap()
+        .clone();
     let saved = app.state.clone();
     let config = toml::to_string(&app.config).unwrap();
     let window = app.window;
@@ -5277,29 +5482,15 @@ fn r5_library_reading_action_uses_existing_generation_gateway_and_back() {
     let callback = Message::SettingsIntent {
         window,
         generation,
-        intent: Intent::Settings(SettingsMsg::Run(ActionId::OpenLibraryTools)),
+        intent: Intent::Settings(SettingsMsg::OpenSearchResult(hit.tab, hit.section, hit.row)),
     };
     let _ = update(&mut app, callback.clone());
-    assert_eq!(
-        app.settings_workbench.windows_panel,
-        Some(SettingsCategory::Library)
-    );
-    let child_generation = app.settings_workbench.generation;
-    assert_ne!(generation, child_generation);
-    let _ = update(&mut app, callback);
-    assert_eq!(
-        app.settings_workbench.generation, child_generation,
-        "stale callback is rejected"
-    );
-    let _ = update(
-        &mut app,
-        Message::SettingsWindowsClose {
-            window,
-            generation: child_generation,
-        },
-    );
-    assert_eq!(app.settings_workbench.windows_panel, None);
     assert_eq!(app.settings_workbench.tab, "library");
+    assert!(app.settings_workbench.windows_panel.is_none());
+    let current = app.settings_workbench.generation;
+    assert_ne!(generation, current);
+    let _ = update(&mut app, callback);
+    assert_eq!(app.settings_workbench.generation, current);
     assert_eq!(app.state, saved);
     assert_eq!(toml::to_string(&app.config).unwrap(), config);
 }
@@ -6053,7 +6244,7 @@ fn preset_name_public_studio_bounds_and_captured_identity() {
     #[derive(Default)]
     struct Bounds {
         text: Vec<(String, iced::Rectangle)>,
-        inputs: Vec<iced::Rectangle>,
+        inputs: Vec<(Option<iced::widget::Id>, iced::Rectangle)>,
     }
     impl Operation for Bounds {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
@@ -6064,11 +6255,11 @@ fn preset_name_public_studio_bounds_and_captured_identity() {
         }
         fn text_input(
             &mut self,
-            _: Option<&iced::widget::Id>,
+            id: Option<&iced::widget::Id>,
             bounds: iced::Rectangle,
             _: &mut dyn iced::advanced::widget::operation::TextInput,
         ) {
-            self.inputs.push(bounds);
+            self.inputs.push((id.cloned(), bounds));
         }
     }
     let output =
@@ -6091,9 +6282,23 @@ fn preset_name_public_studio_bounds_and_captured_identity() {
             "Evening 海風 café — a very long preset name for the narrow layout studio saved button",
         ),
         (
-            960,
+            640,
             720,
             0.5,
+            "zh-CN",
+            "Evening 海風 café — a very long preset name for the narrow layout studio saved button",
+        ),
+        (
+            640,
+            720,
+            2.0,
+            "en-US",
+            "Evening 海風 café — a very long preset name for the narrow layout studio saved button",
+        ),
+        (
+            640,
+            720,
+            2.0,
             "zh-CN",
             "Evening 海風 café — a very long preset name for the narrow layout studio saved button",
         ),
@@ -6151,7 +6356,10 @@ fn preset_name_public_studio_bounds_and_captured_identity() {
             .find(|(text, _)| text == name || (text.starts_with("Evening") && text.ends_with('…')))
             .expect("actual saved entry label");
         assert!(shown.1.x >= 0.0 && shown.1.x + shown.1.width <= right + 0.1);
-        assert!(shown.1.height < 20.0, "saved label is one line");
+        assert!(
+            shown.1.height < (20.0 * scale.max(1.0)),
+            "saved label is one line"
+        );
         if name != "Evening" && name.starts_with("Evening") {
             assert!(shown.0.ends_with('…'));
         } else {
@@ -6167,7 +6375,12 @@ fn preset_name_public_studio_bounds_and_captured_identity() {
         assert!(bounds
             .inputs
             .iter()
-            .any(|b| b.x >= 0.0 && b.x + b.width <= right + 0.1 && b.y < shown.1.y));
+            .any(|(_, b)| b.x >= 0.0 && b.x + b.width <= right + 0.1 && b.y < shown.1.y));
+        assert!(!bounds.text.iter().any(|(text, _)| {
+            text == app
+                .settings_locale
+                .text_static("settings-selector-preset-shortcut-hint")
+        }));
         let mut messages = Vec::new();
         for event in [
             iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
@@ -6184,7 +6397,10 @@ fn preset_name_public_studio_bounds_and_captured_identity() {
                 &viewport,
             );
         }
-        assert!(messages.iter().any(|m|matches!(m,Message::SettingsIntent { intent:view::settings::folio::intent::Message::ApplyPreset(GalleryKind::Slices,target),..} if *target==id)),"public label hit keeps captured ID");
+        assert!(messages.iter().any(|message| matches!(message,
+            Message::SettingsIntent { intent: view::settings::folio::intent::Message::ApplyPreset(GalleryKind::Slices, target), .. }
+            if *target == id
+        )), "public label hit keeps captured ID");
         renderer.reset(viewport);
         element.as_widget().draw(
             &tree,
@@ -6852,7 +7068,7 @@ fn pk02_resolution_editor_and_rail_production_compositions() {
 
     fn action(message: &Message, expected: ActionId) -> bool {
         match message {
-            Message::SettingsLegacy { message, .. } => action(message, expected),
+            Message::SettingsPageAction { message, .. } => action(message, expected),
             Message::SettingsIntent {
                 intent: Intent::Settings(SettingsMsg::Run(actual)),
                 ..
@@ -6862,7 +7078,7 @@ fn pk02_resolution_editor_and_rail_production_compositions() {
     }
     fn closes(message: &Message) -> bool {
         match message {
-            Message::SettingsLegacy { message, .. } => closes(message),
+            Message::SettingsPageAction { message, .. } => closes(message),
             Message::SettingsIntent {
                 intent: Intent::ToggleSettings,
                 ..
@@ -7392,7 +7608,7 @@ fn pk03_rotation_settings_and_playlist_production_compositions() {
 
     fn action(message: &Message, expected: ActionId) -> bool {
         match message {
-            Message::SettingsLegacy { message, .. } => action(message, expected),
+            Message::SettingsPageAction { message, .. } => action(message, expected),
             Message::SettingsIntent {
                 intent: Intent::Settings(SettingsMsg::Run(actual)),
                 ..
@@ -7402,7 +7618,7 @@ fn pk03_rotation_settings_and_playlist_production_compositions() {
     }
     fn closes(message: &Message) -> bool {
         match message {
-            Message::SettingsLegacy { message, .. } => closes(message),
+            Message::SettingsPageAction { message, .. } => closes(message),
             Message::SettingsIntent {
                 intent: Intent::ToggleSettings,
                 ..
@@ -7421,7 +7637,7 @@ fn pk03_rotation_settings_and_playlist_production_compositions() {
     .unwrap();
     fn random_toggle(message: &Message) -> bool {
         match message {
-            Message::SettingsLegacy { message, .. } => random_toggle(message),
+            Message::SettingsPageAction { message, .. } => random_toggle(message),
             Message::SettingsIntent {
                 intent: Intent::Settings(SettingsMsg::Toggle(path, _)),
                 ..

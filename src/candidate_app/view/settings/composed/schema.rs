@@ -400,6 +400,10 @@ pub mod setting {
             Setting::number(keys::selector::SLICE_SEARCH_PANEL_OFFSET_X, 0.0);
         pub const SLICE_SEARCH_PANEL_OFFSET_Y: Setting<f64> =
             Setting::number(keys::selector::SLICE_SEARCH_PANEL_OFFSET_Y, 0.0);
+        pub const DEPTH_STAGE_X: Setting<f64> =
+            Setting::bounded_number(keys::selector::DEPTH_STAGE_X, 0.0, -100.0, 100.0);
+        pub const DEPTH_STAGE_Y: Setting<f64> =
+            Setting::bounded_number(keys::selector::DEPTH_STAGE_Y, 0.0, -100.0, 100.0);
         pub const SLICE_STAGE_X: Setting<f64> =
             Setting::bounded_number(keys::selector::SLICE_STAGE_X, 0.0, -100.0, 100.0);
         pub const SLICE_STAGE_Y: Setting<f64> =
@@ -417,6 +421,23 @@ pub mod setting {
         pub const PREVIEW_FPS: Setting<f64> =
             Setting::bounded_number(keys::transition::PREVIEW_FPS, 30.0, 1.0, 1_000.0);
         pub const SHADER: Setting<String> = Setting::text(keys::transition::SHADER, "random");
+    }
+
+    pub mod wallpaper_transition {
+        use super::{keys, Setting};
+
+        pub const DURATION_MS: Setting<f64> = Setting::bounded_number(
+            keys::wallpaper_transition::DURATION_MS,
+            650.0,
+            100.0,
+            10_000.0,
+        );
+        pub const ENABLED: Setting<bool> =
+            Setting::boolean(keys::wallpaper_transition::ENABLED, true);
+        pub const EFFECT: Setting<String> =
+            Setting::text(keys::wallpaper_transition::EFFECT, "crossfade");
+        pub const FAMILY: Setting<String> =
+            Setting::text(keys::wallpaper_transition::FAMILY, "fade");
     }
 }
 
@@ -525,6 +546,8 @@ const STATIC_SPECS: &[SettingSpec] = &[
     setting::selector::SLICE_FILTER_BAR_OFFSET_Y.spec(),
     setting::selector::SLICE_SEARCH_PANEL_OFFSET_X.spec(),
     setting::selector::SLICE_SEARCH_PANEL_OFFSET_Y.spec(),
+    setting::selector::DEPTH_STAGE_X.spec(),
+    setting::selector::DEPTH_STAGE_Y.spec(),
     setting::selector::SLICE_STAGE_X.spec(),
     setting::selector::SLICE_STAGE_Y.spec(),
     setting::transition::DURATION_MS.spec(),
@@ -532,6 +555,10 @@ const STATIC_SPECS: &[SettingSpec] = &[
     setting::transition::ENABLED.spec(),
     setting::transition::PREVIEW_FPS.spec(),
     setting::transition::SHADER.spec(),
+    setting::wallpaper_transition::DURATION_MS.spec(),
+    setting::wallpaper_transition::ENABLED.spec(),
+    setting::wallpaper_transition::EFFECT.spec(),
+    setting::wallpaper_transition::FAMILY.spec(),
     SettingSpec::boolean(super::keys::selector::LIVE_PREVIEW, true),
     SettingSpec::boolean(super::keys::selector::HEX_ARC, true),
     SettingSpec::boolean("filterBar.show.sort", true),

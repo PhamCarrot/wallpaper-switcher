@@ -1,4 +1,5 @@
 use iced::widget::column;
+mod overlay_layer;
 pub(super) mod settings;
 mod sheets;
 #[cfg(test)]
@@ -215,7 +216,9 @@ pub(super) fn gallery_rail_model(app: &GpuCandidate) -> donor_rail::RailModel {
                     .iter()
                     .any(|preset| preset.matches_orientation(app.filter_rule.orientation))),
         folder: source.flag_default_true("filterBar.show.folder")
-            && (!app.available_folders().is_empty() || !app.filter_rule.folders.is_empty()),
+            && (!app.catalog.is_empty()
+                || !app.config.catalog.local_folders.is_empty()
+                || !app.filter_rule.folders.is_empty()),
         sort: source.flag_default_true("filterBar.show.sort"),
         favorites: source.flag_default_true("filterBar.show.favourites"),
         random: source.flag_default_true("filterBar.show.random"),
@@ -412,7 +415,15 @@ pub(super) fn view(app: &GpuCandidate, _id: window::Id) -> Element<'_, Message> 
         entries
             .iter()
             .filter(|e| !e.outgoing)
-            .filter_map(donor_scene::presented_hit_card)
+            .filter_map(|entry| {
+                let mut card = donor_scene::presented_hit_card(entry)?;
+                if entry.hex_style {
+                    // The Geometric renderer applies this launch transform to
+                    // its instances. Keep the hit and Detail bounds aligned.
+                    donor_scene::launch_card(&mut card, entry.entrance, entry.launch, app.viewport);
+                }
+                Some(card)
+            })
             .collect()
     } else if let Some(frame) = &app.depth_frame {
         frame.cards.iter().map(|e| e.card).collect()
@@ -428,31 +439,37 @@ pub(super) fn view(app: &GpuCandidate, _id: window::Id) -> Element<'_, Message> 
             &poster_aspects,
         )
     };
-    let loaded_layers: HashSet<_> = app.posters.iter().map(|poster| poster.layer).collect();
-    for card in &mut cards {
-        let Some(master_index) = (if app.gallery_mode == GalleryMode::Depth || ordinary.is_some() {
-            Some(card.index)
-        } else {
-            resolve_master_index(&app.wallpapers, &app.filtered_indices, card.index)
-        }) else {
-            card.layer = None;
-            continue;
-        };
-        card.index = master_index;
-        let layer = app
-            .poster_slots
-            .get(&master_index)
-            .filter(|slot| {
-                app.wallpapers
-                    .get(master_index)
-                    .is_some_and(|wallpaper| poster_slot_matches(slot, wallpaper))
-            })
-            .map(|slot| slot.layer)
-            .filter(|layer| loaded_layers.contains(layer));
-        card.layer = layer;
-        if let Some(poster) = layer.and_then(|layer| app.posters.iter().find(|p| p.layer == layer))
-        {
-            card.poster_aspect_ratio = poster.aspect_ratio;
+    // Ordinary cards already carry the source-validated layer and aspect from
+    // ordinary_base_frame. Rechecking them here repeats filesystem metadata work
+    // on every menu/scene animation frame.
+    if ordinary.is_none() {
+        let loaded_layers: HashSet<_> = app.posters.iter().map(|poster| poster.layer).collect();
+        for card in &mut cards {
+            let Some(master_index) = (if app.gallery_mode == GalleryMode::Depth {
+                Some(card.index)
+            } else {
+                resolve_master_index(&app.wallpapers, &app.filtered_indices, card.index)
+            }) else {
+                card.layer = None;
+                continue;
+            };
+            card.index = master_index;
+            let layer = app
+                .poster_slots
+                .get(&master_index)
+                .filter(|slot| {
+                    app.wallpapers
+                        .get(master_index)
+                        .is_some_and(|wallpaper| poster_slot_matches(slot, wallpaper))
+                })
+                .map(|slot| slot.layer)
+                .filter(|layer| loaded_layers.contains(layer));
+            card.layer = layer;
+            if let Some(poster) =
+                layer.and_then(|layer| app.posters.iter().find(|p| p.layer == layer))
+            {
+                card.poster_aspect_ratio = poster.aspect_ratio;
+            }
         }
     }
     let selected_card_geometry = cards
@@ -468,8 +485,23 @@ pub(super) fn view(app: &GpuCandidate, _id: window::Id) -> Element<'_, Message> 
         .or(app.detail_source);
     let snapshot = Arc::new(GallerySnapshot {
         ordinary,
+        defer_near_restore: match app.gallery_mode {
+            GalleryMode::Wall => app
+                .wall_presentation
+                .as_ref()
+                .is_some_and(|p| !p.camera.settled()),
+            GalleryMode::Geometric => app
+                .hex_presentation
+                .as_ref()
+                .is_some_and(|p| !p.camera.settled()),
+            _ => false,
+        },
         wall_clip: (app.gallery_mode == GalleryMode::Wall).then(|| {
-            gpu_gallery::wall_frame(app.viewport, gallery_layout_params_for_app(app).wall).clip
+            let composition = gallery_layout_params_for_app(app).wall;
+            app.wall_presentation.as_ref().map_or_else(
+                || gpu_gallery::wall_frame(app.viewport, composition).clip,
+                |p| p.clip(app.viewport, composition),
+            )
         }),
         depth: app.depth_frame.clone().map(|mut frame| {
             for e in &mut frame.cards {
@@ -495,11 +527,22 @@ pub(super) fn view(app: &GpuCandidate, _id: window::Id) -> Element<'_, Message> 
                 || !matches!(app.gallery_mode, GalleryMode::Slices | GalleryMode::Depth),
             viewport: app.viewport,
             time: app.presentation_started.elapsed().as_secs_f32(),
-            visibility: app.scene_motion.opacity(),
+            visibility: if app.atlas_entry.is_some() {
+                0.0
+            } else {
+                app.scene_motion.opacity()
+            },
         },
     });
     let scene: Element<'_, GalleryMessage> = shader(GalleryProgram {
+        prewarm: (app.atlas_entry.is_some() || app.wall_colour_roll_held()).then(|| {
+            (
+                app.atlas_prewarm_key(),
+                !app.poster_loading && app.poster_request_key.is_some(),
+            )
+        }),
         snapshot: snapshot.clone(),
+        poster_feedback: Some(super::images::publish_poster_feedback),
     })
     .width(Fill)
     .height(Fill)
@@ -799,25 +842,55 @@ pub(super) fn view(app: &GpuCandidate, _id: window::Id) -> Element<'_, Message> 
             ..iced::Padding::ZERO
         }));
     }
-    if app.panel_state.settings_open {
-        layers = layers.push(settings::gateway::view(app));
-    }
-    if app.panel_state.search_open && !app.panel_state.settings_open {
-        layers = layers.push(search_panel_view(app, folio_palette));
-    }
-    if app.playlist_panel_open {
-        let selected = app
-            .selected
+    // Keep the sheets in stable positions even when gallery chrome reappears.
+    let empty = || Space::new().width(Fill).height(Fill);
+    let mut layers = iced::widget::stack![layers.width(Fill).height(Fill)];
+    let settings_opacity = app.scene_motion.settings_opacity();
+    let settings = if app.panel_state.settings_open || settings_opacity > 0.0 {
+        let opacity = if settings_opacity == 0.0 {
+            1.0
+        } else {
+            settings_opacity
+        };
+        overlay_layer::view(
+            settings::gateway::view(app),
+            app.panel_state.settings_open,
+            opacity,
+        )
+    } else {
+        empty().into()
+    };
+    layers = layers.push(settings);
+    let search = if app.panel_state.search_open && !app.panel_state.settings_open {
+        search_panel_view(app, folio_palette)
+    } else {
+        empty().into()
+    };
+    layers = layers.push(search);
+    let playlist = if app.playlist_panel_open || app.retiring_playlist.is_some() {
+        let old = app.retiring_playlist.as_ref();
+        let opacity = app.scene_motion.playlist_opacity();
+        let opacity = if opacity == 0.0 { 1.0 } else { opacity };
+        let selection = old.map_or(app.selected, |old| {
+            old.selected_id
+                .as_ref()
+                .and_then(|id| app.wallpapers.iter().position(|w| &w.id == id))
+        });
+        let selected = selection
             .filter(|i| app.filtered_indices.contains(i))
             .and_then(|i| app.wallpapers.get(i).map(|w| (i, w)));
-        layers = layers.push(if app.playlist_chooser {
-            sheets::playlist_chooser_view(app)
-        } else if app.playlist_picker {
-            sheets::playlist_picker_view(app)
+        let content = if old.map_or(app.playlist_chooser, |old| old.chooser) {
+            sheets::playlist_chooser_view(app, old, opacity)
+        } else if old.map_or(app.playlist_picker, |old| old.picker) {
+            sheets::playlist_picker_view(app, old, opacity)
         } else {
-            playlist_panel_view(app, selected)
-        });
-    }
+            playlist_panel_view(app, selected, old, opacity)
+        };
+        overlay_layer::view(content, app.playlist_panel_open, opacity)
+    } else {
+        empty().into()
+    };
+    layers = layers.push(playlist);
     if app.engine_properties_open {
         layers = layers.push(
             container(engine_property_sheet(app, folio_palette))

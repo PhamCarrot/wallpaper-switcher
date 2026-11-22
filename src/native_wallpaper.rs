@@ -216,7 +216,7 @@ fn create_temporary_cache_file(destination: &Path) -> io::Result<(PathBuf, File)
 
     for attempt in 0..32u32 {
         let temporary = parent.join(format!(
-            ".{filename}.native-cache-tmp-{}-{nonce}-{attempt}",
+            ".{filename}.native-cache-tmp-{}-{nonce}-{attempt}.tmp",
             std::process::id()
         ));
         match OpenOptions::new()
@@ -250,7 +250,7 @@ where
             destination.display()
         )
     })?;
-    let temporary = TemporaryCacheFile {
+    let mut temporary = TemporaryCacheFile {
         path: temporary_path,
         remove_on_drop: true,
     };
@@ -285,6 +285,17 @@ where
             )
         })?;
     drop(file);
+
+    // Once flushed, the stage can become recovery evidence. Keep that name
+    // outside the disposable .tmp allowlist before publication can retain it.
+    let stage_path = temporary.path.with_extension("");
+    file_publication::rename_file_create_only(&temporary.path, &stage_path).map_err(|error| {
+        format!(
+            "Could not promote native-cache temporary file {} to a staged publication: {error}",
+            temporary.path.display()
+        )
+    })?;
+    temporary.path = stage_path;
 
     maybe_fail("temporary-validation").map_err(|error| {
         format!(
@@ -396,7 +407,9 @@ where
     match inspect_cached_bmp(destination) {
         Ok(CacheEntry::Valid { .. }) => return Ok(PublicationOutcome::ReusedExisting),
         Ok(CacheEntry::Missing) => {
-            if let Err(error) = fs::rename(&temporary.path, destination) {
+            if let Err(error) =
+                file_publication::rename_file_create_only(&temporary.path, destination)
+            {
                 let (staged_state, staged_valid) = cache_entry_description(&temporary.path);
                 if staged_valid {
                     temporary.retain_for_recovery();
@@ -552,10 +565,31 @@ where
         if !needs_conversion(path) {
             return Ok(path.to_path_buf());
         }
+        let stamp = crate::library::media_still::Fingerprint {
+            bytes: metadata.len(),
+            modified: metadata.modified().map_err(|error| {
+                format!(
+                    "Could not inspect wallpaper image timestamp {}: {error}",
+                    path.display()
+                )
+            })?,
+        };
+        let source_current = || {
+            if stamp.matches(path) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Wallpaper image changed during conversion: {}",
+                    path.display()
+                ))
+            }
+        };
         let cache_path = compatible_cache_path(path, cache_dir, &metadata);
         match inspect_cached_bmp(&cache_path) {
             Ok(CacheEntry::Valid { .. }) => {
+                source_current()?;
                 cache_status = "reused";
+                crate::poster_worker::cache::touch_native(&cache_path);
                 return Ok(cache_path);
             }
             Ok(CacheEntry::Missing) => cache_status = "created",
@@ -581,18 +615,27 @@ where
             .map_err(|error| format!("Could not create wallpaper cache: {error}"))?;
         let image = image::open(path)
             .map_err(|error| format!("Could not decode {}: {error}", path.display()))?;
+        source_current()?;
         let dimensions = (image.width(), image.height());
         let mut temporary = stage_bmp(&image, &cache_path, &mut maybe_fail)?;
+        source_current()?;
         match publish_staged_cache(
             &mut temporary,
             &cache_path,
             protected_paths,
-            &mut maybe_fail,
+            &mut |stage| {
+                maybe_fail(stage)?;
+                source_current().map_err(io::Error::other)
+            },
             replace_existing,
         )? {
             PublicationOutcome::Published => {}
-            PublicationOutcome::ReusedExisting => cache_status = "reused",
+            PublicationOutcome::ReusedExisting => {
+                cache_status = "reused";
+                crate::poster_worker::cache::touch_native(&cache_path);
+            }
         }
+        source_current()?;
         crate::apply_trace::event(
             "native-conversion-complete",
             format!(
@@ -630,15 +673,35 @@ pub(crate) fn prepare_compatible_image_with_protected_paths(
 
 fn desktop_wallpaper() -> Result<(ComApartment, IDesktopWallpaper), String> {
     let apartment = ComApartment::initialize()?;
-    let wallpaper = unsafe {
+    Ok((apartment, desktop_wallpaper_in_current_apartment()?))
+}
+
+fn desktop_wallpaper_in_current_apartment() -> Result<IDesktopWallpaper, String> {
+    unsafe {
         CoCreateInstance(
             &DesktopWallpaper,
             None::<&windows::core::IUnknown>,
             CLSCTX_ALL,
         )
     }
-    .map_err(|error| format!("IDesktopWallpaper is unavailable: {error}"))?;
-    Ok((apartment, wallpaper))
+    .map_err(|error| format!("IDesktopWallpaper is unavailable: {error}"))
+}
+
+// The WGC worker already owns a multithreaded COM apartment.
+pub(crate) fn monitor_rect_in_current_apartment(device_id: &str) -> Result<DesktopRect, String> {
+    let wallpaper = desktop_wallpaper_in_current_apartment()?;
+    let rect = unsafe { wallpaper.GetMonitorRECT(&HSTRING::from(device_id)) }
+        .map_err(|error| format!("Could not refresh the target display rectangle: {error}"))?;
+    let rect = DesktopRect {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    };
+    if rect.width() == 0 || rect.height() == 0 {
+        return Err("The target display is unavailable".into());
+    }
+    Ok(rect)
 }
 
 fn owned_wide_string(value: PWSTR) -> Result<String, String> {
@@ -827,6 +890,47 @@ pub fn get_wallpaper_for_device(device_id: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p38_native_source_change_during_staging_or_publication_is_discarded() {
+        for phase in ["temporary-validation", "publication"] {
+            let fixture = TestDirectory::new(phase);
+            let source = source_png(&fixture.path, "changing.png");
+            let cache_dir = fixture.path.join("native-images");
+            let old_key = compatible_image_path(&source, &cache_dir).unwrap();
+            let mut changed = false;
+            let result = prepare_compatible_image_inner(&source, &cache_dir, &[], |stage| {
+                if stage == phase {
+                    image::RgbaImage::from_fn(8, 5, |x, y| {
+                        image::Rgba([(x * 31) as u8, (y * 43) as u8, 180, 255])
+                    })
+                    .save(&source)
+                    .unwrap();
+                    changed = true;
+                }
+                Ok(())
+            });
+            assert!(changed, "the source mutation hook must run");
+            assert!(result.unwrap_err().contains("changed during conversion"));
+            assert!(!old_key.exists());
+            assert_no_owned_temporary_files(&cache_dir);
+            let current_key = compatible_image_path(&source, &cache_dir).unwrap();
+            assert_ne!(current_key, old_key);
+            assert_eq!(
+                prepare_compatible_image(&source, &cache_dir).unwrap(),
+                current_key
+            );
+            assert!(!old_key.exists());
+            assert!(matches!(
+                inspect_cached_bmp(&current_key),
+                Ok(CacheEntry::Valid {
+                    width: 8,
+                    height: 5
+                })
+            ));
+            assert_no_owned_temporary_files(&cache_dir);
+        }
+    }
 
     #[cfg(windows)]
     #[test]

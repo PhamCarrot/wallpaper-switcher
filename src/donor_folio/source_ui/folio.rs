@@ -51,7 +51,7 @@ pub fn folio_sheet_panel_style(palette: &Palette, ease: f32) -> container::Style
         with_alpha(palette.outline, 0.58),
     );
     style.shadow = iced::Shadow {
-        color: with_alpha(Color::BLACK, 0.52 * ease),
+        color: with_alpha(Color::BLACK, 0.52 * ease * palette.surface.a),
         offset: iced::Vector::new(0.0, 16.0),
         blur_radius: 48.0,
     };

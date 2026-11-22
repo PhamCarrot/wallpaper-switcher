@@ -15,6 +15,7 @@ mod selector_tab;
 mod source_defaults;
 mod system_tabs;
 mod theme_tabs;
+mod wallpaper_transition_tab;
 
 pub use builder::build_tab;
 #[cfg(test)]

@@ -68,6 +68,20 @@ impl GpuCandidate {
         self.local_tag_input.clear();
     }
 
+    pub(super) fn revoke_catalog_tag_callbacks(&mut self) {
+        let owner = self.tag_owner();
+        let keep = owner.as_ref().is_some_and(|owner| {
+            self.tag_editor_context.is_some()
+                && self.local_tag_draft_owner.as_ref() == Some(owner)
+                && self.catalog.iter().any(|entry| entry.id == owner.item)
+        });
+        self.tag_edit_session = self.tag_edit_session.wrapping_add(1);
+        self.local_tag_draft_owner = keep.then(|| self.tag_owner()).flatten();
+        if !keep {
+            self.local_tag_input.clear();
+        }
+    }
+
     pub(super) fn project_local_tags(&mut self) {
         for entry in &mut self.catalog {
             entry.tags = self
@@ -151,7 +165,13 @@ impl GpuCandidate {
             self.status = Some("Config publication needs reconciliation. Close and reopen this owned profile before another folder edit; recovery files were retained.".into());
             return;
         }
-        match save(&proposed) {
+        let result = save(&proposed);
+        self.settings_workbench
+            .announce_save(view::settings::bridge::SaveNotice::config_result(
+                "Library folders",
+                result.as_ref(),
+            ));
+        match result {
             Ok(outcome) => {
                 self.config = proposed;
                 self.config_save_failure = (!outcome.backup.is_available()).then(|| {
@@ -242,45 +262,22 @@ impl GpuCandidate {
 
     pub(super) fn search_panel_width(&self) -> f32 {
         let scale = view::settings::bridge::effective_ui_scale(self);
-        let source = view::settings::bridge::Source { app: self };
-        let width = source
-            .number("components.wallpaperSelector.tagCloudWidth")
-            .clamp(360.0, 2200.0) as f32;
-        let explicit_width = self.state.frontend_preferences.tag_panel.width.is_some()
-            || self
-                .settings_workbench
-                .draft
-                .values
-                .contains_key("components.wallpaperSelector.tagCloudWidth");
+        let width = 760.0 * scale;
         let (_, content_width) = crate::donor_search::footprint(&self.state.gallery);
-        let desired = if explicit_width {
-            width * scale
-        } else {
-            content_width.map_or(width * scale, |w| {
-                w.clamp(width * scale, (width * 1.15).min(920.0).max(width) * scale)
-            })
-        };
+        let desired = content_width.map_or(width, |w| w.clamp(width, 874.0 * scale));
         desired.min((self.viewport[0] - 40.0).max(1.0))
     }
 
     pub(super) fn search_panel_row_limit(&self) -> usize {
-        (view::settings::bridge::Source { app: self })
-            .text("components.wallpaperSelector.tagCloudRows")
-            .parse::<usize>()
-            .unwrap_or(2)
-            .clamp(1, 3)
+        2
     }
 
     pub(super) fn tag_panel_bounds(&self, width: f32, height: f32) -> [f32; 4] {
-        let source = view::settings::bridge::Source { app: self };
         crate::donor_search::bounds(
             self.viewport,
             &self.state.gallery,
             [width, height.min((self.viewport[1] - 40.0).max(1.0))],
-            [
-                source.number("components.wallpaperSelector.tagCloudOffsetX") as f32,
-                source.number("components.wallpaperSelector.tagCloudOffsetY") as f32,
-            ],
+            [0.0, 0.0],
         )
     }
 

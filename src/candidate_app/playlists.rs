@@ -12,6 +12,18 @@ pub(super) struct Owner {
     session: u64,
 }
 
+pub(super) struct RetiringPlaylist {
+    pub chooser: bool,
+    pub picker: bool,
+    pub owner: Option<Owner>,
+    pub name: String,
+    pub query: String,
+    pub browse_id: Option<String>,
+    pub editor_id: Option<String>,
+    pub selected_id: Option<String>,
+    pub deletion: Option<Deletion>,
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum Browse {
     Query(String),
@@ -56,6 +68,23 @@ impl Deletion {
 }
 
 impl GpuCandidate {
+    pub(super) fn playlist_departure(&self) -> Option<RetiringPlaylist> {
+        (self.visible && self.playlist_panel_open).then(|| RetiringPlaylist {
+            chooser: self.playlist_chooser,
+            picker: self.playlist_picker,
+            owner: self.playlist_owner(),
+            name: self.playlist_name.clone(),
+            query: self.playlist_query.clone(),
+            browse_id: self.browse_playlist_id.clone(),
+            editor_id: self.playlist_browsing_id.clone(),
+            selected_id: self
+                .selected
+                .and_then(|i| self.wallpapers.get(i))
+                .map(|item| item.id.clone()),
+            deletion: self.playlist_delete.clone(),
+        })
+    }
+
     pub(super) fn playlist_owner(&self) -> Option<Owner> {
         if !self.visible
             || self.exit_requested

@@ -80,6 +80,10 @@ pub struct WallProfileSnapshot {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DepthProfileSnapshot {
+    #[serde(default)]
+    pub offset_x: f32,
+    #[serde(default)]
+    pub offset_y: f32,
     pub shadows: bool,
     pub selection_frame: bool,
     pub height: f32,
@@ -236,7 +240,18 @@ pub struct ModeProfiles {
     pub hex: ModeProfileList<HexProfileSnapshot>,
     pub wall: ModeProfileList<WallProfileSnapshot>,
     pub depth: ModeProfileList<DepthProfileSnapshot>,
+    /// Preserved v4 shortcut records. Preset cycling uses local bindings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shortcuts: Vec<ProfileShortcut>,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileShortcut {
+    pub mode: Mode,
+    pub id: u64,
+    pub binding: String,
+}
+
 impl Default for ModeProfiles {
     fn default() -> Self {
         Self {
@@ -245,6 +260,7 @@ impl Default for ModeProfiles {
             hex: Default::default(),
             wall: Default::default(),
             depth: Default::default(),
+            shortcuts: Vec::new(),
         }
     }
 }
@@ -256,6 +272,25 @@ impl ModeProfiles {
             Mode::Wall => self.wall.rows(),
             Mode::Depth => self.depth.rows(),
         }
+    }
+    pub fn cycle_id(&self, mode: Mode, reverse: bool) -> Option<u64> {
+        let available: Vec<_> = self
+            .rows(mode)
+            .into_iter()
+            .filter(|entry| entry.available)
+            .map(|entry| entry.id)
+            .collect();
+        let last = available.len().checked_sub(1)?;
+        let selected = self.selected_id(mode);
+        let current = available.iter().position(|id| Some(*id) == selected);
+        let next = match (reverse, current) {
+            (false, None) => 0,
+            (true, None | Some(0)) => last,
+            (false, Some(index)) => (index + 1) % available.len(),
+            (true, Some(index)) => index - 1,
+        };
+        let id = available[next];
+        (Some(id) != selected).then_some(id)
     }
     pub fn selected_id(&self, mode: Mode) -> Option<u64> {
         match mode {
@@ -307,12 +342,17 @@ impl ModeProfiles {
         }
     }
     pub fn delete(&mut self, mode: Mode, id: u64) -> bool {
-        match mode {
+        let deleted = match mode {
             Mode::Slices => self.slices.delete(id),
             Mode::Geometric => self.hex.delete(id),
             Mode::Wall => self.wall.delete(id),
             Mode::Depth => self.depth.delete(id),
+        };
+        if deleted {
+            self.shortcuts
+                .retain(|shortcut| shortcut.mode != mode || shortcut.id != id);
         }
+        deleted
     }
     /// Resolve only the exact mode/ID; selection changes after actual acceptance.
     pub fn snapshot(&self, mode: Mode, id: u64) -> Option<Snapshot> {
@@ -409,8 +449,29 @@ pub(crate) fn current_geometry_is_valid(gallery: &super::GallerySettings) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn slices(width: f32) -> Snapshot {
+        Snapshot::Slices(SlicesProfileSnapshot {
+            shadows: true,
+            parallax: false,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            height: 220.0,
+            visible_count: 5,
+            expanded_width: 1.0,
+            width,
+            spacing: 12.0,
+            skew_distance: 0.0,
+            edge_tilt_distance: 0.0,
+            wobble: false,
+            wobble_strength: 0.0,
+            round_corners: true,
+            corners: [4.0; 4],
+        })
+    }
     fn depth(height: f32) -> Snapshot {
         Snapshot::Depth(DepthProfileSnapshot {
+            offset_x: 0.0,
+            offset_y: 0.0,
             shadows: false,
             selection_frame: true,
             height,
@@ -476,6 +537,52 @@ mod tests {
         assert_eq!(profiles, before);
         assert!(profiles.delete(Mode::Depth, 1));
         assert!(profiles.depth.entries.is_empty());
+    }
+
+    #[test]
+    fn legacy_profile_shortcuts_round_trip_as_inert_data() {
+        let mut profiles = ModeProfiles::default();
+        let id = profiles
+            .save(depth(500.0), |n| format!("Layout {n}"))
+            .unwrap();
+        profiles.shortcuts.push(ProfileShortcut {
+            mode: Mode::Depth,
+            id,
+            binding: "ctrl+q".into(),
+        });
+        profiles.validate().unwrap();
+        let restored: ModeProfiles = toml::from_str(&toml::to_string(&profiles).unwrap()).unwrap();
+        assert_eq!(restored, profiles);
+        assert!(profiles.delete(Mode::Depth, id));
+        assert!(profiles.shortcuts.is_empty());
+    }
+
+    #[test]
+    fn cycle_id_skips_unavailable_and_wraps_displayed_order() {
+        let mut profiles = ModeProfiles::default();
+        assert_eq!(profiles.cycle_id(Mode::Depth, false), None);
+        let first = profiles.save(depth(500.0), |n| format!("{n}")).unwrap();
+        assert_eq!(profiles.cycle_id(Mode::Depth, true), None);
+        let middle = profiles.next_id;
+        profiles.next_id += 1;
+        profiles.depth.entries.push(NamedModeProfile {
+            id: middle,
+            name: "Old Depth".into(),
+            snapshot: None,
+            legacy_snapshot: None,
+        });
+        let last = profiles.save(depth(600.0), |n| format!("{n}")).unwrap();
+        assert_eq!(profiles.cycle_id(Mode::Depth, false), Some(first));
+        assert_eq!(profiles.cycle_id(Mode::Depth, true), Some(first));
+        profiles.depth.selected_id = None;
+        assert_eq!(profiles.cycle_id(Mode::Depth, false), Some(first));
+        assert_eq!(profiles.cycle_id(Mode::Depth, true), Some(last));
+        profiles.depth.selected_id = Some(middle);
+        assert_eq!(profiles.cycle_id(Mode::Depth, false), Some(first));
+        assert_eq!(profiles.cycle_id(Mode::Depth, true), Some(last));
+        assert!(profiles.delete(Mode::Depth, first));
+        assert_eq!(profiles.cycle_id(Mode::Depth, false), Some(last));
+        assert_eq!(profiles.cycle_id(Mode::Slices, false), None);
     }
 }
 
@@ -571,6 +678,8 @@ impl Snapshot {
             Mode::Depth => {
                 let g = preset.depth.as_ref()?.effective_current();
                 Self::Depth(DepthProfileSnapshot {
+                    offset_x: 0.0,
+                    offset_y: 0.0,
                     shadows: g.shadows,
                     selection_frame: g.selection_frame,
                     height: g.height,
@@ -659,6 +768,7 @@ impl ModeProfiles {
         list(&self.slices, self.next_id, &mut ids)?;
         list(&self.hex, self.next_id, &mut ids)?;
         list(&self.wall, self.next_id, &mut ids)?;
-        list(&self.depth, self.next_id, &mut ids)
+        list(&self.depth, self.next_id, &mut ids)?;
+        Ok(())
     }
 }

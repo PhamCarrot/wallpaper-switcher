@@ -36,6 +36,8 @@ fn binding(path: &str) -> Option<BindingAction> {
         "keys.jumpLast" => BindingAction::JumpLast,
         "keys.modePrev" => BindingAction::ModePrev,
         "keys.modeNext" => BindingAction::ModeNext,
+        "keys.presetNext" => BindingAction::PresetNext,
+        "keys.presetPrev" => BindingAction::PresetPrev,
         "keys.autocomplete" => BindingAction::Autocomplete,
         "keys.typePrev" => BindingAction::TypePrev,
         "keys.typeNext" => BindingAction::TypeNext,
@@ -113,18 +115,6 @@ pub(in crate::candidate_app) fn read(saved: &FrontendPreferences, path: &str) ->
         "launch.animation" => saved.launch.animation.clone().map(Value::Text),
         "motion.launchSpeed" => saved.launch.speed.clone().map(Value::Text),
         "general.openFadeFrom" => saved.launch.fade_from.clone().map(Value::Number),
-        "components.wallpaperSelector.tagCloudWidth" => {
-            saved.tag_panel.width.clone().map(Value::Number)
-        }
-        "components.wallpaperSelector.tagCloudRows" => {
-            saved.tag_panel.rows.clone().map(Value::Text)
-        }
-        "components.wallpaperSelector.tagCloudOffsetX" => {
-            saved.tag_panel.offset_x.clone().map(Value::Number)
-        }
-        "components.wallpaperSelector.tagCloudOffsetY" => {
-            saved.tag_panel.offset_y.clone().map(Value::Number)
-        }
         "filterBar.visualStyle" => saved.filter_bar.visual_style.clone().map(Value::Text),
         "filterBar.orientation" => saved.filter_bar.orientation.clone().map(Value::Text),
         "filterBar.defaultFolder" => saved.filter_bar.default_folder.clone().map(Value::Text),
@@ -303,18 +293,6 @@ pub(in crate::candidate_app) fn write(
             }
             ("general.openFadeFrom", Value::Number(value)) => {
                 proposed.launch.fade_from = Some(value.clone())
-            }
-            ("components.wallpaperSelector.tagCloudWidth", Value::Number(value)) => {
-                proposed.tag_panel.width = Some(value.clone())
-            }
-            ("components.wallpaperSelector.tagCloudRows", Value::Text(value)) => {
-                proposed.tag_panel.rows = Some(value.clone())
-            }
-            ("components.wallpaperSelector.tagCloudOffsetX", Value::Number(value)) => {
-                proposed.tag_panel.offset_x = Some(value.clone())
-            }
-            ("components.wallpaperSelector.tagCloudOffsetY", Value::Number(value)) => {
-                proposed.tag_panel.offset_y = Some(value.clone())
             }
             ("filterBar.visualStyle", Value::Text(value)) => {
                 proposed.filter_bar.visual_style = Some(value.clone())

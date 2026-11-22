@@ -3,6 +3,7 @@ use crate::{
     apply_trace, candidate_state, donor_back_layout, donor_detail, donor_layout, donor_rail,
     donor_scene, gpu_gallery, library, poster_worker,
 };
+use poster_worker::PosterKind;
 use view::settings::composed::SettingsSource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +57,10 @@ pub(super) enum GalleryNumberField {
 pub(super) struct DepthPresentation {
     pub(super) params: donor_layout::DepthParams,
     count: f32,
+    pub(super) shadows: bool,
+    pub(super) selection_frame: bool,
+    style_from: Option<(bool, bool)>,
+    style_progress: f32,
     pub entrance: GalleryMotionState,
     pub launch: donor_scene::LaunchAnimation,
     morph_ms: f32,
@@ -66,6 +71,10 @@ impl DepthPresentation {
         Self {
             params,
             count: params.visible_count as f32,
+            shadows: state.gallery.depth.shadows,
+            selection_frame: state.gallery.depth.selection_frame,
+            style_from: None,
+            style_progress: 1.0,
             entrance: GalleryMotionState::source(1.0, 1.0, 250.0, 1.0),
             launch: donor_scene::LaunchAnimation::Fade,
             morph_ms: state
@@ -88,6 +97,9 @@ impl DepthPresentation {
                 *current = target;
             }
         }
+        for (offset, next) in self.params.offset.iter_mut().zip(target.params.offset) {
+            approach(offset, next, alpha, 0.00001);
+        }
         approach(&mut self.params.width, target.params.width, alpha, 0.05);
         approach(&mut self.params.height, target.params.height, alpha, 0.05);
         approach(&mut self.params.spacing, target.params.spacing, alpha, 0.05);
@@ -106,10 +118,32 @@ impl DepthPresentation {
         );
         approach(&mut self.count, target.count, alpha, 0.001);
         self.params.visible_count = self.count as usize;
-        self.unsettled(target)
+        let style_moving = if self.style_from.is_some()
+            || self.shadows != target.shadows
+            || self.selection_frame != target.selection_frame
+        {
+            if self.style_from.is_none() {
+                self.style_from = Some((self.shadows, self.selection_frame));
+                self.style_progress = 0.0;
+            }
+            self.style_progress += (1.0 - self.style_progress) * alpha;
+            if self.style_progress >= 0.995 {
+                self.shadows = target.shadows;
+                self.selection_frame = target.selection_frame;
+                self.style_progress = 1.0;
+                self.style_from = None;
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        self.unsettled(target) || style_moving
     }
     pub(super) fn unsettled(&self, target: Self) -> bool {
         !self.entrance.settled()
+            || self.params.offset != target.params.offset
             || self.params.width != target.params.width
             || self.params.height != target.params.height
             || self.params.spacing != target.params.spacing
@@ -117,6 +151,9 @@ impl DepthPresentation {
             || self.params.skew != target.params.skew
             || self.params.falloff != target.params.falloff
             || self.count != target.count
+            || self.shadows != target.shadows
+            || self.selection_frame != target.selection_frame
+            || self.style_from.is_some()
     }
 }
 pub(super) fn advance_gallery_motion(
@@ -454,14 +491,15 @@ pub(super) struct PosterRequestIdentity {
     pub(super) index: usize,
     pub(super) item_id: String,
     pub(super) source: std::path::PathBuf,
-    pub(super) is_video: bool,
+    pub(super) kind: PosterKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PosterSlot {
     pub(super) layer: u32,
-    pub(super) is_video: bool,
+    pub(super) kind: PosterKind,
     pub(super) generation: u64,
+    pub(super) last_requested: u64,
     pub(super) catalog_generation: u64,
     pub(super) item_id: String,
     pub(super) source: std::path::PathBuf,
@@ -529,6 +567,7 @@ pub(super) fn depth_poster_sources(
         ghosts,
         catalog_generation,
         gpu_gallery::MAX_POSTERS,
+        false,
     )
 }
 
@@ -538,42 +577,69 @@ pub(super) fn poster_sources_bounded(
     ghosts: &[DepthGhost],
     catalog_generation: u64,
     capacity: usize,
+    retain_recent: bool,
 ) -> Vec<poster_worker::PosterSource> {
-    let mut used: HashSet<u32> = ghosts.iter().map(|g| g.slot.layer).collect();
-    let mut sources = Vec::new();
-    for request in requests {
-        if ghosts
-            .iter()
-            .any(|g| ghost_matches_request(g, request, catalog_generation))
+    let mut used: HashSet<u32> = ghosts
+        .iter()
+        .map(|g| g.slot.layer)
+        .filter(|layer| (*layer as usize) < capacity)
+        .collect();
+    let remaining = capacity - used.len();
+    // Preserve the priority prefix, then reserve its existing layers before
+    // a new request can take a layer needed by a later request in that prefix.
+    let assignments: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            !ghosts
+                .iter()
+                .any(|g| ghost_matches_request(g, request, catalog_generation))
+        })
+        .take(remaining)
+        .map(|request| {
+            let existing = slots
+                .get(&request.index)
+                .filter(|slot| {
+                    slot.catalog_generation == catalog_generation
+                        && slot.item_id == request.item_id
+                        && slot.source == request.source
+                        && slot.kind == request.kind
+                        && slot.layer < capacity as u32
+                        && used.insert(slot.layer)
+                })
+                .map(|slot| slot.layer);
+            (request, existing)
+        })
+        .collect();
+    let mut free: Vec<_> = (0..capacity as u32)
+        .filter(|layer| !used.contains(layer))
+        .collect();
+    if retain_recent {
+        let mut occupied = [None; gpu_gallery::MAX_ORDINARY_POSTERS];
+        for slot in slots
+            .values()
+            .filter(|slot| slot.catalog_generation == catalog_generation)
         {
-            continue;
+            if let Some(age) = occupied.get_mut(slot.layer as usize) {
+                *age = Some(slot.last_requested);
+            }
         }
-        let existing = slots
-            .get(&request.index)
-            .filter(|slot| {
-                slot.catalog_generation == catalog_generation
-                    && slot.item_id == request.item_id
-                    && slot.source == request.source
-                    && slot.is_video == request.is_video
-                    && slot.layer < capacity as u32
-                    && !used.contains(&slot.layer)
-            })
-            .map(|slot| slot.layer);
-        let layer = existing.or_else(|| (0..capacity as u32).find(|layer| !used.contains(layer)));
-        let Some(layer) = layer else {
-            break;
-        };
-        used.insert(layer);
-        sources.push(poster_worker::PosterSource {
-            index: request.index,
-            layer,
-            item_id: request.item_id.clone(),
-            path: request.source.clone(),
-            is_video: request.is_video,
-            still: None,
-        });
+        free.sort_unstable_by_key(|layer| (occupied[*layer as usize], *layer));
     }
-    sources
+    let mut free = free.into_iter();
+    assignments
+        .into_iter()
+        .filter_map(|(request, existing)| {
+            Some(poster_worker::PosterSource {
+                index: request.index,
+                layer: existing.or_else(|| free.next())?,
+                item_id: request.item_id.clone(),
+                path: request.source.clone(),
+                kind: request.kind,
+                video_stamp: None,
+                still: None,
+            })
+        })
+        .collect()
 }
 pub(super) fn ghost_matches_request(
     g: &DepthGhost,
@@ -584,7 +650,7 @@ pub(super) fn ghost_matches_request(
         && g.index == r.index
         && g.slot.item_id == r.item_id
         && g.slot.source == r.source
-        && g.slot.is_video == r.is_video
+        && g.slot.kind == r.kind
 }
 
 /// Current cut frame also owns the upcoming live-window preload identities.
@@ -605,49 +671,81 @@ pub(super) fn depth_poster_requests(
             }
             union.insert(index);
             let wallpaper = wallpapers.get(index)?;
-            Some(PosterRequestIdentity {
-                index,
-                item_id: wallpaper.id.clone(),
-                source: poster_source_for_item(wallpaper),
-                is_video: wallpaper.source == WallpaperSource::LocalVideo,
-            })
+            Some(poster_identity(index, wallpaper))
         })
         .collect()
 }
 
 pub(super) fn poster_source_for_item(wallpaper: &WallpaperItem) -> std::path::PathBuf {
-    library::media_still::MediaStill::select(wallpaper, 0)
-        .map(|still| still.path)
-        .unwrap_or_else(|| {
-            wallpaper
-                .preview_path
-                .clone()
-                .unwrap_or_else(|| wallpaper.file_target.clone())
-        })
+    poster_media_for_item(wallpaper).0
+}
+
+pub(super) fn poster_media_for_item(wallpaper: &WallpaperItem) -> (std::path::PathBuf, PosterKind) {
+    if let Some(preview) = wallpaper.poster_video_path() {
+        return (preview.clone(), PosterKind::Video);
+    }
+    if let Some(still) = library::media_still::MediaStill::select(wallpaper, 0) {
+        return (still.path, PosterKind::Still);
+    }
+    if wallpaper.source == WallpaperSource::WallpaperEngine {
+        return (wallpaper.file_target.clone(), PosterKind::Placeholder);
+    }
+    (
+        wallpaper
+            .preview_path
+            .clone()
+            .unwrap_or_else(|| wallpaper.file_target.clone()),
+        PosterKind::Still,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn poster_kind_for_item(wallpaper: &WallpaperItem) -> PosterKind {
+    poster_media_for_item(wallpaper).1
+}
+
+fn poster_identity(index: usize, wallpaper: &WallpaperItem) -> PosterRequestIdentity {
+    let (source, kind) = poster_media_for_item(wallpaper);
+    PosterRequestIdentity {
+        index,
+        item_id: wallpaper.id.clone(),
+        source,
+        kind,
+    }
 }
 
 pub(super) fn poster_slot_matches(slot: &PosterSlot, wallpaper: &WallpaperItem) -> bool {
-    poster_slot_matches_source(slot, wallpaper, &poster_source_for_item(wallpaper))
+    let (source, kind) = poster_media_for_item(wallpaper);
+    poster_slot_matches_source(slot, wallpaper, &source, kind)
 }
 
 pub(super) fn poster_slot_matches_source(
     slot: &PosterSlot,
     wallpaper: &WallpaperItem,
     source: &std::path::Path,
+    kind: PosterKind,
 ) -> bool {
-    slot.item_id == wallpaper.id
-        && slot.source.as_path() == source
-        && slot.is_video == (wallpaper.source == WallpaperSource::LocalVideo)
+    slot.item_id == wallpaper.id && slot.source.as_path() == source && slot.kind == kind
 }
 
 pub(super) fn poster_completion_matches(
     decoded: &poster_worker::DecodedPoster,
     wallpaper: &WallpaperItem,
 ) -> bool {
-    wallpaper.id == decoded.source.item_id
-        && poster_source_for_item(wallpaper) == decoded.source.path
-        && (wallpaper.source == WallpaperSource::LocalVideo) == decoded.source.is_video
+    poster_source_matches(&decoded.source, wallpaper)
+        && decoded.source.video_is_current()
         && decoded.poster.source == decoded.source.path
+}
+
+pub(super) fn poster_source_matches(
+    source: &poster_worker::PosterSource,
+    wallpaper: &WallpaperItem,
+) -> bool {
+    if wallpaper.id != source.item_id {
+        return false;
+    }
+    let (path, kind) = poster_media_for_item(wallpaper);
+    path == source.path && kind == source.kind
 }
 
 pub(super) fn poster_completion_is_current(
@@ -710,7 +808,8 @@ pub(super) fn next_shape_filter(orientation: OrientationFilter) -> OrientationFi
     match orientation {
         OrientationFilter::Any => OrientationFilter::Landscape,
         OrientationFilter::Landscape => OrientationFilter::Portrait,
-        OrientationFilter::Portrait | OrientationFilter::Square => OrientationFilter::Any,
+        OrientationFilter::Portrait => OrientationFilter::Square,
+        OrientationFilter::Square => OrientationFilter::Any,
     }
 }
 
@@ -1002,6 +1101,7 @@ pub(super) fn gallery_layout_params(
     let wall = &state.gallery.wall;
     GalleryLayoutParams {
         depth: donor_layout::DepthParams {
+            offset: [state.gallery.depth.offset_x, state.gallery.depth.offset_y],
             width: state.gallery.depth.width,
             height: state.gallery.depth.height,
             spacing: state.gallery.depth.spacing,
@@ -1160,6 +1260,17 @@ pub(super) fn prioritized_poster_indices(filtered: &[usize], selected: usize) ->
         .iter()
         .position(|index| *index == selected)
         .unwrap_or(0);
+    prioritized_poster_indices_at(filtered, selected_position)
+}
+
+pub(super) fn prioritized_poster_indices_at(
+    filtered: &[usize],
+    selected_position: usize,
+) -> Vec<usize> {
+    if filtered.is_empty() {
+        return Vec::new();
+    }
+    let selected_position = selected_position.min(filtered.len() - 1);
     let mut indices = Vec::with_capacity(gpu_gallery::MAX_POSTERS.min(filtered.len()));
     indices.push(filtered[selected_position]);
     for distance in 1..filtered.len() {
@@ -1194,12 +1305,6 @@ pub(super) fn filtered_poster_aspects(
                 .unwrap_or(16.0 / 9.0)
         })
         .collect()
-}
-
-pub(super) fn push_unique_poster_index(indices: &mut Vec<usize>, index: usize) {
-    if indices.len() < gpu_gallery::MAX_POSTERS && !indices.contains(&index) {
-        indices.push(index);
-    }
 }
 
 /// Choose Wall requests from the same visible cards that the renderer draws.
@@ -1462,18 +1567,13 @@ impl GpuCandidate {
         }
         if self.gallery_mode == GalleryMode::Depth {
             self.depth_settings_changed(&previous.depth);
+        } else {
+            self.start_motion(0.0);
         }
         self.wall_scroll_offset = 0.0;
         self.schedule_posters();
     }
-    pub(super) fn publish_gallery_settings(
-        &mut self,
-        gallery: candidate_state::GallerySettings,
-    ) -> bool {
-        if let Err(error) = view::settings::controller::finish_geometry_owner_edit(self) {
-            self.settings_workbench.message = error;
-            return false;
-        }
+    fn publish_gallery_settings(&mut self, gallery: candidate_state::GallerySettings) -> bool {
         if gallery == self.state.gallery {
             return false;
         }
@@ -1591,9 +1691,6 @@ impl GpuCandidate {
         let mut gallery = self.state.gallery.clone();
         if choose_geometric_shape(&mut gallery, shape) {
             self.publish_gallery_settings(gallery);
-            if self.state.gallery.geometric.shape == shape {
-                self.reveal_gallery_layout();
-            }
         }
     }
 
@@ -1672,16 +1769,21 @@ impl GpuCandidate {
         &mut self,
         mode: GalleryKind,
         id: u64,
-    ) -> Result<(), String> {
-        if mode != self.state.gallery.mode || mode != gallery_kind(self.gallery_mode) {
-            return Err("Choose a profile from the current mode.".into());
-        }
-        let snapshot = self
-            .state
-            .mode_profiles
-            .snapshot(mode, id)
-            .ok_or("This legacy profile has no available geometry snapshot.")?;
-        view::settings::profile_projection::install(self, &snapshot, Some(id))
+    ) -> (Task<Message>, Result<(), String>) {
+        let snapshot = if mode != self.state.gallery.mode || mode != gallery_kind(self.gallery_mode)
+        {
+            Err("Choose a profile from the current mode.")
+        } else {
+            self.state
+                .mode_profiles
+                .snapshot(mode, id)
+                .ok_or("This legacy profile has no available geometry snapshot.")
+        };
+        view::settings::profile_projection::install(
+            self,
+            snapshot.as_ref().map_err(|e| *e),
+            Some(id),
+        )
     }
 
     pub(super) fn delete_gallery_preset(
@@ -2060,6 +2162,10 @@ impl GpuCandidate {
         });
         let presentation_target = DepthPresentation::target(&self.state);
         let filter_duration = self.filter_swap_ms();
+        let poster_wait_deadline = self
+            .ordinary_roll
+            .as_ref()
+            .and_then(|r| r.poster_wait_deadline);
         let mut filter_wave = self
             .depth_roll
             .as_ref()
@@ -2078,6 +2184,7 @@ impl GpuCandidate {
                 .clamp(1.0, 1000.0) as f32,
         );
         let generation_clock = self.motion_generation.clone();
+        let motion_mailbox = Arc::clone(&self.motion_mailbox);
         let motion_tx = WAKE_TX.get().and_then(|slot| slot.lock().ok()?.clone());
         let Some(motion_tx) = motion_tx else {
             self.settle_gallery_motion();
@@ -2086,11 +2193,16 @@ impl GpuCandidate {
         if let Err(error) = std::thread::Builder::new()
             .name(format!("gpu-gallery-camera-{generation}"))
             .spawn(move || {
+                #[cfg(test)]
+                let _producer = motion_mailbox.observe_producer();
+                apply_trace::event_lazy("gallery-motion-start", || format!("generation={generation}"));
+                let mut frames = 0_u64;
                 let frame = frame_interval;
                 let mut previous_tick = std::time::Instant::now();
                 let mut next_tick = previous_tick + frame;
                 loop {
                     if generation != generation_clock.load(Ordering::Acquire) {
+                        apply_trace::event_lazy("gallery-motion-exit", || format!("generation={generation} frames={frames} reason=cancelled work={:?}", donor_layout::layout_work_snapshot()));
                         return;
                     }
                     let dt = motion_tick_elapsed(&mut previous_tick, std::time::Instant::now());
@@ -2116,8 +2228,9 @@ impl GpuCandidate {
                         p.inset = scene.inset(p.viewport[0]);
                         moving |= p.tick(dt);
                     }
-                    if motion_tx
-                        .unbounded_send(Wake::MotionFrame {
+                    frames += 1;
+                    if !motion_mailbox.publish(
+                        Wake::MotionFrame {
                             generation,
                             value: initial_state.value(),
                             velocity: initial_state.velocity,
@@ -2129,12 +2242,20 @@ impl GpuCandidate {
                             hex: hex.clone(),
                             wall: wall.clone(),
                             scene: Some(scene),
-                        })
-                        .is_err()
-                    {
+                        },
+                        &generation_clock,
+                        || motion_tx.unbounded_send(Wake::MotionReady).is_ok(),
+                    ) {
+                        apply_trace::event_lazy("gallery-motion-exit", || format!("generation={generation} frames={frames} reason=publication-rejected"));
                         return;
                     }
-                    if !moving && filter_wave.is_none_or(|wave| wave >= 1.6) {
+                    if !moving
+                        && filter_wave.is_none_or(|wave| wave >= 1.6)
+                        && poster_wait_deadline.is_none_or(|deadline| {
+                            std::time::Instant::now() >= deadline
+                        })
+                    {
+                        apply_trace::event_lazy("gallery-motion-exit", || format!("generation={generation} frames={frames} reason=settled terminal=published work={:?}", donor_layout::layout_work_snapshot()));
                         return;
                     }
                     let now = std::time::Instant::now();
@@ -2150,6 +2271,9 @@ impl GpuCandidate {
     }
 
     fn settle_gallery_motion(&mut self) {
+        if self.wall_colour_roll_held() {
+            self.ordinary_roll = None;
+        }
         self.scene_motion.settle();
         if let Some(p) = &mut self.hex_presentation {
             p.inset = self.scene_motion.inset(p.viewport[0]);
@@ -2167,6 +2291,9 @@ impl GpuCandidate {
     }
 
     pub(super) fn engage_gallery(&mut self) {
+        if self.wall_colour_roll_held() {
+            self.ordinary_roll = None;
+        }
         self.gallery_engaged = true;
         if let Some(p) = &mut self.wall_presentation {
             p.engaged = true;
@@ -2294,7 +2421,23 @@ impl GpuCandidate {
         }
     }
 
+    pub(super) fn assign_gallery_mode(&mut self, mode: GalleryMode) {
+        let deferred_colour = self.defer_wall_colour_sort();
+        self.gallery_mode = mode;
+        if deferred_colour != self.defer_wall_colour_sort() {
+            self.refresh_filter();
+        }
+    }
+
     pub(super) fn set_gallery_mode(&mut self, mode: GalleryMode) {
+        self.change_gallery_mode(mode, false);
+    }
+
+    pub(super) fn cycle_picker_mode(&mut self, mode: GalleryMode) {
+        self.change_gallery_mode(mode, true);
+    }
+
+    fn change_gallery_mode(&mut self, mode: GalleryMode, interactive: bool) {
         if self.gallery_mode == GalleryMode::Depth && mode == GalleryMode::Depth {
             return;
         }
@@ -2318,26 +2461,59 @@ impl GpuCandidate {
                     self.wall_presentation = None;
                 }
                 GalleryNavigationEffect::PersistState => {
-                    self.gallery_mode = mode;
+                    self.assign_gallery_mode(mode);
                     if mode == GalleryMode::Depth && self.depth_camera.is_none() {
                         self.reset_depth_transients();
-                        if !studio {
+                        if !interactive {
                             self.restart_gallery_entrance();
+                            self.start_motion(0.0);
                         }
-                        self.start_motion(0.0);
                     }
                     self.persist_state();
                 }
-                GalleryNavigationEffect::SchedulePosters => self.schedule_posters(),
+                GalleryNavigationEffect::SchedulePosters => {
+                    if interactive
+                        && changed
+                        && self.visible
+                        && (!self.panel_state.settings_open || studio)
+                    {
+                        self.restore_wall_start_position();
+                        self.sync_gallery_presentation();
+                        self.restart_gallery_entrance();
+                        self.start_motion(0.0);
+                    }
+                    self.schedule_posters();
+                }
             }
         }
         if changed {
-            self.reveal_gallery_layout();
+            if !interactive
+                && self.visible
+                && !studio
+                && self.screenshot_path.is_none()
+                && matches!(mode, GalleryMode::Wall | GalleryMode::Geometric)
+                && !self.filtered_indices.is_empty()
+                && self.cache_operation.is_none()
+                && self.poster_worker.is_some()
+            {
+                self.atlas_entry = Some(mode);
+                apply_trace::event_lazy("atlas-prewarm-held", || {
+                    format!(
+                        "mode={mode:?} generation={}",
+                        self.poster_generation.load(Ordering::Acquire)
+                    )
+                });
+            } else {
+                self.reveal_gallery_layout();
+            }
         }
     }
 
     pub(super) fn invalidate_poster_work(&mut self) {
+        self.atlas_entry = None;
+        self.poster_retry = PosterRetry::Available;
         self.poster_loading = false;
+        self.poster_failed_indices.clear();
         let generation = self.poster_generation.fetch_add(1, Ordering::AcqRel) + 1;
         if let Err(error) = self.poster_mailbox.expect(generation, Vec::new()) {
             self.poster_worker = None;
@@ -2350,6 +2526,15 @@ impl GpuCandidate {
         }
         self.poster_request_key = None;
         self.poster_assignment_key = None;
+    }
+
+    pub(super) fn atlas_prewarm_key(&self) -> gpu_gallery::AtlasPrewarmKey {
+        gpu_gallery::AtlasPrewarmKey {
+            generation: self.poster_generation.load(Ordering::Acquire),
+            motion_generation: self.motion_generation.load(Ordering::Acquire),
+            selected: self.selected,
+            viewport: self.viewport.map(f32::to_bits),
+        }
     }
 
     pub(super) fn clear_posters(&mut self) {
@@ -2560,9 +2745,8 @@ impl GpuCandidate {
                         .wallpapers
                         .get(body.card.index)
                         .is_some_and(|wallpaper| {
-                            completed.identity.source == poster_source_for_item(wallpaper)
-                                && completed.identity.is_video
-                                    == (wallpaper.source == WallpaperSource::LocalVideo)
+                            let (path, kind) = poster_media_for_item(wallpaper);
+                            completed.identity.source == path && completed.identity.kind == kind
                         })
             }) {
                 return true;
@@ -2585,7 +2769,7 @@ impl GpuCandidate {
                                 index: ghost.index,
                                 item_id: ghost.slot.item_id,
                                 source: ghost.slot.source,
-                                is_video: ghost.slot.is_video,
+                                kind: ghost.slot.kind,
                             },
                         },
                     );
@@ -2621,19 +2805,8 @@ impl GpuCandidate {
         self.depth_roll = Some(roll);
     }
 
-    pub(super) fn rebuild_depth_frame(&mut self) {
-        if self.gallery_mode != GalleryMode::Depth || !self.visible {
-            self.depth_frame = None;
-            return;
-        }
-        let selected_id = self
-            .selected
-            .and_then(|i| self.wallpapers.get(i))
-            .map(|w| w.id.clone());
-        if self.depth_detail_id.is_some() && self.depth_detail_id != selected_id {
-            self.cancel_detail("depth-frame-identity-change");
-        }
-        self.depth_revision = self.depth_revision.wrapping_add(1);
+    // Shared pure geometry lets a delayed retry reject stale demand before pruning residents.
+    fn base_depth_snapshot(&self) -> gpu_gallery::DepthSnapshot {
         let selected = self
             .selected
             .and_then(|i| self.wallpapers.get(i))
@@ -2672,13 +2845,34 @@ impl GpuCandidate {
                 .params,
             self.depth_presentation.map_or(1.0, |p| p.entrance.value()),
         );
-        let mut snapshot = gpu_gallery::DepthSnapshot::from_frame(frame);
+        gpu_gallery::DepthSnapshot::from_frame(frame)
+    }
+
+    pub(super) fn rebuild_depth_frame(&mut self) {
+        if self.gallery_mode != GalleryMode::Depth || !self.visible {
+            self.depth_frame = None;
+            return;
+        }
+        let selected_id = self
+            .selected
+            .and_then(|i| self.wallpapers.get(i))
+            .map(|w| w.id.clone());
+        if self.depth_detail_id.is_some() && self.depth_detail_id != selected_id {
+            self.cancel_detail("depth-frame-identity-change");
+        }
+        self.depth_revision = self.depth_revision.wrapping_add(1);
+        let mut snapshot = self.base_depth_snapshot();
         snapshot.entrance = self.depth_presentation.map_or(1.0, |p| p.entrance.value());
         snapshot.launch = self
             .depth_presentation
             .map_or(donor_scene::LaunchAnimation::None, |p| p.launch);
-        snapshot.selection_frame = self.state.gallery.depth.selection_frame;
-        snapshot.shadows = self.state.gallery.depth.shadows;
+        if let Some(presentation) = self.depth_presentation {
+            snapshot.selection_frame = presentation.selection_frame;
+            snapshot.shadows = presentation.shadows;
+        } else {
+            snapshot.selection_frame = self.state.gallery.depth.selection_frame;
+            snapshot.shadows = self.state.gallery.depth.shadows;
+        }
         snapshot.detail = donor_scene::DepthDetailPresentation {
             effect: candidate_state::depth_effect_id(&self.state.card_flip().effect).unwrap_or(0),
             animate_shader: self.state.card_flip().animate_shader,
@@ -2715,7 +2909,7 @@ impl GpuCandidate {
                     r.index == *index
                         && r.item_id == slot.item_id
                         && r.source == slot.source
-                        && r.is_video == slot.is_video
+                        && r.kind == slot.kind
                         && slot.catalog_generation
                             == self.catalog_generation.load(Ordering::Acquire)
                 })
@@ -2742,26 +2936,41 @@ impl GpuCandidate {
         self.resolve_depth_detail();
     }
     pub(super) fn schedule_posters(&mut self) {
-        self.schedule_posters_with_still_selector(library::media_still::MediaStill::select);
+        self.schedule_posters_with_still_selector(false, library::media_still::MediaStill::select);
     }
 
     pub(super) fn schedule_posters_with_still_selector(
         &mut self,
+        retry: bool,
         mut select_still: impl FnMut(
             &scanner::WallpaperItem,
             u64,
         ) -> Option<library::media_still::MediaStill>,
     ) {
-        self.restore_wall_start_position();
+        if retry && (self.wallpapers.is_empty() || self.filtered_indices.is_empty()) {
+            return;
+        }
+        let depth_retry = retry && self.gallery_mode == GalleryMode::Depth;
+        if !depth_retry {
+            self.restore_wall_start_position();
+        }
+        if !self.visible {
+            if self.poster_request_key.is_some() || self.poster_loading {
+                self.invalidate_poster_work();
+            }
+            return;
+        }
         if self.cache_operation.is_some() {
             return;
         }
-        if self.sync_gallery_presentation() {
-            self.start_motion(0.0);
+        if !depth_retry {
+            if self.sync_gallery_presentation() {
+                self.start_motion(0.0);
+            }
+            self.rebuild_depth_frame();
+            self.reconcile_ordinary_roll();
         }
-        self.rebuild_depth_frame();
-        self.reconcile_ordinary_roll();
-        if !self.visible || self.wallpapers.is_empty() || self.filtered_indices.is_empty() {
+        if self.wallpapers.is_empty() || self.filtered_indices.is_empty() {
             if self.posters.is_empty()
                 && self.poster_slots.is_empty()
                 && self.poster_request_key.is_none()
@@ -2773,57 +2982,56 @@ impl GpuCandidate {
             return;
         }
 
-        if let Some(failure) = self
-            .poster_worker
-            .as_ref()
-            .and_then(poster_worker::PosterWorker::unavailable_reason)
-        {
-            self.poster_worker = None;
-            self.poster_request_key = None;
-            self.record_poster_worker_failure(failure);
-        }
-
-        let requested = if let Some(frame) = &self.depth_frame {
-            depth_poster_requests(
+        let retry_frame = depth_retry.then(|| self.base_depth_snapshot());
+        let demand_frame = retry_frame.as_ref().or(self.depth_frame.as_ref());
+        let (requested, visible) = if let Some(frame) = demand_frame {
+            let requests = depth_poster_requests(
                 frame,
                 &self.filtered_indices,
                 &self.wallpapers,
                 self.depth_roll.as_ref().map_or(&[], |r| r.old.as_slice()),
-            )
+            );
+            let visible = requests
+                .iter()
+                .take_while(|request| frame.live_poster_indices.contains(&request.index))
+                .count();
+            (requests, visible)
         } else {
-            let poster_aspects = filtered_poster_aspects(&self.catalog, &self.filtered_indices);
-            let indices = if matches!(
+            let (indices, visible) = if matches!(
                 self.gallery_mode,
                 GalleryMode::Slices | GalleryMode::Geometric | GalleryMode::Wall
             ) {
-                self.ordinary_poster_indices()
+                self.ordinary_poster_demand()
             } else {
-                poster_indices_for_view(
+                let poster_aspects = filtered_poster_aspects(&self.catalog, &self.filtered_indices);
+                let indices = poster_indices_for_view(
                     self.gallery_mode,
                     &self.filtered_indices,
                     self.selected,
                     self.viewport,
                     gallery_layout_params_for_app(self),
                     &poster_aspects,
-                )
+                );
+                let visible = indices.len();
+                (indices, visible)
             };
-            indices
+            let mut visible_requests = 0;
+            let requests: Vec<_> = indices
                 .into_iter()
-                .filter_map(|index| {
+                .enumerate()
+                .filter_map(|(position, index)| {
                     let wallpaper = self.wallpapers.get(index)?;
-                    Some(PosterRequestIdentity {
-                        index,
-                        item_id: wallpaper.id.clone(),
-                        source: poster_source_for_item(wallpaper),
-                        is_video: wallpaper.source == WallpaperSource::LocalVideo,
-                    })
+                    visible_requests += usize::from(position < visible);
+                    Some(poster_identity(index, wallpaper))
                 })
-                .collect()
+                .collect();
+            (requests, visible_requests)
         };
-        let capacity = if self.gallery_mode == GalleryMode::Depth {
-            gpu_gallery::MAX_POSTERS
-        } else {
+        let retain_recent = self.gallery_mode != GalleryMode::Depth;
+        let capacity = if retain_recent {
             gpu_gallery::ordinary_poster_limit()
+        } else {
+            gpu_gallery::MAX_POSTERS
         };
         let pins = self.gallery_pins();
         let mut sources = poster_sources_bounded(
@@ -2832,29 +3040,141 @@ impl GpuCandidate {
             &pins,
             self.catalog_generation.load(Ordering::Acquire),
             capacity,
+            retain_recent,
         );
+        crate::apply_trace::event_lazy("gallery-poster-demand", || {
+            let live = self
+                .depth_frame
+                .as_ref()
+                .map_or(visible, |frame| frame.live_poster_indices.len());
+            let pins = self.depth_roll.as_ref().map_or(0, |roll| roll.old.len());
+            let source_summary = sources
+                .iter()
+                .take(16)
+                .map(|source| {
+                    format!(
+                        "index={} layer={} kind={:?} source={}",
+                        source.index,
+                        source.layer,
+                        source.kind,
+                        source.path.display()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+            format!(
+                "generation={} mode={:?} requested={} visible={} live={} pins={} capacity={} selected={:?} sources={source_summary}",
+                self.poster_generation.load(Ordering::Acquire),
+                self.gallery_mode,
+                requested.len(),
+                visible,
+                live,
+                pins,
+                capacity,
+                self.selected,
+            )
+        });
         let mut assignment_key: Vec<_> = sources.iter().map(|s| (s.index, s.layer)).collect();
         assignment_key.sort_unstable();
-        if !poster_request_changed(self.poster_request_key.as_deref(), &requested)
+        let mut visible_indices: Vec<_> = requested[..visible]
+            .iter()
+            .map(|request| request.index)
+            .collect();
+        visible_indices.sort_unstable();
+        let assignment_key = (assignment_key, visible_indices);
+        let same_request = !poster_request_changed(self.poster_request_key.as_deref(), &requested);
+        let same_logical_demand = same_request
+            && self
+                .poster_assignment_key
+                .as_ref()
+                .is_some_and(|previous| previous.1 == assignment_key.1);
+        let same_prefetch_priority = !matches!(
+            self.gallery_mode,
+            GalleryMode::Wall | GalleryMode::Geometric
+        ) || self
+            .poster_request_key
+            .as_deref()
+            .is_some_and(|previous| previous.get(visible..) == requested.get(visible..));
+        if retry {
+            if !same_logical_demand {
+                return;
+            }
+            self.poster_retry = PosterRetry::Spent;
+        } else if same_request
+            && same_prefetch_priority
             && self.poster_assignment_key.as_ref() == Some(&assignment_key)
         {
             return;
         }
-        // Unchanged demand does not need new captured still descriptors.
+        // Unchanged demand does not need new captured source descriptors.
         // Live source/slot checks above and worker freshness checks remain.
         for source in &mut sources {
-            source.still = self.wallpapers.get(source.index).and_then(|item| {
-                select_still(item, self.catalog_generation.load(Ordering::Acquire))
-            });
+            match source.kind {
+                poster_worker::PosterKind::Still => {
+                    source.still = self.wallpapers.get(source.index).and_then(|item| {
+                        select_still(item, self.catalog_generation.load(Ordering::Acquire))
+                    });
+                }
+                poster_worker::PosterKind::Video => {
+                    source.video_stamp = self
+                        .wallpapers
+                        .get(source.index)
+                        .and_then(WallpaperItem::video_stamp);
+                }
+                poster_worker::PosterKind::Placeholder => {}
+            }
         }
         let generation = self.poster_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let request_key = requested.clone();
+        self.poster_failed_indices.clear();
         if !self.ensure_preview_worker() {
             return;
         }
 
-        let batch =
+        let mut batch =
             poster_worker::PosterBatch::new(generation, sources, self.poster_cache_dir.clone());
+        batch.visible = requested[..visible]
+            .iter()
+            .map(|request| request.index)
+            .collect();
+        batch
+            .reusable
+            .extend(pins.into_iter().map(|pin| (pin.slot.layer, pin.poster)));
+        let mut requested_slots = Vec::new();
+        let mut stale_slots = HashMap::new();
+        for source in &batch.sources {
+            let same_slot = self.poster_slots.get(&source.index).is_some_and(|slot| {
+                slot.layer == source.layer
+                    && slot.catalog_generation == self.catalog_generation.load(Ordering::Acquire)
+                    && slot.item_id == source.item_id
+                    && slot.source == source.path
+                    && slot.kind == source.kind
+            });
+            if same_slot {
+                if let Some(poster) = self
+                    .posters
+                    .iter()
+                    .find(|poster| poster.layer == source.layer)
+                {
+                    if retain_recent {
+                        if !poster.matches_source(source.kind, source.stamp())
+                            || !source.video_is_current()
+                        {
+                            stale_slots.insert(source.index, source.layer);
+                            continue;
+                        }
+                        requested_slots.push(source.index);
+                    }
+                    batch.reusable.insert(source.layer, poster.clone());
+                }
+            }
+        }
+        if !stale_slots.is_empty() {
+            self.poster_slots
+                .retain(|index, _| !stale_slots.contains_key(index));
+            Arc::make_mut(&mut self.posters)
+                .retain(|poster| !stale_slots.values().any(|layer| *layer == poster.layer));
+        }
         if let Err(error) =
             self.poster_mailbox
                 .expect_bounded(generation, batch.sources.clone(), capacity)
@@ -2871,9 +3191,42 @@ impl GpuCandidate {
         };
         match worker.submit(batch) {
             Ok(()) => {
+                for index in requested_slots {
+                    if let Some(slot) = self.poster_slots.get_mut(&index) {
+                        slot.last_requested = generation;
+                    }
+                }
+                // Physical remaps cannot spend the delayed attempt. Once actually
+                // spent, that allowance stays spent for this logical demand.
+                if !same_logical_demand || self.poster_retry != PosterRetry::Spent {
+                    self.poster_retry = PosterRetry::Available;
+                }
                 self.poster_loading = true;
                 self.poster_request_key = Some(request_key);
                 self.poster_assignment_key = Some(assignment_key);
+            }
+            Err(
+                error
+                @ (poster_worker::SubmitError::CacheBusy | poster_worker::SubmitError::Closed),
+            ) => {
+                // No batch was accepted for this generation. Keep the cache owner
+                // and leave demand eligible for the next scheduling tick.
+                self.poster_loading = false;
+                if !retry {
+                    self.poster_request_key = None;
+                }
+                apply_trace::event_lazy("poster-submit-retry", || {
+                    format!(
+                        "worker={} generation={generation} reason={error:?}",
+                        worker.id()
+                    )
+                });
+            }
+            Err(
+                poster_worker::SubmitError::WorkerUnavailable(_)
+                | poster_worker::SubmitError::QueuePoisoned,
+            ) => {
+                // The owned worker's terminal wake settles the batch and reports why.
             }
             Err(error) => {
                 self.poster_worker = None;

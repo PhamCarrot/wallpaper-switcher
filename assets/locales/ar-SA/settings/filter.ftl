@@ -1,7 +1,7 @@
 settings-filter-appearance-card = المظهر
 settings-filter-appearance-card-desc = طابق شريط التصفية مع كل تخطيط للمنتقي، أو افرض نمطًا واحدًا في كل مكان.
 settings-filter-visual-style-label = النمط المرئي
-settings-filter-visual-style-desc = «مطابقة المنتقي» يستخدم الشريط المائل في Slices وSandy، والشريط الهندسي في Geometric، والشريط المستقيم في Wall.
+settings-filter-visual-style-desc = «مطابقة المنتقي» يستخدم الشريط المائل في Slices، والشريط الهندسي في Geometric، والشريط المستقيم في Wall.
 settings-filter-visual-style-match = مطابقة المنتقي
 settings-filter-visual-style-slices = Slices
 settings-filter-visual-style-hex = Geometric

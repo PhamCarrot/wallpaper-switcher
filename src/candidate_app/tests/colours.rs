@@ -19,7 +19,7 @@ fn pk01_same_path_catalog_refresh_updates_mtime_without_history_or_identity_chan
     let wallpapers = app.wallpapers.clone();
     let mut entries = app.catalog.clone();
     entries[0].modified_unix = 100;
-    let generation = app.catalog_generation.load(Ordering::Acquire);
+    let generation = app.catalog_scan_generation.load(Ordering::Acquire);
     let _ = update(
         &mut app,
         Message::Wake(Wake::CatalogLoaded {
@@ -197,13 +197,13 @@ fn w5_real_worker_result_requeries_preserves_selection_tags_geometry_and_rejects
     app.selected = Some(1);
     assert_eq!(app.colours.query.bucket, snapshot);
     app.colours.active = true;
-    app.colours.pending = true;
+    app.colours.pending = 1;
     let mut failed = stale.clone();
     failed.result = Err("Colour worker stopped".into());
     failed.worker_failure = Some(poster_worker::WorkerFailure::WorkerExited);
     app.install_colour(failed);
     assert!(!app.colours.active);
-    assert!(!app.colours.pending);
+    assert_eq!(app.colours.pending, 0);
     assert!(app.colours.status.contains("failed"));
     app.cancel_colours();
     app.colours.metadata.clear();
@@ -243,7 +243,7 @@ fn w5_actual_sort_reducer_cycles_all_delivered_orders_and_internal_cancellation_
     let clock = app.colours.clock.load(Ordering::Acquire);
     app.cancel_colours();
     assert!(app.colours.clock.load(Ordering::Acquire) > clock);
-    assert!(!app.colours.pending);
+    assert_eq!(app.colours.pending, 0);
 }
 
 #[test]
@@ -352,4 +352,200 @@ fn motion_repair_colour_publication_requeries_only_metadata_dependent_views() {
             "metadata sort {sort:?} must update immediately"
         );
     }
+}
+
+#[test]
+fn wall_colour_indexing_keeps_order_and_holds_art_until_current_gpu_receipt() {
+    use crate::library::sort_metrics::{self, SortMetrics};
+    use iced::widget::shader::Program;
+
+    let (mut app, _) = d4a_fixture(0);
+    let media = app.state_path.parent().unwrap().join("wall-colour");
+    std::fs::create_dir(&media).unwrap();
+    for (name, rgb) in [
+        ("a-blue.png", [0, 0, 255, 255]),
+        ("b-red.png", [255, 0, 0, 255]),
+    ] {
+        image::RgbaImage::from_pixel(16, 16, image::Rgba(rgb))
+            .save(media.join(name))
+            .unwrap();
+    }
+    app.wallpapers = scanner::scan_local_images(&[media]);
+    app.catalog = app
+        .wallpapers
+        .iter()
+        .map(library::CatalogEntry::from_wallpaper)
+        .collect();
+    app.catalog_loaded = true;
+    app.visible = true;
+    app.gallery_mode = GalleryMode::Wall;
+    app.browse_position_restored = true;
+    app.colours.active = true;
+    app.colours.cursor = app.wallpapers.len();
+    app.colours.pending = 2;
+    app.refresh_filter();
+    let [blue, red] = app.filtered_indices[..] else {
+        panic!("expected two local wallpapers");
+    };
+    assert!(app.wallpapers[blue].title.contains("blue"));
+    app.selected = Some(blue);
+    app.sync_wall_presentation();
+    app.wall_presentation.as_mut().unwrap().settle();
+    app.ordinary_roll = None;
+
+    let catalog_generation = app.catalog_generation.load(Ordering::Acquire);
+    let mut posters = Vec::new();
+    for (layer, entry) in app.ordinary_base_frame().into_iter().enumerate() {
+        let layer = layer as u32;
+        app.poster_slots.insert(
+            entry.card.index,
+            PosterSlot {
+                layer,
+                kind: poster_worker::PosterKind::Still,
+                generation: 0,
+                last_requested: 0,
+                catalog_generation,
+                item_id: entry.id,
+                source: entry.source.clone(),
+            },
+        );
+        posters.push(gpu_gallery::video_placeholder_poster(&entry.source, layer));
+    }
+    assert!(!posters.is_empty());
+    app.posters = Arc::new(posters);
+    let worker =
+        poster_worker::PosterWorker::spawn(app.poster_generation.clone(), |_| true).unwrap();
+    let epoch = worker.cache_epoch();
+    app.poster_worker = Some(worker);
+    let completion = |app: &GpuCandidate, index, hue, rgb| poster_worker::colour::Completion {
+        generation: app.colours.clock.load(Ordering::Acquire),
+        epoch,
+        still: MediaStill::select(&app.wallpapers[index], catalog_generation).unwrap(),
+        result: color_metadata::analyse_sample(
+            &image::RgbaImage::from_pixel(1, 1, image::Rgba(rgb)),
+            "0".repeat(64),
+        ),
+        sorting: Some(SortMetrics {
+            version: sort_metrics::VERSION,
+            hue,
+            saturation: 100,
+            richness: 100,
+        }),
+        persistence: Ok(()),
+        worker_failure: None,
+    };
+    let order_before = app.filtered_indices.clone();
+    let generation_before = app.poster_generation.load(Ordering::Acquire);
+    let motion_before = app.motion_generation.load(Ordering::Acquire);
+    app.install_colour(completion(&app, red, 0, [255, 0, 0, 255]));
+    app.refresh_filter();
+    assert_eq!(app.filtered_indices, order_before);
+    assert_eq!(
+        app.poster_generation.load(Ordering::Acquire),
+        generation_before
+    );
+    assert_eq!(app.motion_generation.load(Ordering::Acquire), motion_before);
+    assert!(app.colours.metadata.contains_key(&app.wallpapers[red].id));
+    assert!(app.colours.active);
+
+    app.install_colour(completion(&app, blue, 8, [0, 0, 255, 255]));
+    assert!(!app.colours.active);
+    assert_eq!(app.filtered_indices, [red, blue]);
+    assert_eq!(app.selected, Some(blue));
+    assert!(app.wall_colour_roll_held());
+    let frame = app.ordinary_frame();
+    assert!(
+        frame
+            .iter()
+            .filter(|entry| entry.outgoing && entry.roll == 0.0)
+            .count()
+            >= 1
+    );
+    assert!(frame
+        .iter()
+        .filter(|entry| !entry.outgoing)
+        .all(|entry| { donor_scene::presented_hit_card(entry).is_none() }));
+
+    // A receipt can release the roll only for the current, finished demand.
+    let key = app.atlas_prewarm_key();
+    let posters = app.posters.clone();
+    let mut program = GalleryProgram {
+        prewarm: Some((key, false)),
+        snapshot: Arc::new(GallerySnapshot {
+            defer_near_restore: false,
+            ordinary: Some(frame),
+            cards: Vec::new(),
+            posters: posters.clone(),
+            colors: GalleryColors::default(),
+            depth: None,
+            wall_clip: None,
+            scene: DonorSceneState {
+                stage: Default::default(),
+                camera: 0.0,
+                camera_target: 0.0,
+                camera_velocity: 0.0,
+                detail_progress: 0.0,
+                external_detail: false,
+                flip_options: Default::default(),
+                detail_source: None,
+                detail_card: None,
+                viewport: app.viewport,
+                time: 0.0,
+                visibility: 1.0,
+            },
+        }),
+        poster_feedback: None,
+    };
+    let wheel = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
+        delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 },
+    });
+    let bounds = iced::Rectangle::new(
+        iced::Point::ORIGIN,
+        iced::Size::new(app.viewport[0], app.viewport[1]),
+    );
+    let cursor = iced::mouse::Cursor::Available(iced::Point::new(100.0, 100.0));
+    assert!(program
+        .update(&mut Default::default(), &wheel, bounds, cursor)
+        .is_some());
+    let click = iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left));
+    assert!(program
+        .update(&mut Default::default(), &click, bounds, cursor)
+        .is_none());
+    Arc::make_mut(&mut program.snapshot).scene.visibility = 0.0;
+    assert!(program
+        .update(&mut Default::default(), &wheel, bounds, cursor)
+        .is_none());
+
+    app.poster_loading = false;
+    let mut stale_key = key;
+    stale_key.generation -= 1;
+    let _ = update(
+        &mut app,
+        Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Prewarmed {
+            key: stale_key,
+            posters: posters.clone(),
+        })),
+    );
+    assert!(app.wall_colour_roll_held());
+    let _ = update(
+        &mut app,
+        Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Prewarmed {
+            key,
+            posters: Arc::new(posters.as_ref().clone()),
+        })),
+    );
+    assert!(app.wall_colour_roll_held());
+    let _ = update(
+        &mut app,
+        Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Prewarmed {
+            key,
+            posters,
+        })),
+    );
+    assert!(!app.wall_colour_roll_held());
+    app.ordinary_roll.as_mut().unwrap().advance_to(1.6);
+    assert!(app
+        .ordinary_frame()
+        .iter()
+        .all(|entry| !entry.outgoing && entry.roll == 1.0));
 }

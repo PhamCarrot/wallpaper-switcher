@@ -25,6 +25,12 @@ pub(super) fn tab_position(builder: &mut Builder<'_>) {
         keys::selector::GRID_STAGE_X,
         keys::selector::GRID_STAGE_Y,
     );
+    picker_position(
+        builder,
+        tr("settings-position-depth-card"),
+        keys::selector::DEPTH_STAGE_X,
+        keys::selector::DEPTH_STAGE_Y,
+    );
     builder.card(
         tr("settings-filter-position-card"),
         tr("settings-filter-position-card-desc"),

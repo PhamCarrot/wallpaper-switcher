@@ -201,6 +201,113 @@ fn p8_all_source_curve_and_shape_choices_preserve_non_square_hits_and_circle_com
 }
 
 #[test]
+fn p8_profile_topology_retarget_keeps_ids_and_converges_after_reversal() {
+    let mut app = fixture();
+    let original = view::settings::profile_projection::capture(&app);
+    let original_params = app.hex_presentation.as_ref().unwrap().params;
+    app.state.gallery.geometric.rows = 2;
+    app.state.gallery.geometric.columns = 5;
+    app.state.gallery.geometric.curve = StateGeometricCurve::Wave;
+    app.state.gallery.geometric.shape = StateGeometricShape::Triangle;
+    app.sync_gallery_presentation();
+    {
+        let p = app.hex_presentation.as_ref().unwrap();
+        assert_ne!(p.params.rows, p.target.rows);
+        assert_ne!(p.params.curve, p.target.curve);
+        assert_ne!(p.params.shape, p.target.shape);
+    }
+    app.hex_presentation.as_mut().unwrap().tick(0.05);
+    let frame = app.ordinary_frame();
+    let ids: std::collections::BTreeSet<_> = frame.iter().map(|entry| entry.id.clone()).collect();
+    assert_eq!(ids.len(), frame.len());
+    assert!(frame.iter().all(|entry| {
+        entry.card.center.iter().all(|value| value.is_finite())
+            && entry
+                .card
+                .size
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+    }));
+    let selected = frame.iter().find(|entry| entry.card.selected).unwrap();
+    assert_eq!(
+        gpu_gallery::hit_test(
+            &frame.iter().map(|entry| entry.card).collect::<Vec<_>>(),
+            selected.card.center[0],
+            selected.card.center[1]
+        ),
+        Some(selected.card.index)
+    );
+    assert!(app
+        .ordinary_poster_indices()
+        .iter()
+        .all(|index| *index < app.wallpapers.len()));
+
+    let Snapshot::Hex(original) = original else {
+        panic!("hex snapshot")
+    };
+    app.state.gallery.geometric.rows = original.rows as usize;
+    app.state.gallery.geometric.columns = original.columns as usize;
+    app.state.gallery.geometric.curve = original.curve;
+    app.state.gallery.geometric.shape = original.shape;
+    app.sync_gallery_presentation();
+    app.hex_presentation.as_mut().unwrap().tick(0.05);
+    app.hex_presentation.as_mut().unwrap().settle();
+    let p = app.hex_presentation.as_ref().unwrap();
+    assert_eq!(p.params, original_params);
+}
+
+#[test]
+fn hex_distant_selection_survives_reversal_and_navigation_before_settlement() {
+    let (mut app, _) = d4a_fixture(1_000);
+    app.gallery_mode = GalleryMode::Geometric;
+    app.depth_frame = None;
+    app.selected = Some(500);
+    app.viewport = [1280.0, 720.0];
+    app.state.gallery.geometric.rows = 1;
+    app.state.gallery.geometric.radius = 80.0;
+    app.state.gallery.geometric.curve = StateGeometricCurve::Flat;
+    app.sync_gallery_presentation();
+    app.hex_presentation.as_mut().unwrap().settle();
+    app.state.gallery.geometric.rows = 5;
+    app.sync_gallery_presentation();
+    for _ in 0..3 {
+        assert!(app.hex_presentation.as_mut().unwrap().tick(0.05));
+    }
+    let before = app.ordinary_frame();
+    app.state.gallery.geometric.rows = 1;
+    app.sync_gallery_presentation();
+    let reversed = app.ordinary_frame();
+    for card in before.iter().filter(|c| c.card.opacity > 0.05) {
+        let next = reversed.iter().find(|entry| entry.id == card.id).unwrap();
+        assert_eq!(
+            (next.card.center, next.card.size, next.card.opacity),
+            (card.card.center, card.card.size, card.card.opacity)
+        );
+    }
+    assert!(reversed
+        .iter()
+        .any(|c| c.card.selected && c.card.opacity > 0.9));
+    app.navigate_selection(1);
+    let mut settled = false;
+    for _ in 0..120 {
+        let moving = app.hex_presentation.as_mut().unwrap().tick(1.0 / 60.0);
+        assert!(app
+            .ordinary_frame()
+            .iter()
+            .any(|c| c.card.selected && c.card.opacity > 0.05));
+        if !moving {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled);
+    let frame = app.ordinary_frame();
+    let selected = frame.iter().find(|entry| entry.card.selected).unwrap();
+    assert_eq!(selected.card.index, app.selected.unwrap());
+    assert_eq!(app.hex_presentation.as_ref().unwrap().params.rows, 1);
+}
+
+#[test]
 fn p8_material_order_crops_shadow_position_and_current_demand_agree() {
     let mut app = fixture();
     let before = app
@@ -309,11 +416,16 @@ fn p8_faded_columns_omit_visible_bodies_and_hits_but_preserve_prefetch() {
         !frame.iter().any(|e| e.card.index == 57),
         "source skips faded column19"
     );
-    // Faded bodies do not consume visible-frame capacity. Existing neighbor
-    // prefetch may still use remaining slots, independently of visibility.
+    // A faded adjacent column uses backfill instead of visible capacity.
     assert!(frame.len() < gpu_gallery::ordinary_poster_limit());
-    assert!(app.ordinary_poster_indices().contains(&57));
     let p = app.hex_presentation.as_ref().unwrap();
+    let (requested, visible) = app.ordinary_poster_demand();
+    assert!(requested[visible..].iter().any(|index| {
+        p.scales
+            .get(&(index / p.params.rows))
+            .is_some_and(|scale| scale.value() <= 0.01)
+            && !frame.iter().any(|entry| entry.card.index == *index)
+    }));
     assert!(frame
         .iter()
         .all(|e| p.scales[&(e.card.index / p.params.rows)].value() > 0.01));
@@ -379,8 +491,9 @@ fn t1_triangle_fixture() -> (GpuCandidate, Arc<std::sync::atomic::AtomicUsize>) 
             i,
             PosterSlot {
                 layer: i as u32,
-                is_video: false,
+                kind: crate::poster_worker::PosterKind::Still,
                 generation: 0,
+                last_requested: 0,
                 catalog_generation: app.catalog_generation.load(Ordering::Acquire),
                 item_id: w.id.clone(),
                 source: path.clone(),

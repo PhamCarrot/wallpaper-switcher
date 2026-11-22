@@ -45,6 +45,15 @@ float2 coverUv(float2 uv, float sourceAspect)
     return uv;
 }
 
+// Reveal a pixel whose normalized threshold lies in [0, 1]. Progress travels
+// across the feather on both sides, so nothing moves at the first frame and
+// every pixel has finished before the final frame.
+float revealAt(float threshold, float feather)
+{
+    float travel = progress * (1.0 + 2.0 * feather) - feather;
+    return smoothstep(threshold - feather, threshold + feather, travel);
+}
+
 struct FullOutput
 {
     float4 position : SV_Position;
@@ -77,15 +86,18 @@ float4 PSMain(FullOutput input) : SV_Target
     float noise = valueNoise(uv * 9.0 + progress * 2.3);
     float mask = progress;
 
+    // Thresholds are normalized so the farthest pixel finishes before the final frame.
+    float edgeRadius = radius / (0.5 * sqrt(targetAspect * targetAspect + 1.0));
+
     // Linear family: Crossfade, four wipes, Slices, Blinds, Checker.
     if (effect == 1)
-        mask = 1.0 - smoothstep(progress - 0.08, progress + 0.08, uv.x);
+        mask = revealAt(uv.x, 0.08);
     else if (effect == 2)
-        mask = smoothstep(1.0 - progress - 0.08, 1.0 - progress + 0.08, uv.x);
+        mask = revealAt(1.0 - uv.x, 0.08);
     else if (effect == 3)
-        mask = 1.0 - smoothstep(progress - 0.08, progress + 0.08, uv.y);
+        mask = revealAt(uv.y, 0.08);
     else if (effect == 4)
-        mask = smoothstep(1.0 - progress - 0.08, 1.0 - progress + 0.08, uv.y);
+        mask = revealAt(1.0 - uv.y, 0.08);
     else if (effect == 5)
         mask = step(frac(uv.y * 15.0 + floor(uv.x * 8.0) * 0.13), progress);
     else if (effect == 6)
@@ -96,39 +108,46 @@ float4 PSMain(FullOutput input) : SV_Target
     // Geometric and optical family.
     else if (effect == 8)
     {
-        float blocks = lerp(90.0, 7.0, sin(progress * 3.14159));
+        // Square blocks that coarsen to seven rows mid-way and return to pixel
+        // size at both ends, so neither endpoint snaps from a pixelated frame.
+        float rows = lerp(2048.0, 7.0, pow(abs(sin(progress * 3.14159)), 0.35));
+        float2 blocks = float2(rows * targetAspect, rows);
         float2 blockUv = (floor(uv * blocks) + 0.5) / blocks;
         oldColor = oldImage.Sample(imageSampler, coverUv(blockUv, oldAspect));
         newColor = newImage.Sample(imageSampler, coverUv(blockUv, newAspect));
     }
     else if (effect == 9)
-        mask = 1.0 - smoothstep(progress * 0.82, progress * 0.82 + 0.09, radius);
+    {
+        float edge = progress * 1.09;
+        mask = 1.0 - smoothstep(edge - 0.09, edge, edgeRadius);
+    }
     else if (effect == 10)
     {
-        float ringRadius = progress * 0.92;
+        float ringRadius = progress * 1.18;
         float ringWidth = lerp(0.18, 0.04, progress);
-        float leading = 1.0 - smoothstep(ringRadius - ringWidth, ringRadius, radius);
-        float trailing = 1.0 - smoothstep(max(0.0, ringRadius - ringWidth * 3.0), ringRadius - ringWidth * 2.0, radius);
+        float leading = 1.0 - smoothstep(ringRadius - ringWidth, ringRadius, edgeRadius);
+        float trailing = 1.0 - smoothstep(max(0.0, ringRadius - ringWidth * 3.0), ringRadius - ringWidth * 2.0, edgeRadius);
         mask = max(leading, trailing * progress);
     }
     else if (effect == 11)
-        mask = smoothstep(radius + abs(centered.x) * 0.42 - 0.06,
-                          radius + abs(centered.x) * 0.42 + 0.06, progress);
+        mask = revealAt((radius + abs(centered.x) * 0.42)
+                        / (0.5 * sqrt(targetAspect * targetAspect + 1.0) + 0.21), 0.06);
     else if (effect == 12)
-        mask = 1.0 - smoothstep(progress * 0.9 - 0.05, progress * 0.9 + 0.05, radius);
+        // Screen-shaped ellipse, distinct from Iris's round reveal.
+        mask = revealAt(length(centered) / 0.70711, 0.05);
     else if (effect == 13)
-        mask = step(hash21(floor(uv * float2(20.0, 12.0))), progress);
+        mask = step(0.02 + hash21(floor(uv * float2(20.0, 12.0))) * 0.96, progress);
     else if (effect == 14)
     {
         float2 cell = frac(uv * 14.0) - 0.5;
         mask = smoothstep(length(cell) + hash21(floor(uv * 14.0)) * 0.25 - 0.18,
-                          length(cell) + 0.12, progress);
+                          length(cell) + 0.12, lerp(-0.05, 0.83, progress));
     }
     else if (effect == 15)
     {
         float sector = abs(frac(angle / 1.0472 + 0.5) - 0.5) * 2.0;
-        mask = smoothstep(radius + sector * 0.23 - 0.07,
-                          radius + sector * 0.23 + 0.07, progress);
+        mask = revealAt((radius + sector * 0.23)
+                        / (0.5 * sqrt(targetAspect * targetAspect + 1.0) + 0.23), 0.07);
     }
 
     // Distortion and blur family.
@@ -139,18 +158,18 @@ float4 PSMain(FullOutput input) : SV_Target
         float red = newImage.Sample(imageSampler, coverUv(uv + offset, newAspect)).r;
         float blue = newImage.Sample(imageSampler, coverUv(uv - offset, newAspect)).b;
         newColor = float4(red, newColor.g, blue, 1.0);
-        mask = 1.0 - smoothstep(progress * 0.9 - 0.1, progress * 0.9 + 0.1, radius);
+        mask = revealAt(edgeRadius, 0.1);
     }
     else if (effect == 17)
     {
         float row = floor(uv.y * 36.0);
         float jitter = (hash11(row + floor(progress * 20.0)) - 0.5) * 0.12 * sin(progress * 3.14159);
         newColor = newImage.Sample(imageSampler, coverUv(uv + float2(jitter, 0.0), newAspect));
-        mask = step(hash11(row * 3.1), progress);
+        mask = step(0.02 + hash11(row * 3.1) * 0.96, progress);
     }
     else if (effect == 18)
     {
-        float2 warped = uv + centered * sin(progress * 3.14159) * 0.19 + sin(uv.yx * 18.0) * 0.015;
+        float2 warped = uv + (centered * 0.19 + sin(uv.yx * 18.0) * 0.015) * sin(progress * 3.14159);
         newColor = newImage.Sample(imageSampler, coverUv(warped, newAspect));
     }
     else if (effect == 19 || effect == 20)
@@ -180,29 +199,25 @@ float4 PSMain(FullOutput input) : SV_Target
         newColor = newImage.Sample(imageSampler, coverUv(displaced, newAspect));
     }
     else if (effect == 23)
-        mask = smoothstep(uv.x + sin(uv.y * 18.0) * 0.09 - 0.08,
-                          uv.x + sin(uv.y * 18.0) * 0.09 + 0.08, progress);
+        mask = revealAt((uv.x + sin(uv.y * 18.0) * 0.09 + 0.09) / 1.18, 0.08);
 
     // Organic and procedural family.
     else if (effect == 24)
-        mask = smoothstep(noise - 0.12, noise + 0.12, progress);
+        mask = revealAt(noise, 0.12);
     else if (effect == 25)
-        mask = smoothstep(valueNoise(uv * 5.0 + noise) - 0.18,
-                          valueNoise(uv * 5.0 + noise) + 0.18, progress);
+        mask = revealAt(valueNoise(uv * 5.0 + noise), 0.18);
     else if (effect == 26)
-        mask = smoothstep(valueNoise(uv * 3.0 + float2(0.0, progress * 2.0)) - 0.24,
-                          valueNoise(uv * 3.0) + 0.24, progress);
+        mask = revealAt(0.5 * (valueNoise(uv * 3.0 + float2(0.0, progress * 2.0))
+                               + valueNoise(uv * 3.0)), 0.24);
     else if (effect == 27)
-        mask = smoothstep(noise - 0.08, noise + 0.05, progress);
+        mask = smoothstep(noise - 0.08, noise + 0.05, progress * 1.13 - 0.08);
     else if (effect == 28)
     {
         float luma = dot(oldColor.rgb, float3(0.2126, 0.7152, 0.0722));
-        mask = smoothstep(luma - 0.12, luma + 0.12, progress);
+        mask = revealAt(luma, 0.12);
     }
     else if (effect == 29)
-        mask = smoothstep(hash11(floor(uv.x * 220.0)) * 0.7 + uv.y * 0.3 - 0.08,
-                          hash11(floor(uv.x * 220.0)) * 0.7 + uv.y * 0.3 + 0.08,
-                          progress);
+        mask = revealAt(hash11(floor(uv.x * 220.0)) * 0.7 + uv.y * 0.3, 0.08);
 
     return float4(lerp(oldColor.rgb, newColor.rgb, saturate(mask)), 1.0);
 }

@@ -644,3 +644,124 @@ fn owned_desktop_layers_capture_new_pixels_and_play_above_renderer_below_icons()
         }
     }
 }
+
+#[test]
+#[ignore = "PrintWindow readback of an owned web-like presenter subtree; explicit invocation"]
+fn isolated_shell_worker_reads_visible_presenter_descendants() {
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe { RoUninitialize() };
+        }
+    }
+    unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.unwrap();
+    let _apartment = Apartment;
+    let graphics = CaptureGraphics::new().unwrap();
+    let dxgi: IDXGIDevice = graphics.device.cast().unwrap();
+    let composition: IDCompositionDevice = unsafe { DCompositionCreateDevice(&dxgi) }.unwrap();
+    let _coordinates = PhysicalWindowCoordinates::enter().unwrap();
+    let rect = |left, right| DesktopRect {
+        left,
+        top: 0,
+        right,
+        bottom: 96,
+    };
+    let host = OwnedWindow::show(
+        windows::core::w!("OwnedWebCaptureShell"),
+        null_mut(),
+        rect(0, 160),
+        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+    );
+    let _icons = OwnedWindow::show(
+        windows::core::w!("SHELLDLL_DefView"),
+        host.0,
+        rect(0, 16),
+        0,
+    );
+    let worker = OwnedWindow::show(windows::core::w!("WorkerW"), host.0, rect(0, 160), 0);
+    // A web presenter hosts visible browser and GPU child windows, as observed
+    // for WPEDesktopCEFWindow on 23 November.
+    let presenter = OwnedWindow::show(
+        windows::core::w!("WPEDesktopCEFWindow"),
+        worker.0,
+        rect(16, 144),
+        0,
+    );
+    let browser = OwnedWindow::show(
+        windows::core::w!("Chrome_WidgetWin_1"),
+        presenter.0,
+        rect(0, 128),
+        0,
+    );
+    let gpu = OwnedWindow::show(
+        windows::core::w!("Intermediate D3D Window"),
+        browser.0,
+        rect(0, 128),
+        WS_EX_NOREDIRECTIONBITMAP,
+    );
+    let gpu_target = unsafe { composition.CreateTargetForHwnd(WinHwnd(gpu.0), true) }.unwrap();
+    let visual = unsafe { composition.CreateVisual() }.unwrap();
+    unsafe { gpu_target.SetRoot(&visual) }.unwrap();
+    let content = [[200, 30, 40, 255], [20, 160, 220, 255]];
+    draw_layer(
+        &composition,
+        &graphics.context,
+        &visual,
+        &stripes(128, 96, content),
+    );
+    let model = inspect_engine_window(presenter.0, std::process::id()).unwrap();
+    let capture = CaptureWindow::from_presenter(&model).unwrap();
+    let target = model.rect;
+    let progress = Mutex::default();
+    // Engine presenters leave the child-window DIB untouched on this system.
+    let reader = |hwnd, rect: DesktopRect| {
+        if hwnd == presenter.0 {
+            Ok(FrozenFrame {
+                width: rect.width(),
+                height: rect.height(),
+                rgba: vec![UNWRITTEN_PIXEL; (rect.width() * rect.height() * 4) as usize],
+            })
+        } else {
+            copy_window_pixels(hwnd, rect)
+        }
+    };
+    let captured = frame(read_isolated_presenter(
+        &capture,
+        target,
+        &[],
+        Instant::now() + Duration::from_secs(2),
+        &|| true,
+        &progress,
+        || host.0,
+        reader,
+    ));
+    assert!(progress.lock().unwrap().contains("wallpaper WorkerW"));
+    assert_eq!(
+        [pixel(&captured, 14, 48), pixel(&captured, 114, 48)],
+        content
+    );
+
+    for class in [
+        windows::core::w!("SHELLDLL_DefView"),
+        windows::core::w!("WallpaperSwitcherTransition"),
+    ] {
+        let nested = OwnedWindow::show(class, browser.0, rect(0, 16), 0);
+        let refusal = wallpaper_worker(&capture, target, &[], host.0).unwrap_err();
+        assert!(
+            refusal.contains("icons") || refusal.contains("cover"),
+            "{refusal}"
+        );
+        drop(nested);
+    }
+    let sibling = OwnedWindow::show(
+        windows::core::w!("WPEVideoWallpaper"),
+        worker.0,
+        rect(0, 16),
+        0,
+    );
+    assert!(wallpaper_worker(&capture, target, &[], host.0)
+        .unwrap_err()
+        .contains("another visible window"));
+    drop(sibling);
+    assert!(wallpaper_worker(&capture, target, &[], host.0).is_ok());
+}

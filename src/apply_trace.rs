@@ -74,6 +74,9 @@ pub const REQUIRED_STAGE_NAMES: &[&str] = &[
     "gallery-poster-demand",
     "gallery-screenshot-request",
     "gallery-screenshot-captured",
+    "transition-engine-capture-retry",
+    "transition-engine-capture-frame",
+    "transition-playback-complete",
 ];
 
 static ENABLED: AtomicBool = AtomicBool::new(false);

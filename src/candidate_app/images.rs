@@ -15,7 +15,7 @@ pub(super) fn backdrop_dimensions(viewport_width: f32, viewport_height: f32) -> 
 }
 
 fn decode_backdrop(path: &std::path::Path, width: u32, height: u32) -> Option<Vec<u8>> {
-    let resized = image::open(path)
+    let resized = crate::library::media_still::decode_bounded(path)
         .ok()?
         .resize_to_fill(width, height, image::imageops::FilterType::Triangle)
         .to_rgba8();

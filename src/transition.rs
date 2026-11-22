@@ -287,7 +287,7 @@ pub struct FrozenFrame {
 
 impl FrozenFrame {
     pub fn from_path_cover(path: &Path, width: u32, height: u32) -> Result<Self, String> {
-        let source = image::open(path)
+        let source = crate::library::media_still::decode_bounded(path)
             .map_err(|error| {
                 format!(
                     "Could not decode transition frame {}: {error}",

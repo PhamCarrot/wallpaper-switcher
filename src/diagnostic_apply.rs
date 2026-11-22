@@ -272,24 +272,19 @@ where
             Some(target.requested_name()),
             Some(wallpaper_path.to_string_lossy().into_owned()),
             None,
-            "Diagnostic Apply requires --diagnostic-transition <off|crossfade|pixelate>",
+            "Diagnostic Apply requires --diagnostic-transition <off|random|catalog effect>",
         ));
     };
+    // Every catalog effect is reachable so the live matrix can use this harness;
+    // migrated legacy names stay out because they do not name the played effect.
     let transition = match TransitionEffect::parse_saved(&transition) {
-        Ok(parsed)
-            if matches!(
-                parsed.effect,
-                TransitionEffect::Off | TransitionEffect::Crossfade | TransitionEffect::Pixelate
-            ) =>
-        {
-            parsed.effect
-        }
+        Ok(parsed) if parsed.migration.is_none() => parsed.effect,
         _ => {
             return DiagnosticInvocation::Invalid(DiagnosticApplyOutput::invalid(
                 Some(target.requested_name()),
                 Some(wallpaper_path.to_string_lossy().into_owned()),
                 Some(transition),
-                "Diagnostic transition must be off, crossfade, or pixelate",
+                "Diagnostic transition must be off, random, or a catalog effect key",
             ));
         }
     };
@@ -564,12 +559,12 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_transition_accepts_only_approved_names() {
-        for (value, expected) in [
-            ("off", TransitionEffect::Off),
-            ("crossfade", TransitionEffect::Crossfade),
-            ("pixelate", TransitionEffect::Pixelate),
-        ] {
+    fn diagnostic_transition_accepts_every_catalog_effect_off_and_random() {
+        for expected in [TransitionEffect::Off, TransitionEffect::Random]
+            .into_iter()
+            .chain(crate::transition::TRANSITION_CATALOG)
+        {
+            let value = expected.key();
             let DiagnosticInvocation::Ready(request) = parse_with_existing_path(&valid_args(value))
             else {
                 panic!("expected accepted transition {value}");
@@ -577,15 +572,14 @@ mod tests {
             assert_eq!(request.transition, expected);
         }
 
-        let DiagnosticInvocation::Invalid(output) =
-            parse_with_existing_path(&valid_args("wipe-left"))
-        else {
-            panic!("expected unsupported transition rejection");
-        };
-        assert!(output
-            .error
-            .unwrap()
-            .contains("off, crossfade, or pixelate"));
+        for rejected in ["sand", "definitely-not-an-effect"] {
+            let DiagnosticInvocation::Invalid(output) =
+                parse_with_existing_path(&valid_args(rejected))
+            else {
+                panic!("expected unsupported transition rejection for {rejected}");
+            };
+            assert!(output.error.unwrap().contains("catalog effect key"));
+        }
     }
 
     #[test]

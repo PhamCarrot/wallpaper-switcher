@@ -2066,6 +2066,7 @@ fn apply_with_outcomes(
                             "incoming",
                             endpoint,
                             &overlay_windows,
+                            Some(output.outgoing_fingerprint),
                         )?);
                     }
                     Ok(output)
@@ -2082,6 +2083,10 @@ fn apply_with_outcomes(
                     "the transition surface was unavailable; no animation was attempted",
                 ),
             );
+        }
+        Err(error) if error.contains(SAME_WALLPAPER_REAPPLY) => {
+            outcomes.extend(apply_direct_to_monitors(request, monitors, context));
+            return (order_outcomes(outcomes), TransitionResult::not_requested());
         }
         Err(error) => {
             crate::log_debug(&format!(
@@ -2211,6 +2216,8 @@ fn play_synchronized(
         });
     }
     let started = std::time::Instant::now();
+    // Frame count, last present and largest present gap per display (ms).
+    let mut pacing = vec![(0u32, 0u128, 0u128); outputs.len()];
     let playback = (|| -> Result<(), (usize, String)> {
         loop {
             let frame_started = std::time::Instant::now();
@@ -2234,6 +2241,13 @@ fn play_synchronized(
             }
             for (index, output) in outputs.iter().enumerate() {
                 output.session.present().map_err(|error| (index, error))?;
+                let presented = started.elapsed().as_millis();
+                let (frames, last, gap) = &mut pacing[index];
+                if *frames > 0 {
+                    *gap = (*gap).max(presented - *last);
+                }
+                *frames += 1;
+                *last = presented;
                 let result = &mut results[index];
                 result.final_submitted = progress >= 1.0;
                 if !result.intermediate_submitted && progress > 0.0 && progress < 1.0 {
@@ -2277,6 +2291,17 @@ fn play_synchronized(
             );
         }
     }
+    for (output, ((frames, last, gap), result)) in outputs.iter().zip(pacing.iter().zip(&results)) {
+        crate::apply_trace::event_lazy("transition-playback-complete", || {
+            format!(
+                "display={:?} effect={} frames={frames} last_present_ms={last} max_gap_ms={gap} final_submitted={} error={:?}",
+                output.monitor.device_id,
+                effect.key(),
+                result.final_submitted,
+                result.error
+            )
+        });
+    }
     results
 }
 
@@ -2317,13 +2342,18 @@ struct PreparedOutput {
     monitor: native_wallpaper::NativeMonitor,
     session: DesktopTransitionSession,
     incoming: Option<FrozenFrame>,
+    outgoing_fingerprint: engine_capture::FrameFingerprint,
 }
+
+// Re-applying the wallpaper already on screen has no visible change to animate.
+const SAME_WALLPAPER_REAPPLY: &str = "the requested wallpaper is already on this display";
 
 fn outgoing_frame(
     operation_id: OperationId,
     monitor: &native_wallpaper::NativeMonitor,
     context: &ApplyContext,
     overlay_windows: &[usize],
+    requested: &std::path::Path,
 ) -> Result<FrozenFrame, String> {
     crate::apply_trace::event(
         "outgoing-capture-start",
@@ -2334,7 +2364,7 @@ fn outgoing_frame(
             monitor.rect.height()
         ),
     );
-    let result = outgoing_frame_inner(operation_id, monitor, context, overlay_windows);
+    let result = outgoing_frame_inner(operation_id, monitor, context, overlay_windows, requested);
     match &result {
         Ok(frame) => crate::apply_trace::event(
             "outgoing-capture-complete",
@@ -2356,6 +2386,7 @@ fn outgoing_frame_inner(
     monitor: &native_wallpaper::NativeMonitor,
     context: &ApplyContext,
     overlay_windows: &[usize],
+    requested: &std::path::Path,
 ) -> Result<FrozenFrame, String> {
     match engine_ipc::availability() {
         engine_ipc::EngineAvailability::ControlAvailable => {
@@ -2364,11 +2395,14 @@ fn outgoing_frame_inner(
                 &EngineTarget::bound(&monitor.device_id, &location),
             );
             match observation.state {
-                EngineObservationState::Present(_)
+                EngineObservationState::Present(ref current)
                     if observation
                         .adequate_for(&EngineTarget::bound(&monitor.device_id, &location))
                         .is_ok() =>
                 {
+                    if engine_ipc::same_engine_project(requested, current) {
+                        return Err(SAME_WALLPAPER_REAPPLY.into());
+                    }
                     let endpoint = endpoint
                         .ok_or("Wallpaper Engine did not confirm an outgoing capture owner")?;
                     return engine_capture::capture_for_apply(
@@ -2378,6 +2412,7 @@ fn outgoing_frame_inner(
                         "outgoing",
                         endpoint,
                         overlay_windows,
+                        None,
                     );
                 }
                 EngineObservationState::ConfirmedAbsent
@@ -2415,13 +2450,19 @@ fn prepare_transition(
     for monitor in targets {
         #[cfg(test)]
         eprintln!("trace: capturing outgoing frame");
-        let outgoing = outgoing_frame(request.operation_id, &monitor, context, &overlay_windows)
-            .map_err(|error| {
-                format!(
-                    "{}: outgoing frame unavailable ({error})",
-                    monitor.device_id
-                )
-            })?;
+        let outgoing = outgoing_frame(
+            request.operation_id,
+            &monitor,
+            context,
+            &overlay_windows,
+            request.wallpaper.engine_target(),
+        )
+        .map_err(|error| {
+            format!(
+                "{}: outgoing frame unavailable ({error})",
+                monitor.device_id
+            )
+        })?;
         let incoming = match request.wallpaper.source {
             WallpaperSource::LocalImage => {
                 crate::apply_trace::event(
@@ -2470,6 +2511,7 @@ fn prepare_transition(
         };
         #[cfg(test)]
         eprintln!("trace: showing desktop transition surface");
+        let outgoing_fingerprint = engine_capture::FrameFingerprint::of(&outgoing);
         let session = DesktopTransitionSession::show(outgoing, monitor.rect)
             .map_err(|error| format!("{}: {error}", monitor.device_id))?;
         crate::apply_trace::event_lazy("transition-display-host", || {
@@ -2485,6 +2527,7 @@ fn prepare_transition(
             monitor,
             session,
             incoming,
+            outgoing_fingerprint,
         });
     }
     Ok(Some(PreparedTransition { outputs }))

@@ -84,6 +84,22 @@ struct ApplyCapture {
     endpoint: (usize, u32),
     overlay_windows: Vec<usize>,
     progress: Arc<Mutex<String>>,
+    // Incoming captures must differ from the frozen outgoing frame.
+    outgoing: Option<FrameFingerprint>,
+}
+
+// Mean 8×4 luma difference (0–255) below which an incoming frame is treated
+// as the outgoing wallpaper still on screen.
+const UNCHANGED_FRAME_DIFFERENCE: f32 = 1.0;
+
+fn incoming_frame_is_stale(frame: &FrozenFrame, outgoing: &FrameFingerprint) -> Option<String> {
+    if !has_visible_detail(&frame.rgba) {
+        return Some("incoming frame is uniform and may predate the new wallpaper".into());
+    }
+    let difference = FrameFingerprint::of(frame).mean_difference(outgoing);
+    (difference < UNCHANGED_FRAME_DIFFERENCE).then(|| {
+        format!("incoming frame still matches the outgoing wallpaper (difference {difference:.2})")
+    })
 }
 
 pub(crate) fn capture_for_apply(
@@ -93,6 +109,7 @@ pub(crate) fn capture_for_apply(
     phase: &'static str,
     endpoint: (usize, u32),
     overlay_windows: &[usize],
+    outgoing: Option<FrameFingerprint>,
 ) -> Result<FrozenFrame, String> {
     let details = ApplyCapture {
         operation,
@@ -101,6 +118,7 @@ pub(crate) fn capture_for_apply(
         endpoint,
         overlay_windows: overlay_windows.to_vec(),
         progress: Arc::default(),
+        outgoing,
     };
     crate::apply_trace::event_for_lazy(operation, "transition-engine-capture-start", || {
         format!("display={display:?} phase={phase} endpoint={endpoint:?} target={target:?}")
@@ -109,7 +127,7 @@ pub(crate) fn capture_for_apply(
         target,
         &CAPTURE_BUSY,
         &CAPTURE_WORKER,
-        CAPTURE_DEADLINE,
+        capture_deadline(phase),
         Some(details),
         |receiver| {
             std::thread::Builder::new()
@@ -141,6 +159,91 @@ type CaptureRequest = (
 static CAPTURE_WORKER: Mutex<Option<mpsc::SyncSender<CaptureRequest>>> = Mutex::new(None);
 static CAPTURE_BUSY: AtomicBool = AtomicBool::new(false);
 const CAPTURE_DEADLINE: Duration = Duration::from_secs(5);
+// Apply captures hold either a pending switch or a frozen cover over the live
+// wallpaper. Successful readback took 59–275 ms in the 22 November trace.
+const APPLY_CAPTURE_DEADLINE: Duration = Duration::from_millis(1_500);
+// A structural refusal that repeats unchanged is not waiting on the provider.
+const PERMANENT_REFUSAL_ATTEMPTS: u32 = 3;
+const STRUCTURAL_REFUSAL: &str = "WorkerW unavailable: ";
+
+fn capture_deadline(phase: &str) -> Duration {
+    if matches!(phase, "outgoing" | "incoming") {
+        APPLY_CAPTURE_DEADLINE
+    } else {
+        CAPTURE_DEADLINE
+    }
+}
+
+fn is_permanent_refusal(reason: &str) -> bool {
+    reason.contains(STRUCTURAL_REFUSAL) && !reason.contains("no longer contains")
+}
+
+/// Coarse 8×4 luma grid. Compares outgoing and incoming frames in the trace
+/// without retaining pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrameFingerprint([u8; 32]);
+
+impl FrameFingerprint {
+    pub(crate) fn of(frame: &FrozenFrame) -> Self {
+        let (width, height) = (frame.width.max(1) as usize, frame.height.max(1) as usize);
+        let mut sums = [0u64; 32];
+        let mut counts = [0u64; 32];
+        for y in (0..height).step_by(4) {
+            let row = y * 4 / height;
+            for x in (0..width).step_by(4) {
+                let Some(pixel) = frame.rgba.get((y * width + x) * 4..(y * width + x) * 4 + 3)
+                else {
+                    continue;
+                };
+                let cell = row * 8 + x * 8 / width;
+                sums[cell] += (u64::from(pixel[0]) * 54
+                    + u64::from(pixel[1]) * 183
+                    + u64::from(pixel[2]) * 19)
+                    >> 8;
+                counts[cell] += 1;
+            }
+        }
+        Self(std::array::from_fn(|cell| {
+            (sums[cell] / counts[cell].max(1)) as u8
+        }))
+    }
+
+    pub(crate) fn mean_difference(&self, other: &Self) -> f32 {
+        self.0
+            .iter()
+            .zip(other.0)
+            .map(|(a, b)| f32::from(a.abs_diff(b)))
+            .sum::<f32>()
+            / 32.0
+    }
+}
+
+impl std::fmt::Display for FrameFingerprint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0
+            .iter()
+            .try_for_each(|value| write!(formatter, "{value:02x}"))
+    }
+}
+
+/// Visible windows under the presenter's parent, for render-tree changes.
+fn subtree_summary(presenter: HWND) -> String {
+    struct Found(Vec<String>);
+    unsafe extern "system" fn collect(hwnd: HWND, param: LPARAM) -> BOOL {
+        if IsWindowVisible(hwnd) != 0 {
+            let mut process = 0;
+            GetWindowThreadProcessId(hwnd, &mut process);
+            (*(param as *mut Found))
+                .0
+                .push(format!("{}@{process}", window_string(hwnd, GetClassNameW)));
+        }
+        1
+    }
+    let parent = unsafe { GetAncestor(presenter, GA_PARENT) };
+    let mut found = Found(Vec::new());
+    unsafe { EnumChildWindows(parent, Some(collect), (&mut found as *mut Found) as LPARAM) };
+    found.0.join(",")
+}
 
 struct CaptureBusyGuard(&'static AtomicBool);
 
@@ -224,10 +327,10 @@ fn capture_frame_with_worker(
             *worker = None;
         }
         return Err(match error {
-            CaptureSubmissionError::Deadline => {
-                "Wallpaper Engine capture worker was not ready before its 5-second deadline"
-                    .to_string()
-            }
+            CaptureSubmissionError::Deadline => format!(
+                "Wallpaper Engine capture worker was not ready before its {:.1}-second deadline",
+                timeout.as_secs_f32()
+            ),
             CaptureSubmissionError::Disconnected => {
                 "The Wallpaper Engine capture worker stopped".to_string()
             }
@@ -248,7 +351,10 @@ fn capture_frame_with_worker(
                         format!("Wallpaper Engine capture deadline exceeded: {stage}")
                     }
                 }
-                None => "Wallpaper Engine frame capture exceeded its 5-second deadline".into(),
+                None => format!(
+                    "Wallpaper Engine frame capture exceeded its {:.1}-second deadline",
+                    timeout.as_secs_f32()
+                ),
             },
             mpsc::RecvTimeoutError::Disconnected => {
                 *worker = None;
@@ -446,6 +552,7 @@ mod capture_submission_tests {
                 endpoint: (0, 0),
                 overlay_windows: Vec::new(),
                 progress: Arc::default(),
+                outgoing: None,
             }),
             |rx| {
                 thread = Some(std::thread::spawn(move || {
@@ -799,6 +906,9 @@ fn wallpaper_worker(
                 children.found = true;
                 None
             }
+            // Web wallpapers render through visible browser children of the
+            // presenter; they are part of the verified wallpaper content.
+            _ if IsChild(children.presenter, hwnd) != 0 => None,
             _ if IsWindowVisible(hwnd) != 0 => Some("WorkerW contains another visible window"),
             _ => None,
         };
@@ -1222,7 +1332,9 @@ fn capture_frame_on_worker(
     let progress = &details.progress;
     let mut graphics = None;
 
+    let started = Instant::now();
     let mut attempts = 0usize;
+    let mut repeated = (String::new(), 0u32);
     wait_for_presenter(capture_deadline, || {
         let attempt = (|| {
             record_stage(
@@ -1266,11 +1378,52 @@ fn capture_frame_on_worker(
                         "Wallpaper Engine's frame exceeded the capture deadline".into(),
                     ));
                 }
+                if let PresenterAttempt::Ready(frame) = &frame {
+                    // Provider confirmation precedes the new presenter's first
+                    // frame; keep waiting within the budget for fresh pixels.
+                    if let Some(reason) = details
+                        .outgoing
+                        .as_ref()
+                        .and_then(|outgoing| incoming_frame_is_stale(frame, outgoing))
+                    {
+                        return Ok(PresenterAttempt::Retry(reason));
+                    }
+                    crate::apply_trace::event_lazy("transition-engine-capture-frame", || {
+                        format!(
+                            "display={:?} phase={} attempts={attempts} elapsed_ms={} fingerprint={} visible_detail={} subtree={:?}",
+                            details.display,
+                            details.phase,
+                            started.elapsed().as_millis(),
+                            FrameFingerprint::of(frame),
+                            has_visible_detail(&frame.rgba),
+                            subtree_summary(window.presenter),
+                        )
+                    });
+                }
             }
             Ok(frame)
         })();
         if let Ok(PresenterAttempt::Retry(reason)) = &attempt {
             record_stage(progress, reason.clone());
+            if *reason == repeated.0 {
+                repeated.1 += 1;
+            } else {
+                repeated = (reason.clone(), 1);
+                crate::apply_trace::event_lazy("transition-engine-capture-retry", || {
+                    format!(
+                        "display={:?} phase={} attempt={attempts} elapsed_ms={} reason={reason:?}",
+                        details.display,
+                        details.phase,
+                        started.elapsed().as_millis(),
+                    )
+                });
+            }
+            if is_permanent_refusal(reason) && repeated.1 >= PERMANENT_REFUSAL_ATTEMPTS {
+                return Err(format!(
+                    "{reason} (unchanged after {} attempts)",
+                    repeated.1
+                ));
+            }
         }
         attempt
     })
@@ -1583,6 +1736,7 @@ mod tests {
             endpoint,
             overlay_windows: Vec::new(),
             progress: Arc::default(),
+            outgoing: None,
         };
         match current_capture_window(monitor.rect, &details, true).unwrap() {
             PresenterAttempt::Ready(selected) => eprintln!("selected={selected:?}"),
@@ -1606,6 +1760,7 @@ mod tests {
             "diagnostic",
             endpoint,
             &[],
+            None,
         )
         .unwrap();
         assert_eq!(frame.width, monitor.rect.width());
@@ -1624,6 +1779,61 @@ mod tests {
 #[cfg(test)]
 mod presenter_tests {
     use super::*;
+
+    #[test]
+    fn apply_phases_use_the_short_deadline_and_only_unchanged_structure_is_permanent() {
+        assert_eq!(capture_deadline("outgoing"), APPLY_CAPTURE_DEADLINE);
+        assert_eq!(capture_deadline("incoming"), APPLY_CAPTURE_DEADLINE);
+        assert_eq!(capture_deadline("diagnostic"), CAPTURE_DEADLINE);
+        assert!(is_permanent_refusal(
+            "PrintWindow presenter child hwnd=0x1: destination contains unwritten pixels; WorkerW unavailable: WorkerW contains another visible window"
+        ));
+        assert!(!is_permanent_refusal(
+            "child; WorkerW unavailable: WorkerW no longer contains the selected presenter"
+        ));
+        assert!(!is_permanent_refusal(
+            "No rendered Wallpaper Engine window covers the target monitor"
+        ));
+    }
+
+    #[test]
+    fn frame_fingerprint_separates_distinct_frames_and_matches_identical_ones() {
+        let frame = |shade: fn(u32, u32) -> u8| {
+            let (width, height) = (64u32, 36u32);
+            let mut rgba = Vec::new();
+            for y in 0..height {
+                for x in 0..width {
+                    let value = shade(x, y);
+                    rgba.extend([value, value, value, 255]);
+                }
+            }
+            FrozenFrame {
+                width,
+                height,
+                rgba,
+            }
+        };
+        let gradient = FrameFingerprint::of(&frame(|x, _| (x * 4) as u8));
+        let same = FrameFingerprint::of(&frame(|x, _| (x * 4) as u8));
+        let mirrored = FrameFingerprint::of(&frame(|x, _| 255 - (x * 4) as u8));
+        assert_eq!(gradient, same);
+        assert_eq!(gradient.mean_difference(&same), 0.0);
+        assert!(gradient.mean_difference(&mirrored) > 64.0);
+        assert_eq!(gradient.to_string().len(), 64);
+
+        let outgoing = frame(|x, _| (x * 4) as u8);
+        let outgoing_print = FrameFingerprint::of(&outgoing);
+        assert!(incoming_frame_is_stale(&outgoing, &outgoing_print)
+            .unwrap()
+            .contains("still matches"));
+        assert!(incoming_frame_is_stale(&frame(|_, _| 64), &outgoing_print)
+            .unwrap()
+            .contains("uniform"));
+        assert_eq!(
+            incoming_frame_is_stale(&frame(|x, _| 255 - (x * 4) as u8), &outgoing_print),
+            None
+        );
+    }
 
     #[test]
     fn copied_dark_artwork_is_distinct_from_an_unwritten_or_zeroed_buffer() {

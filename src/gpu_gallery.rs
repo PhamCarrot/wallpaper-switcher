@@ -3798,7 +3798,7 @@ fn decode_poster_into(
     let source = if is_gif(path) {
         decode_gif_cover(path, wanted)?
     } else {
-        image::open(path)
+        crate::library::media_still::decode_bounded(path)
             .map_err(PosterDecodeError::Image)?
             .into_rgba8()
     };

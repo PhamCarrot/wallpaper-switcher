@@ -21,6 +21,7 @@ pub(in crate::candidate_app) struct Session {
     pub generation: u64,
     pub message: String,
     pub save_notice: Option<SaveNotice>,
+    pub save_note: Option<&'static str>,
     pub save_details_open: bool,
     pub active: bool,
     pub windows_panel: Option<SettingsCategory>,
@@ -50,6 +51,9 @@ pub(in crate::candidate_app) struct Session {
     preview_generation: u64,
     preview_loading: Option<u64>,
 }
+
+pub(in crate::candidate_app) const LIVE_FALLBACK_NOTE: &str =
+    "This effect doesn't work on animated wallpapers; Crossfade will be used as the fallback.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::candidate_app) enum SaveNotice {
@@ -101,9 +105,15 @@ impl SaveNotice {
         }
     }
 
-    pub(super) fn status(app: &GpuCandidate) -> super::folio::workbench::SaveStatus {
+    pub(in crate::candidate_app) fn status(
+        app: &GpuCandidate,
+    ) -> super::folio::workbench::SaveStatus {
         let session = &app.settings_workbench;
         let notice = session.save_notice.map(Self::label);
+        let note = session
+            .save_notice
+            .and(session.save_note)
+            .map(str::to_string);
         let details = match session.save_notice {
             Some(Self::Pending(_) | Self::Rejected) => Some(session.message.clone()),
             Some(
@@ -129,6 +139,7 @@ impl SaveNotice {
         .filter(|details| !details.is_empty());
         super::folio::workbench::SaveStatus {
             notice,
+            note,
             details,
             expanded: session.save_details_open,
         }
@@ -139,7 +150,14 @@ impl Session {
     pub(in crate::candidate_app) fn announce_save(&mut self, notice: SaveNotice) {
         if self.active {
             self.save_notice = Some(notice);
+            self.save_note = None;
             self.save_details_open = false;
+        }
+    }
+
+    pub(in crate::candidate_app) fn announce_note(&mut self, note: &'static str) {
+        if self.active && self.save_notice.is_some() {
+            self.save_note = Some(note);
         }
     }
 

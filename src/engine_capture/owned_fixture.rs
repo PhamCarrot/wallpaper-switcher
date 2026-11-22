@@ -615,7 +615,7 @@ fn owned_desktop_layers_capture_new_pixels_and_play_above_renderer_below_icons()
             assert!(window_is_above(worker.0, overlay_hwnd));
         }
         overlay
-            .render(&incoming, TransitionEffect::Crossfade, 0.5)
+            .render(Some(&incoming), TransitionEffect::Crossfade, 0.5)
             .unwrap();
         overlay.present().unwrap();
         if let Some(worker) = &worker {
@@ -630,19 +630,265 @@ fn owned_desktop_layers_capture_new_pixels_and_play_above_renderer_below_icons()
         check(&held(), blended, Some(icon));
         eprintln!("shared_root={shared_root} gpu={} old={old:?} incoming={new:?} intermediate={blended:?} icon={icon:?}", overlay.uses_gpu());
         overlay
-            .render(&incoming, TransitionEffect::WipeLeft, 0.5)
+            .render(Some(&incoming), TransitionEffect::WipeLeft, 0.5)
             .unwrap();
         overlay.present().unwrap();
         assert!(unsafe { DwmFlush() } >= 0);
         let wiped = [new[0], old[1]];
         check(&held(), wiped, Some(icon));
         eprintln!("shared_root={shared_root} Wipe Left intermediate={wiped:?} icon={icon:?}");
+        let mut settled = new;
+        if worker.is_some() {
+            let live = [[30, 180, 60, 255], [210, 120, 30, 255]];
+            draw_layer(
+                &composition,
+                &graphics.context,
+                &renderer_visual,
+                &stripes(96, 96, live),
+            );
+            overlay
+                .render(None, TransitionEffect::WipeLeft, 0.5)
+                .unwrap();
+            overlay.present().unwrap();
+            assert!(unsafe { DwmFlush() } >= 0);
+            check(&held(), [live[0], old[1]], Some(icon));
+            overlay
+                .render(None, TransitionEffect::Crossfade, 1.0)
+                .unwrap();
+            overlay.present().unwrap();
+            assert!(unsafe { DwmFlush() } >= 0);
+            check(&held(), live, Some(icon));
+            eprintln!("shared_root={shared_root} reveal live={live:?} icon={icon:?}");
+            settled = live;
+        }
         drop(overlay);
         assert_eq!(unsafe { IsWindow(overlay_hwnd) }, 0);
         if shared_root {
-            check(&held(), new, Some(icon));
+            check(&held(), settled, Some(icon));
         }
     }
+}
+
+#[test]
+#[ignore = "PrintWindow readback of an owned live desktop layout with a flip-model renderer; explicit invocation"]
+fn owned_live_layout_reveals_a_flip_model_renderer_through_the_cover() {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::Graphics::Dxgi::{
+        IDXGIFactory2, IDXGISwapChain1, DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC1,
+        DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    };
+
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe { RoUninitialize() };
+        }
+    }
+    unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.unwrap();
+    let _apartment = Apartment;
+    let graphics = CaptureGraphics::new().unwrap();
+    let dxgi: IDXGIDevice = graphics.device.cast().unwrap();
+    let composition: IDCompositionDevice = unsafe { DCompositionCreateDevice(&dxgi) }.unwrap();
+    let _coordinates = PhysicalWindowCoordinates::enter().unwrap();
+    let old = [[24, 60, 116, 255], [166, 80, 48, 255]];
+    let decoded = [[144, 152, 44, 255], [80, 42, 210, 255]];
+    let icon = [35, 220, 151, 255];
+    let target = DesktopRect {
+        left: 40,
+        top: 40,
+        right: 200,
+        bottom: 130,
+    };
+    let client = DesktopRect {
+        left: 0,
+        top: 0,
+        right: 160,
+        bottom: 90,
+    };
+    let host = OwnedWindow::show(
+        windows::core::w!("OwnedLiveLayoutHost"),
+        null_mut(),
+        target,
+        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+    );
+    let worker = OwnedWindow::show(windows::core::w!("WorkerW"), host.0, client, 0);
+    let renderer = OwnedWindow::show(
+        windows::core::w!("OwnedFlipModelRenderer"),
+        worker.0,
+        client,
+        0,
+    );
+    let icons = OwnedWindow::show(
+        windows::core::w!("SHELLDLL_DefView"),
+        host.0,
+        client,
+        WS_EX_LAYERED,
+    );
+    let icon_target = unsafe { composition.CreateTargetForHwnd(WinHwnd(icons.0), false) }.unwrap();
+    let icon_visual = unsafe { composition.CreateVisual() }.unwrap();
+    unsafe { icon_target.SetRoot(&icon_visual) }.unwrap();
+    let mut icon_frame = stripes(160, 90, [[0; 4]; 2]);
+    for y in 4..16u32 {
+        for x in 4..16u32 {
+            let start = 4 * (y * 160 + x) as usize;
+            icon_frame.rgba[start..start + 4].copy_from_slice(&icon);
+        }
+    }
+    draw_layer(&composition, &graphics.context, &icon_visual, &icon_frame);
+
+    let factory: IDXGIFactory2 =
+        unsafe { dxgi.GetAdapter().and_then(|adapter| adapter.GetParent()) }.unwrap();
+    let chain: IDXGISwapChain1 = unsafe {
+        factory.CreateSwapChainForHwnd(
+            &graphics.device,
+            WinHwnd(renderer.0),
+            &DXGI_SWAP_CHAIN_DESC1 {
+                Width: 160,
+                Height: 90,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: 2,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+    }
+    .unwrap();
+    let paint_renderer = |colour: [u8; 4]| unsafe {
+        let buffer: ID3D11Texture2D = chain.GetBuffer(0).unwrap();
+        let mut view = None;
+        graphics
+            .device
+            .CreateRenderTargetView(&buffer, None, Some(&mut view))
+            .unwrap();
+        graphics.context.ClearRenderTargetView(
+            &view.unwrap(),
+            &colour.map(|channel| f32::from(channel) / 255.0),
+        );
+        chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+        assert!(DwmFlush() >= 0);
+    };
+    let live = [200, 40, 90, 255];
+    paint_renderer(live);
+
+    let mut overlay =
+        DesktopTransitionSession::show_in_owned_host(stripes(160, 90, old), target, host.0)
+            .unwrap();
+    let cover = overlay.window_identity() as HWND;
+    assert!(
+        overlay.uses_gpu(),
+        "the reveal needs the composition renderer"
+    );
+    let layered = |cover| window_is_above(icons.0, cover) && window_is_above(cover, worker.0);
+    assert!(
+        layered(cover),
+        "icons above the cover, the cover above WorkerW"
+    );
+
+    let close = |a: [u8; 4], b: [u8; 4]| (0..3).all(|channel| a[channel].abs_diff(b[channel]) <= 2);
+    let read = |label: &str, left: [u8; 4], right: [u8; 4]| {
+        let frame = copy_window_pixels(worker.0, client).unwrap();
+        let observed = [
+            pixel(&frame, 30, 45),
+            pixel(&frame, 130, 45),
+            pixel(&frame, 8, 8),
+        ];
+        eprintln!(
+            "{label}: PrintWindow(WorkerW) left={:?} right={:?} icon={:?}",
+            observed[0], observed[1], observed[2]
+        );
+        assert!(
+            close(observed[0], left) && close(observed[1], right),
+            "{label}: expected left={left:?} right={right:?}, observed {observed:?}"
+        );
+        assert!(
+            close(observed[2], icon),
+            "{label}: the icon view must stay above the cover"
+        );
+    };
+    read("opaque cover before dispatch", old[0], old[1]);
+
+    let mut reveal = |effect, progress| {
+        overlay.render(None, effect, progress).unwrap();
+        overlay.present().unwrap();
+        assert!(unsafe { DwmFlush() } >= 0);
+    };
+    reveal(TransitionEffect::WipeLeft, 0.5);
+    read("reveal at 50%", live, old[1]);
+    let moved = [30, 180, 60, 255];
+    paint_renderer(moved);
+    read("renderer moved under the reveal", moved, old[1]);
+    reveal(TransitionEffect::WipeLeft, 1.0);
+    read("reveal finished", moved, moved);
+    assert!(layered(cover));
+
+    overlay
+        .render(
+            Some(&stripes(160, 90, decoded)),
+            TransitionEffect::WipeLeft,
+            0.5,
+        )
+        .unwrap();
+    overlay.present().unwrap();
+    assert!(unsafe { DwmFlush() } >= 0);
+    read("static composite at 50%", decoded[0], old[1]);
+    assert!(layered(cover));
+    drop(overlay);
+    assert_eq!(unsafe { IsWindow(cover) }, 0);
+    read("cover removed", moved, moved);
+
+    let cpu_session = || {
+        crate::desktop_transition::FORCE_CPU_SURFACE.with(|force| force.set(true));
+        let session =
+            DesktopTransitionSession::show_in_owned_host(stripes(160, 90, old), target, host.0);
+        crate::desktop_transition::FORCE_CPU_SURFACE.with(|force| force.set(false));
+        let session = session.unwrap();
+        let cover = session.window_identity() as HWND;
+        assert!(!session.uses_gpu());
+        assert!(layered(cover));
+        read("CPU cover before dispatch", old[0], old[1]);
+        (session, cover)
+    };
+    let frame = |session: &mut DesktopTransitionSession,
+                 incoming: Option<&FrozenFrame>,
+                 effect,
+                 progress| {
+        session.render(incoming, effect, progress).unwrap();
+        session.present().unwrap();
+        assert!(unsafe { DwmFlush() } >= 0);
+    };
+    let (mut fallback, cover) = cpu_session();
+    let decoded_frame = stripes(160, 90, decoded);
+    frame(
+        &mut fallback,
+        Some(&decoded_frame),
+        TransitionEffect::WipeLeft,
+        0.5,
+    );
+    read("CPU static composite at 50%", decoded[0], old[1]);
+    drop(fallback);
+    assert_eq!(unsafe { IsWindow(cover) }, 0);
+
+    let (mut fallback, cover) = cpu_session();
+    frame(&mut fallback, None, TransitionEffect::Crossfade, 0.5);
+    let faded = |cover: [u8; 4]| -> [u8; 4] {
+        std::array::from_fn(|channel| {
+            ((f32::from(cover[channel]) * 128.0 + f32::from(moved[channel]) * 127.0) / 255.0)
+                .round() as u8
+        })
+    };
+    read("CPU uniform fade at 50%", faded(old[0]), faded(old[1]));
+    frame(&mut fallback, None, TransitionEffect::Crossfade, 1.0);
+    read("CPU reveal finished", moved, moved);
+    assert!(layered(cover));
+    drop(fallback);
+    assert_eq!(unsafe { IsWindow(cover) }, 0);
 }
 
 #[test]

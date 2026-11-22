@@ -223,6 +223,37 @@ impl TransitionEffect {
             self
         }
     }
+
+    pub const fn needs_incoming_frame(self) -> bool {
+        matches!(
+            self,
+            Self::Pixelate
+                | Self::ChromaticRipple
+                | Self::Glitch
+                | Self::Warp
+                | Self::ZoomBlur
+                | Self::RadialBlur
+                | Self::Swirl
+                | Self::Displacement
+        )
+    }
+
+    pub fn resolve_for_target(self, sample: u64, live: bool) -> Self {
+        if !live {
+            return self.resolve(sample);
+        }
+        match self {
+            Self::Random => {
+                let reveal: Vec<_> = TRANSITION_CATALOG
+                    .into_iter()
+                    .filter(|effect| !effect.needs_incoming_frame())
+                    .collect();
+                reveal[sample as usize % reveal.len()]
+            }
+            effect if effect.needs_incoming_frame() => Self::Crossfade,
+            effect => effect,
+        }
+    }
 }
 
 fn normalize_effect_name(value: &str) -> String {
@@ -756,5 +787,61 @@ mod tests {
 
         assert_eq!(resolved.len(), 30);
         assert!(resolved.values().all(|count| *count == 10));
+    }
+
+    #[test]
+    fn exactly_eight_effects_need_the_incoming_frame() {
+        let flagged: Vec<_> = TRANSITION_CATALOG
+            .into_iter()
+            .filter(|effect| effect.needs_incoming_frame())
+            .collect();
+        assert_eq!(
+            flagged,
+            [
+                TransitionEffect::Pixelate,
+                TransitionEffect::ChromaticRipple,
+                TransitionEffect::Glitch,
+                TransitionEffect::Warp,
+                TransitionEffect::ZoomBlur,
+                TransitionEffect::RadialBlur,
+                TransitionEffect::Swirl,
+                TransitionEffect::Displacement,
+            ]
+        );
+        assert!(!TransitionEffect::Off.needs_incoming_frame());
+        assert!(!TransitionEffect::Random.needs_incoming_frame());
+    }
+
+    #[test]
+    fn live_targets_resolve_only_to_mask_effects() {
+        let random = (0..220)
+            .map(|sample| TransitionEffect::Random.resolve_for_target(sample, true))
+            .fold(std::collections::BTreeMap::new(), |mut counts, effect| {
+                assert!(!effect.needs_incoming_frame(), "{effect:?}");
+                *counts.entry(effect.key()).or_insert(0usize) += 1;
+                counts
+            });
+        assert_eq!(random.len(), 22);
+        assert!(random.values().all(|count| *count == 10));
+        for effect in TRANSITION_CATALOG {
+            let live = effect.resolve_for_target(7, true);
+            let expected = if effect.needs_incoming_frame() {
+                TransitionEffect::Crossfade
+            } else {
+                effect
+            };
+            assert_eq!(live, expected, "{effect:?} on a live target");
+            assert_eq!(effect.resolve_for_target(7, false), effect);
+        }
+        for sample in 0..60 {
+            assert_eq!(
+                TransitionEffect::Random.resolve_for_target(sample, false),
+                TransitionEffect::Random.resolve(sample)
+            );
+        }
+        assert_eq!(
+            TransitionEffect::Off.resolve_for_target(3, true),
+            TransitionEffect::Off
+        );
     }
 }

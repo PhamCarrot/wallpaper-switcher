@@ -13344,6 +13344,134 @@ fn e3_manual_and_automation_capture_native_config_despite_different_inert_source
 }
 
 #[test]
+fn wallpaper_transition_save_notes_the_live_fallback_for_incoming_transforming_effects() {
+    use view::settings::{
+        bridge::{SaveNotice, LIVE_FALLBACK_NOTE},
+        composed::{keys::wallpaper_transition as T, transitions},
+        folio::intent::SettingsMsg,
+    };
+    let mut app = p3_composed_editor_app(SettingsCategory::Motion);
+    let config_path = Config::config_path();
+    let owned = std::env::var_os("WALLPAPER_SWITCHER_CONFIG_DIR").expect("isolated config fixture");
+    assert!(config_path.starts_with(std::path::Path::new(&owned)));
+    let backup = config_path.with_extension("toml.bak");
+    let previous_config = std::fs::read(&config_path).ok();
+    let previous_backup = std::fs::read(&backup).ok();
+    let note = |app: &GpuCandidate| SaveNotice::status(app).note;
+    let saved = |app: &GpuCandidate| {
+        matches!(
+            app.settings_workbench.save_notice,
+            Some(SaveNotice::Saved("Wallpaper transition"))
+                | Some(SaveNotice::BackupWarning("Wallpaper transition"))
+        )
+    };
+    let pick = |app: &mut GpuCandidate, path: &str, value: &str| {
+        p3_settings_intent(app, SettingsMsg::Pick(path.into(), value.into()));
+    };
+    let choose = |app: &mut GpuCandidate, effect: transition::TransitionEffect| {
+        pick(app, T::FAMILY, transitions::native_family_of(effect).key());
+        pick(app, T::EFFECT, effect.key());
+        assert_eq!(app.config.transition.effect, effect);
+    };
+
+    for effect in transition::TRANSITION_CATALOG {
+        choose(&mut app, effect);
+        assert!(
+            saved(&app),
+            "{effect:?}: {:?}",
+            app.settings_workbench.save_notice
+        );
+        assert_eq!(
+            note(&app).as_deref(),
+            effect.needs_incoming_frame().then_some(LIVE_FALLBACK_NOTE),
+            "{effect:?}"
+        );
+    }
+    pick(&mut app, T::FAMILY, "random");
+    assert_eq!(
+        app.config.transition.effect,
+        transition::TransitionEffect::Random
+    );
+    assert!(saved(&app));
+    assert_eq!(
+        note(&app),
+        None,
+        "Random draws mask effects on live targets"
+    );
+    choose(&mut app, transition::TransitionEffect::Glitch);
+    assert_eq!(note(&app).as_deref(), Some(LIVE_FALLBACK_NOTE));
+    p3_settings_intent(&mut app, SettingsMsg::Toggle(T::ENABLED.into(), false));
+    assert_eq!(
+        app.config.transition.effect,
+        transition::TransitionEffect::Off
+    );
+    assert!(saved(&app));
+    assert_eq!(note(&app), None, "Off");
+
+    for family in [
+        transitions::Family::Fade,
+        transitions::Family::Wipe,
+        transitions::Family::Warp,
+        transitions::Family::Break,
+    ] {
+        choose(&mut app, transition::TransitionEffect::Swirl);
+        assert_eq!(note(&app).as_deref(), Some(LIVE_FALLBACK_NOTE));
+        pick(&mut app, T::FAMILY, family.key());
+        let default = transitions::native_default_effect_for_family(family).unwrap();
+        assert_eq!(app.config.transition.effect, default, "{family:?}");
+        assert_eq!(
+            note(&app).as_deref(),
+            default.needs_incoming_frame().then_some(LIVE_FALLBACK_NOTE),
+            "{family:?} default {default:?}"
+        );
+    }
+
+    choose(&mut app, transition::TransitionEffect::ZoomBlur);
+    p3_settings_intent(
+        &mut app,
+        SettingsMsg::Input(T::DURATION_MS.into(), "900".into()),
+    );
+    p3_settings_intent(&mut app, SettingsMsg::Commit);
+    assert_eq!(app.config.transition.duration_ms, 900);
+    assert_eq!(
+        note(&app).as_deref(),
+        Some(LIVE_FALLBACK_NOTE),
+        "a duration save keeps the flagged effect"
+    );
+    let launch = match app
+        .settings_workbench
+        .draft
+        .values
+        .get(view::settings::composed::keys::launch::ANIMATION)
+    {
+        Some(view::settings::composed::draft::Value::Text(current)) if current == "zoom" => "rise",
+        _ => "zoom",
+    };
+    pick(
+        &mut app,
+        view::settings::composed::keys::launch::ANIMATION,
+        launch,
+    );
+    assert!(app.settings_workbench.save_notice.is_some());
+    assert!(!saved(&app), "{:?}", app.settings_workbench.save_notice);
+    assert_eq!(note(&app), None, "an unrelated save clears the note");
+
+    choose(&mut app, transition::TransitionEffect::Displacement);
+    assert_eq!(note(&app).as_deref(), Some(LIVE_FALLBACK_NOTE));
+    p3_settings_intent(&mut app, SettingsMsg::SelectTab("playback".into()));
+    assert_eq!(app.settings_workbench.save_notice, None);
+    assert_eq!(app.settings_workbench.save_note, None);
+
+    for (path, previous) in [(config_path, previous_config), (backup, previous_backup)] {
+        if let Some(previous) = previous {
+            std::fs::write(path, previous).unwrap();
+        } else {
+            crate::file_publication::remove_if_present(&path).unwrap();
+        }
+    }
+}
+
+#[test]
 fn compatibility_owner_p4_pending_targets_and_exact_scopes_preserve_other_records_restart_and_reject_stale_actions(
 ) {
     use candidate_state::frontend::{PendingOnly, PendingSetting};

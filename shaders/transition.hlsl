@@ -5,7 +5,7 @@ cbuffer TransitionConstants : register(b0)
     float oldAspect;
     float newAspect;
     float style;
-    float padding0;
+    float mode;
     float padding1;
     float padding2;
 };
@@ -76,8 +76,9 @@ float4 PSMain(FullOutput input) : SV_Target
     float2 uv = input.uv;
     float4 oldColor = oldImage.Sample(imageSampler, coverUv(uv, oldAspect));
     float4 newColor = newImage.Sample(imageSampler, coverUv(uv, newAspect));
+    bool reveal = mode > 0.5;
     if (progress <= 0.0) return float4(oldColor.rgb, 1.0);
-    if (progress >= 1.0) return float4(newColor.rgb, 1.0);
+    if (progress >= 1.0) return reveal ? float4(0.0, 0.0, 0.0, 0.0) : float4(newColor.rgb, 1.0);
 
     int effect = (int)(style + 0.5);
     float2 centered = uv - 0.5;
@@ -221,5 +222,7 @@ float4 PSMain(FullOutput input) : SV_Target
     else if (effect == 29)
         mask = revealAt(hash11(floor(uv.x * 220.0)) * 0.7 + uv.y * 0.3, 0.08);
 
+    if (reveal)
+        return float4(oldColor.rgb * (1.0 - saturate(mask)), 1.0 - saturate(mask));
     return float4(lerp(oldColor.rgb, newColor.rgb, saturate(mask)), 1.0);
 }

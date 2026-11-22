@@ -2012,10 +2012,17 @@ fn apply_with_outcomes(
             );
         }
     }
-    let effect = request.transition.effect.resolve(random_sample());
-    crate::apply_trace::event_lazy("transition-effect", || {
+    let live = matches!(
+        request.wallpaper.source,
+        WallpaperSource::WallpaperEngine | WallpaperSource::LocalVideo
+    );
+    let effect = request
+        .transition
+        .effect
+        .resolve_for_target(random_sample(), live);
+    crate::apply_trace::event_lazy("transition-effect-resolved", || {
         format!(
-            "configured={} effect={} duration_ms={} targets={target_order:?}",
+            "configured={} resolved={} live={live} duration_ms={} targets={target_order:?}",
             request.transition.effect.key(),
             effect.key(),
             request.transition.duration_ms,
@@ -2035,46 +2042,17 @@ fn apply_with_outcomes(
         );
     }
 
-    match prepare_transition(request, monitors.clone(), context) {
+    match prepare_transition(request, monitors.clone(), effect, context) {
         Ok(Some(prepared)) => {
             #[cfg(test)]
             eprintln!("trace: transition prepared");
             let duration = std::time::Duration::from_millis(request.transition.duration_ms);
-            let overlay_windows: Vec<_> = prepared
-                .outputs
-                .iter()
-                .flat_map(|(_, output)| output.as_ref())
-                .map(|output| output.session.window_identity())
-                .collect();
             // Every target receives the provider command, in target order.
-            let (applied, transition) = settle_prepared_transition(
+            let (applied, transition) = settle_reveal_transition(
                 prepared.outputs,
                 || apply_direct_to_monitors(request, monitors, context),
-                |mut output| {
-                    let display = &output.monitor.device_id;
-                    if output.incoming.is_none() {
-                        output.session.ensure_wallpaper_layer()?;
-                        let endpoint = context
-                            .confirmed_capture_owners
-                            .borrow()
-                            .get(display)
-                            .copied()
-                            .ok_or(
-                                "Wallpaper Engine did not confirm a capture owner for this display",
-                            )?;
-                        output.incoming = Some(engine_capture::capture_for_apply(
-                            output.monitor.rect,
-                            request.operation_id.get(),
-                            display,
-                            "incoming",
-                            endpoint,
-                            &overlay_windows,
-                            Some(output.outgoing_fingerprint),
-                        )?);
-                    }
-                    Ok(output)
-                },
-                |playable| play_synchronized(playable, effect, duration),
+                &SystemRevealClock,
+                |playable| play_synchronized(playable, duration),
             );
             outcomes.extend(applied);
             return (order_outcomes(outcomes), transition);
@@ -2144,6 +2122,109 @@ fn settle_prepared_transition<T>(
                 }),
         );
     (providers, transition)
+}
+
+const LIVE_REVEAL_HOLD: std::time::Duration = std::time::Duration::from_millis(1_300);
+const LIVE_REVEAL_CAP: std::time::Duration = std::time::Duration::from_millis(2_500);
+
+trait RevealTarget {
+    fn display_id(&self) -> &str;
+    fn reveals_live(&self) -> bool;
+}
+
+impl RevealTarget for PreparedOutput {
+    fn display_id(&self) -> &str {
+        &self.monitor.device_id
+    }
+
+    fn reveals_live(&self) -> bool {
+        self.incoming.is_none()
+    }
+}
+
+trait RevealClock {
+    fn now(&self) -> std::time::Instant;
+    fn sleep(&self, duration: std::time::Duration);
+}
+
+struct SystemRevealClock;
+
+impl RevealClock for SystemRevealClock {
+    fn now(&self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    fn sleep(&self, duration: std::time::Duration) {
+        let until = std::time::Instant::now() + duration;
+        loop {
+            crate::desktop_transition::pump_messages();
+            let remaining = until.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(remaining.min(std::time::Duration::from_millis(16)));
+        }
+    }
+}
+
+fn live_reveal_wait(
+    since_confirmation: std::time::Duration,
+) -> (std::time::Duration, &'static str) {
+    if since_confirmation >= LIVE_REVEAL_CAP {
+        (std::time::Duration::ZERO, "cap")
+    } else {
+        (
+            LIVE_REVEAL_HOLD
+                .min(LIVE_REVEAL_CAP)
+                .saturating_sub(since_confirmation),
+            "fixed-hold",
+        )
+    }
+}
+
+fn hold_live_reveal<T: RevealTarget>(
+    output: T,
+    confirmed_at: Option<std::time::Instant>,
+    clock: &impl RevealClock,
+) -> Result<T, String> {
+    if !output.reveals_live() {
+        return Ok(output);
+    }
+    let confirmed_at = confirmed_at.unwrap_or_else(|| clock.now());
+    let since = clock.now().saturating_duration_since(confirmed_at);
+    let (wait, reason) = live_reveal_wait(since);
+    clock.sleep(wait);
+    crate::apply_trace::event_lazy("transition-reveal-ready", || {
+        format!(
+            "display={:?} elapsed_ms={} waited_ms={} reason={reason}",
+            output.display_id(),
+            clock
+                .now()
+                .saturating_duration_since(confirmed_at)
+                .as_millis(),
+            wait.as_millis()
+        )
+    });
+    Ok(output)
+}
+
+fn settle_reveal_transition<T: RevealTarget>(
+    targets: Vec<(String, Option<T>)>,
+    dispatch: impl FnOnce() -> Vec<MonitorApplyOutcome>,
+    clock: &impl RevealClock,
+    play: impl FnOnce(&mut [T]) -> Vec<PlaybackProgress>,
+) -> (Vec<MonitorApplyOutcome>, TransitionResult) {
+    let confirmed_at = std::cell::Cell::new(None);
+    settle_prepared_transition(
+        targets,
+        || {
+            let providers = dispatch();
+            confirmed_at.set(Some(clock.now()));
+            providers
+        },
+        |output| hold_live_reveal(output, confirmed_at.get(), clock),
+        play,
+    )
 }
 
 fn settle_incoming_transitions<T>(
@@ -2235,7 +2316,6 @@ struct PlaybackProgress {
 
 fn play_synchronized(
     outputs: &mut [PreparedOutput],
-    effect: TransitionEffect,
     duration: std::time::Duration,
 ) -> Vec<PlaybackProgress> {
     let frame_interval = std::time::Duration::from_millis(16);
@@ -2246,9 +2326,14 @@ fn play_synchronized(
     for output in outputs.iter() {
         crate::apply_trace::event_lazy("transition-playback-start", || {
             format!(
-                "display={:?} effect={} duration_ms={} {}",
+                "display={:?} effect={} mode={} duration_ms={} {}",
                 output.monitor.device_id,
-                effect.key(),
+                output.effect.key(),
+                if output.reveals_live() {
+                    "reveal"
+                } else {
+                    "composite"
+                },
                 duration.as_millis(),
                 output.session.placement_trace()
             )
@@ -2267,15 +2352,9 @@ fn play_synchronized(
                 (elapsed.as_secs_f32() / duration.as_secs_f32()).min(1.0)
             };
             for (index, output) in outputs.iter_mut().enumerate() {
-                let incoming = output.incoming.as_ref().ok_or_else(|| {
-                    (
-                        index,
-                        "A prepared transition output has no incoming frame".into(),
-                    )
-                })?;
                 output
                     .session
-                    .render(incoming, effect, progress)
+                    .render(output.incoming.as_ref(), output.effect, progress)
                     .map_err(|error| (index, error))?;
             }
             for (index, output) in outputs.iter().enumerate() {
@@ -2335,7 +2414,7 @@ fn play_synchronized(
             format!(
                 "display={:?} effect={} frames={frames} last_present_ms={last} max_gap_ms={gap} final_submitted={} error={:?}",
                 output.monitor.device_id,
-                effect.key(),
+                output.effect.key(),
                 result.final_submitted,
                 result.error
             )
@@ -2383,7 +2462,24 @@ struct PreparedOutput {
     monitor: native_wallpaper::NativeMonitor,
     session: DesktopTransitionSession,
     incoming: Option<FrozenFrame>,
-    outgoing_fingerprint: engine_capture::FrameFingerprint,
+    effect: TransitionEffect,
+}
+
+fn display_effect(
+    configured: TransitionEffect,
+    resolved: TransitionEffect,
+    live: bool,
+    gpu: bool,
+) -> (TransitionEffect, &'static str) {
+    if live && !gpu && resolved != TransitionEffect::Crossfade {
+        (TransitionEffect::Crossfade, "cpu-uniform-fade")
+    } else if live && configured.needs_incoming_frame() {
+        (resolved, "live-target-fallback")
+    } else if configured == TransitionEffect::Random {
+        (resolved, if live { "random-mask-effect" } else { "random" })
+    } else {
+        (resolved, "configured")
+    }
 }
 
 fn outgoing_frame(
@@ -2492,6 +2588,7 @@ fn outgoing_frame_inner(
 fn prepare_transition(
     request: &ApplyRequest,
     targets: Vec<native_wallpaper::NativeMonitor>,
+    effect: TransitionEffect,
     context: &ApplyContext,
 ) -> Result<Option<PreparedTransition>, String> {
     let mut outputs = Vec::with_capacity(targets.len());
@@ -2564,9 +2661,20 @@ fn prepare_transition(
         };
         #[cfg(test)]
         eprintln!("trace: showing desktop transition surface");
-        let outgoing_fingerprint = engine_capture::FrameFingerprint::of(&outgoing);
         let session = DesktopTransitionSession::show(outgoing, monitor.rect)
             .map_err(|error| format!("{}: {error}", monitor.device_id))?;
+        let live = incoming.is_none();
+        let (played, reason) =
+            display_effect(request.transition.effect, effect, live, session.uses_gpu());
+        crate::apply_trace::event_lazy("transition-effect", || {
+            format!(
+                "display={:?} configured={} resolved={} played={} reason={reason} live={live}",
+                monitor.device_id,
+                request.transition.effect.key(),
+                effect.key(),
+                played.key()
+            )
+        });
         crate::apply_trace::event_lazy("transition-display-host", || {
             format!(
                 "display={:?} target={:?} {}",
@@ -2582,7 +2690,7 @@ fn prepare_transition(
                 monitor,
                 session,
                 incoming,
-                outgoing_fingerprint,
+                effect: played,
             }),
         ));
     }
@@ -5072,6 +5180,313 @@ mod contract_tests {
         assert_ne!(
             TransitionResult::unchanged().status_name(),
             TransitionResult::not_requested().status_name()
+        );
+    }
+
+    struct RevealSlot {
+        display: &'static str,
+        live: bool,
+        removed: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+    }
+
+    impl RevealTarget for RevealSlot {
+        fn display_id(&self) -> &str {
+            self.display
+        }
+
+        fn reveals_live(&self) -> bool {
+            self.live
+        }
+    }
+
+    impl Drop for RevealSlot {
+        fn drop(&mut self) {
+            self.removed.borrow_mut().push(self.display);
+        }
+    }
+
+    struct FakeClock {
+        now: std::cell::Cell<std::time::Instant>,
+        slept: std::cell::RefCell<Vec<std::time::Duration>>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self {
+                now: std::cell::Cell::new(std::time::Instant::now()),
+                slept: std::cell::RefCell::default(),
+            }
+        }
+
+        fn advance(&self, duration: std::time::Duration) {
+            self.now.set(self.now.get() + duration);
+        }
+    }
+
+    impl RevealClock for FakeClock {
+        fn now(&self) -> std::time::Instant {
+            self.now.get()
+        }
+
+        fn sleep(&self, duration: std::time::Duration) {
+            self.slept.borrow_mut().push(duration);
+            self.advance(duration);
+        }
+    }
+
+    #[test]
+    fn live_targets_reveal_after_the_hold_and_static_targets_composite() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let cases: [(
+            &str,
+            Vec<(&'static str, Option<bool>)>,
+            Option<&str>,
+            TransitionStatus,
+            Vec<Duration>,
+            Vec<&str>,
+        ); 6] = [
+            (
+                "live",
+                vec![("display-a", Some(true))],
+                None,
+                TransitionStatus::Completed,
+                vec![ms(1_300)],
+                vec!["display-a"],
+            ),
+            (
+                "static",
+                vec![("display-a", Some(false))],
+                None,
+                TransitionStatus::Completed,
+                vec![],
+                vec!["display-a"],
+            ),
+            (
+                "mixed",
+                vec![("display-a", Some(false)), ("display-b", Some(true))],
+                None,
+                TransitionStatus::Completed,
+                vec![ms(1_300)],
+                vec!["display-a", "display-b"],
+            ),
+            (
+                "two-live",
+                vec![("display-a", Some(true)), ("display-b", Some(true))],
+                None,
+                TransitionStatus::Completed,
+                vec![ms(1_300), ms(0)],
+                vec!["display-a", "display-b"],
+            ),
+            (
+                "unchanged",
+                vec![("display-a", Some(true)), ("display-b", None)],
+                None,
+                TransitionStatus::Completed,
+                vec![ms(1_300)],
+                vec!["display-a"],
+            ),
+            (
+                "provider-unknown",
+                vec![("display-a", Some(true)), ("display-b", Some(false))],
+                Some("display-b"),
+                TransitionStatus::NotAttempted,
+                vec![],
+                vec![],
+            ),
+        ];
+        for (case, slots, unknown, status, holds, played) in cases {
+            let removed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let clock = FakeClock::new();
+            let targets: Vec<(String, Option<RevealSlot>)> = slots
+                .iter()
+                .map(|(display, live)| {
+                    (
+                        display.to_string(),
+                        live.map(|live| RevealSlot {
+                            display,
+                            live,
+                            removed: removed.clone(),
+                        }),
+                    )
+                })
+                .collect();
+            let mut presented = Vec::new();
+            let (providers, transition) = settle_reveal_transition(
+                targets,
+                || {
+                    clock.advance(ms(400));
+                    slots
+                        .iter()
+                        .map(|(display, _)| {
+                            if Some(*display) == unknown {
+                                unknown_outcome(display.to_string(), "no fresh readback".into())
+                            } else {
+                                confirmed_outcome(display.to_string())
+                            }
+                        })
+                        .collect()
+                },
+                &clock,
+                |outputs| {
+                    presented.extend(outputs.iter().map(|output| output.display));
+                    outputs
+                        .iter()
+                        .map(|_| PlaybackProgress {
+                            intermediate_submitted: true,
+                            final_submitted: true,
+                            error: None,
+                        })
+                        .collect()
+                },
+            );
+            assert_eq!(transition.status, status, "{case}");
+            assert_eq!(*clock.slept.borrow(), holds, "{case}: hold before reveal");
+            assert_eq!(presented, played, "{case}: played displays");
+            let mut covers: Vec<_> = slots
+                .iter()
+                .filter(|(_, live)| live.is_some())
+                .map(|(display, _)| *display)
+                .collect();
+            covers.sort_unstable();
+            removed.borrow_mut().sort_unstable();
+            assert_eq!(*removed.borrow(), covers, "{case}: every cover is removed");
+            for (display, live) in &slots {
+                let provider = providers
+                    .iter()
+                    .find(|outcome| outcome.target_id == *display)
+                    .unwrap();
+                let expected_provider = if Some(*display) == unknown {
+                    ApplyOperationState::Unknown
+                } else {
+                    ApplyOperationState::ProviderConfirmed
+                };
+                assert_eq!(provider.state, expected_provider, "{case}: {display}");
+                if status == TransitionStatus::NotAttempted {
+                    continue;
+                }
+                let animation = transition
+                    .displays
+                    .iter()
+                    .find(|item| item.display_id == *display)
+                    .unwrap();
+                let expected = if live.is_some() {
+                    TransitionStatus::Completed
+                } else {
+                    TransitionStatus::Unchanged
+                };
+                assert_eq!(animation.status, expected, "{case}: {display}");
+                assert_eq!(animation.error, None, "{case}: {display}");
+            }
+            if status == TransitionStatus::NotAttempted {
+                assert!(transition
+                    .warning_message()
+                    .is_some_and(|warning| warning.contains("did not confirm every target")));
+            } else {
+                assert_eq!(transition.warning_message(), None, "{case}: no warning");
+            }
+        }
+    }
+
+    #[test]
+    fn live_reveal_hold_is_bounded_with_an_injected_clock() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        for (since, wait, reason) in [
+            (0, 1_300, "fixed-hold"),
+            (200, 1_100, "fixed-hold"),
+            (1_300, 0, "fixed-hold"),
+            (1_500, 0, "fixed-hold"),
+            (2_499, 0, "fixed-hold"),
+            (2_500, 0, "cap"),
+            (4_000, 0, "cap"),
+        ] {
+            assert_eq!(
+                live_reveal_wait(ms(since)),
+                (ms(wait), reason),
+                "{since} ms"
+            );
+        }
+        for since in (0..3_000).step_by(10).map(ms) {
+            let (wait, _) = live_reveal_wait(since);
+            assert!(
+                since + wait <= LIVE_REVEAL_CAP || wait.is_zero(),
+                "{since:?}"
+            );
+            assert!(since + wait >= LIVE_REVEAL_HOLD.min(since.max(LIVE_REVEAL_HOLD)));
+        }
+        let removed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        for (since, slept) in [(Some(0), 1_300), (Some(2_600), 0), (None, 1_300)] {
+            let clock = FakeClock::new();
+            let confirmed = since.map(|_| clock.now());
+            clock.advance(ms(since.unwrap_or(0)));
+            let slot = RevealSlot {
+                display: "display-a",
+                live: true,
+                removed: removed.clone(),
+            };
+            let slot = hold_live_reveal(slot, confirmed, &clock).unwrap();
+            assert_eq!(*clock.slept.borrow(), [ms(slept)], "{since:?}");
+            assert!(slot.reveals_live());
+        }
+        let clock = FakeClock::new();
+        let still = RevealSlot {
+            display: "display-b",
+            live: false,
+            removed,
+        };
+        hold_live_reveal(still, Some(clock.now()), &clock).unwrap();
+        assert!(
+            clock.slept.borrow().is_empty(),
+            "a static target never waits"
+        );
+    }
+
+    #[test]
+    fn live_targets_never_play_an_incoming_transforming_effect() {
+        use crate::transition::TRANSITION_CATALOG;
+        let configured = TRANSITION_CATALOG
+            .into_iter()
+            .chain([TransitionEffect::Random]);
+        for effect in configured {
+            for sample in 0..220 {
+                let resolved = effect.resolve_for_target(sample, true);
+                for gpu in [true, false] {
+                    let (played, reason) = display_effect(effect, resolved, true, gpu);
+                    assert!(
+                        !played.needs_incoming_frame(),
+                        "{effect:?} played {played:?}"
+                    );
+                    if !gpu {
+                        assert_eq!(played, TransitionEffect::Crossfade);
+                    } else if effect.needs_incoming_frame() {
+                        assert_eq!(
+                            (played, reason),
+                            (TransitionEffect::Crossfade, "live-target-fallback")
+                        );
+                    } else if effect == TransitionEffect::Random {
+                        assert_eq!((played, reason), (resolved, "random-mask-effect"));
+                    } else {
+                        assert_eq!((played, reason), (effect, "configured"));
+                    }
+                }
+                let still = effect.resolve_for_target(sample, false);
+                let (played, reason) = display_effect(effect, still, false, true);
+                assert_eq!(played, still);
+                if effect != TransitionEffect::Random {
+                    assert_eq!((played, reason), (effect, "configured"));
+                }
+            }
+        }
+        assert_eq!(
+            display_effect(
+                TransitionEffect::Swirl,
+                TransitionEffect::Swirl,
+                false,
+                false
+            ),
+            (TransitionEffect::Swirl, "configured"),
+            "static targets keep every effect, also on the CPU surface"
         );
     }
 

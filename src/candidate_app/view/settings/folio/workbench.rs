@@ -398,6 +398,7 @@ pub fn settings_workbench<'a>(input: WorkbenchInput<'a, '_>) -> Element<'a, Mess
 #[derive(Clone, Default)]
 pub struct SaveStatus {
     pub notice: Option<String>,
+    pub note: Option<String>,
     pub details: Option<String>,
     pub expanded: bool,
 }
@@ -434,6 +435,15 @@ pub(in crate::candidate_app::view::settings) fn status_footer<'a>(
         }
     }
     let mut body = column![strip];
+    if let Some(note) = status.note {
+        body = body.push(
+            text(note)
+                .font(crate::donor_folio::source_ui::UI_FONT)
+                .size(12.0 * legible_type_scale(scale))
+                .color(palette.surface_text)
+                .width(Length::Fill),
+        );
+    }
     if let Some(details) = details {
         body = body.push(details);
     }
@@ -3277,6 +3287,7 @@ mod tests {
                     process_picker: None,
                     save_status: SaveStatus {
                         notice: Some("Settings saved (execution pending)".into()),
+                        note: None,
                         details: Some("This operation is unavailable in this build.".into()),
                         expanded: false,
                     },

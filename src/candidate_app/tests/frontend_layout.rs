@@ -7916,3 +7916,136 @@ fn pk03_rotation_settings_and_playlist_production_compositions() {
     )
     .unwrap();
 }
+
+#[test]
+#[ignore = "Owned R5 save footer capture; requires R5_LAYOUT_OUTPUT and explicit invocation"]
+fn r5_owned_save_footer_shows_the_live_fallback_note() {
+    use iced::advanced::{
+        layout,
+        renderer::{Headless, Renderer as _},
+        widget::{Operation, Tree},
+        Layout,
+    };
+    use view::settings::{
+        bridge::LIVE_FALLBACK_NOTE,
+        composed::{keys::wallpaper_transition as T, transitions},
+        folio::intent::SettingsMsg,
+    };
+    #[derive(Default)]
+    struct Probe {
+        texts: Vec<(String, iced::Rectangle)>,
+    }
+    impl Operation for Probe {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(&mut self, _: Option<&iced::widget::Id>, bounds: iced::Rectangle, value: &str) {
+            self.texts.push((value.into(), bounds));
+        }
+    }
+    let output =
+        std::path::PathBuf::from(std::env::var_os("R5_LAYOUT_OUTPUT").expect("owned output"));
+    std::fs::create_dir_all(&output).unwrap();
+    let config_path = Config::config_path();
+    let owned = std::env::var_os("WALLPAPER_SWITCHER_CONFIG_DIR").expect("isolated config fixture");
+    assert!(config_path.starts_with(std::path::Path::new(&owned)));
+    let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+        UI_FONT,
+        iced::Pixels(16.0),
+        Some("wgpu"),
+    ))
+    .unwrap();
+    let (width, height) = (1920u32, 1080u32);
+    let (mut app, _) = d4a_fixture(3);
+    app.viewport = [width as f32, height as f32];
+    app.launch_policy = p1_preview_policy();
+    iced::advanced::graphics::text::font_system()
+        .write()
+        .unwrap()
+        .load_font(std::borrow::Cow::Borrowed(app.settings_locale.font_bytes()));
+    let _ = update(&mut app, Message::ToggleSettingsPanel);
+    p3_settings_intent(&mut app, SettingsMsg::SelectTab("motion".into()));
+    assert_eq!(app.settings_workbench.tab, "motion");
+    let effect = transition::TransitionEffect::Swirl;
+    p3_settings_intent(
+        &mut app,
+        SettingsMsg::Pick(
+            T::FAMILY.into(),
+            transitions::native_family_of(effect).key().into(),
+        ),
+    );
+    p3_settings_intent(
+        &mut app,
+        SettingsMsg::Pick(T::EFFECT.into(), effect.key().into()),
+    );
+    assert_eq!(app.config.transition.effect, effect);
+    app.settings_workbench.folio_entrance = None;
+    app.settings_workbench.tab_reveal = None;
+
+    let window = app.window.unwrap();
+    let theme = theme(&app, window);
+    let style = application_style(&app, &theme);
+    let size = iced::Size::new(width as f32, height as f32);
+    let viewport = iced::Rectangle::with_size(size);
+    let mut element = view(&app, window);
+    let mut tree = Tree::new(&element);
+    let node =
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &layout::Limits::new(size, size));
+    let mut probe = Probe::default();
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+    let find = |label: &str| {
+        probe
+            .texts
+            .iter()
+            .find(|(text, bounds)| text == label && viewport.contains(bounds.center()))
+            .map(|(_, bounds)| *bounds)
+            .unwrap_or_else(|| panic!("missing visible {label:?}: {:?}", probe.texts))
+    };
+    let notice = find("Wallpaper transition saved");
+    let note = find(LIVE_FALLBACK_NOTE);
+    eprintln!("footer notice={notice:?} note={note:?}");
+    assert!(
+        note.y >= notice.y + notice.height - 0.5,
+        "the note is a second line"
+    );
+    assert!(
+        note.y - (notice.y + notice.height) < notice.height,
+        "same footer box"
+    );
+    assert!((note.x - notice.x).abs() < 1.0, "aligned with the notice");
+    assert!(
+        !probe.texts.iter().any(|(text, _)| text == "Details"),
+        "the note is visible without Details"
+    );
+    renderer.reset(viewport);
+    element.as_widget().draw(
+        &tree,
+        &mut renderer,
+        &theme,
+        &iced::advanced::renderer::Style {
+            text_color: style.text_color,
+        },
+        Layout::new(&node),
+        iced::mouse::Cursor::Unavailable,
+        &viewport,
+    );
+    let bytes = Headless::screenshot(
+        &mut renderer,
+        iced::Size::new(width, height),
+        1.0,
+        style.background_color,
+    );
+    ::image::save_buffer_with_format(
+        output.join("r5-footer-1920x1080-swirl.png"),
+        &bytes,
+        width,
+        height,
+        ::image::ColorType::Rgba8,
+        ::image::ImageFormat::Png,
+    )
+    .unwrap();
+}

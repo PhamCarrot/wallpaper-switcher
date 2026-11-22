@@ -20,7 +20,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     HTTRANSPARENT, HWND_BOTTOM, HWND_TOP, LWA_ALPHA, MSG, PM_REMOVE, SMTO_ABORTIFHUNG,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WM_ERASEBKGND, WM_NCCREATE,
     WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::d3d11_transition::D3d11TransitionRenderer;
@@ -28,6 +29,11 @@ use crate::monitor::DesktopRect;
 use crate::transition::{render_effect, FrozenFrame, TransitionEffect};
 
 const SPAWN_WORKERW: u32 = 0x052c;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_CPU_SURFACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 pub(crate) const CLASS_NAME: &str = "WallpaperSwitcherTransition";
 
 struct WindowState {
@@ -183,6 +189,56 @@ impl DesktopTransitionSession {
         let raised = raised_desktop_children(host).is_some();
         register_window_class()?;
 
+        let mut session = Self::place(outgoing, target, host, fallback, raised, true)?;
+        crate::apply_trace::event(
+            "d3d-create-start",
+            format!(
+                "width={} height={}",
+                session.outgoing.width, session.outgoing.height
+            ),
+        );
+        match session.attach_renderer() {
+            Ok(()) => {
+                crate::apply_trace::event(
+                    "d3d-create-complete",
+                    format!(
+                        "width={} height={}",
+                        session.outgoing.width, session.outgoing.height
+                    ),
+                );
+                Ok(session)
+            }
+            Err(error) => {
+                crate::apply_trace::event("d3d-create-fallback", format!("error={error:?}"));
+                crate::log_debug(&format!(
+                    "D3D11 transition unavailable; using bounded CPU upload fallback: {error}"
+                ));
+                let outgoing = std::mem::replace(
+                    &mut session.outgoing,
+                    FrozenFrame {
+                        width: 0,
+                        height: 0,
+                        rgba: Vec::new(),
+                    },
+                );
+                drop(session);
+                let session = Self::place(outgoing, target, host, fallback, raised, false)?;
+                // The outgoing CPU frame covers the desktop before the provider changes.
+                session.present()?;
+                commit_desktop()?;
+                Ok(session)
+            }
+        }
+    }
+
+    fn place(
+        outgoing: FrozenFrame,
+        target: DesktopRect,
+        host: HWND,
+        fallback: HWND,
+        raised: bool,
+        composition: bool,
+    ) -> Result<Self, String> {
         let class_name = wide(CLASS_NAME);
         let title = wide("Wallpaper Switcher Transition");
         let instance = unsafe { GetModuleHandleW(null()) };
@@ -190,6 +246,9 @@ impl DesktopTransitionSession {
         let mut extended = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT;
         if raised {
             extended |= WS_EX_LAYERED;
+        }
+        if composition {
+            extended |= WS_EX_NOREDIRECTIONBITMAP;
         }
         let hwnd = create_transition_window(WindowState::new(&outgoing), |parameter| unsafe {
             CreateWindowExW(
@@ -279,41 +338,22 @@ impl DesktopTransitionSession {
             }
         }
         session.ensure_wallpaper_layer()?;
-        // The outgoing CPU frame covers the desktop before the provider changes.
-        session.present()?;
-        let flush = unsafe { DwmFlush() };
-        if flush < 0 {
-            return Err(format!(
-                "Could not commit the outgoing transition frame: {flush:#010x}"
-            ));
-        }
-        crate::apply_trace::event(
-            "d3d-create-start",
-            format!(
-                "width={} height={}",
-                session.outgoing.width, session.outgoing.height
-            ),
-        );
-        session.gpu = match D3d11TransitionRenderer::new(hwnd, &session.outgoing) {
-            Ok(renderer) => {
-                crate::apply_trace::event(
-                    "d3d-create-complete",
-                    format!(
-                        "width={} height={}",
-                        session.outgoing.width, session.outgoing.height
-                    ),
-                );
-                Some(renderer)
-            }
-            Err(error) => {
-                crate::apply_trace::event("d3d-create-fallback", format!("error={error:?}"));
-                crate::log_debug(&format!(
-                    "D3D11 transition unavailable; using bounded CPU upload fallback: {error}"
-                ));
-                None
-            }
-        };
         Ok(session)
+    }
+
+    fn attach_renderer(&mut self) -> Result<(), String> {
+        #[cfg(test)]
+        if FORCE_CPU_SURFACE.with(std::cell::Cell::get) {
+            return Err("an owned fixture requested the CPU surface".into());
+        }
+        let mut renderer = D3d11TransitionRenderer::new(self.hwnd, &self.outgoing)?;
+        renderer.render(None, TransitionEffect::Crossfade, 0.0)?;
+        self.gpu = Some(renderer);
+        self.present()?;
+        if let Some(renderer) = &self.gpu {
+            renderer.commit()?;
+        }
+        commit_desktop()
     }
 
     pub(crate) fn ensure_wallpaper_layer(&self) -> Result<(), String> {
@@ -376,7 +416,7 @@ impl DesktopTransitionSession {
             } else {
                 (elapsed.as_secs_f32() / duration.as_secs_f32()).min(1.0)
             };
-            self.render(incoming, effect, progress)?;
+            self.render(Some(incoming), effect, progress)?;
             self.present()?;
             if progress >= 1.0 {
                 break;
@@ -388,7 +428,7 @@ impl DesktopTransitionSession {
 
     pub fn render(
         &mut self,
-        incoming: &FrozenFrame,
+        incoming: Option<&FrozenFrame>,
         effect: TransitionEffect,
         progress: f32,
     ) -> Result<(), String> {
@@ -397,20 +437,22 @@ impl DesktopTransitionSession {
                 "Windows destroyed the transition surface during the wallpaper handoff".into(),
             );
         }
-
-        let gpu_error = self
-            .gpu
-            .as_mut()
-            .and_then(|renderer| renderer.render(incoming, effect, progress).err());
-        if let Some(error) = gpu_error {
-            crate::log_debug(&format!(
-                "D3D11 transition render failed; continuing with CPU fallback: {error}"
-            ));
-            self.gpu = None;
+        if let Some(renderer) = self.gpu.as_mut() {
+            return renderer.render(incoming, effect, progress);
         }
-        if self.gpu.is_some() {
+        let Some(incoming) = incoming else {
+            if !self.raised {
+                return Err(
+                    "The CPU transition surface is not layered and cannot reveal a live wallpaper"
+                        .into(),
+                );
+            }
+            let alpha = ((1.0 - progress.clamp(0.0, 1.0)) * 255.0).round() as u8;
+            if unsafe { SetLayeredWindowAttributes(self.hwnd, 0, alpha, LWA_ALPHA) } == 0 {
+                return Err(last_error("Could not fade the CPU transition surface"));
+            }
             return Ok(());
-        }
+        };
 
         let frame = render_effect(effect, &self.outgoing, incoming, progress)?;
         unsafe {
@@ -474,8 +516,7 @@ impl DesktopTransitionSession {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub fn uses_gpu(&self) -> bool {
+    pub(crate) fn uses_gpu(&self) -> bool {
         self.gpu.is_some()
     }
 }
@@ -556,6 +597,16 @@ unsafe extern "system" fn window_proc(
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
     }
+}
+
+fn commit_desktop() -> Result<(), String> {
+    let flush = unsafe { DwmFlush() };
+    if flush < 0 {
+        return Err(format!(
+            "Could not commit the outgoing transition frame: {flush:#010x}"
+        ));
+    }
+    Ok(())
 }
 
 fn register_window_class() -> Result<(), String> {
@@ -662,7 +713,7 @@ unsafe extern "system" fn find_wallpaper_host(hwnd: HWND, lparam: LPARAM) -> BOO
     1
 }
 
-fn pump_messages() {
+pub(crate) fn pump_messages() {
     unsafe {
         let mut message: MSG = std::mem::zeroed();
         while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {

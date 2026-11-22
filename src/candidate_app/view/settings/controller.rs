@@ -96,6 +96,7 @@ pub(in crate::candidate_app) fn reconcile(app: &mut GpuCandidate) {
             }
             session.clear_preview();
             session.save_notice = None;
+            session.save_note = None;
             session.save_details_open = false;
             session.draft.depart();
             session.generation = session.generation.wrapping_add(1);
@@ -266,6 +267,10 @@ fn persist_wallpaper_transition(
         Ok(outcome) => {
             app.config = proposed;
             let effect = app.config.transition.effect;
+            if effect.needs_incoming_frame() {
+                app.settings_workbench
+                    .announce_note(super::bridge::LIVE_FALLBACK_NOTE);
+            }
             app.settings_workbench.draft.values.insert(
                 T::ENABLED.to_string(),
                 Value::Boolean(effect != TransitionEffect::Off),
@@ -1175,6 +1180,7 @@ pub(super) fn select_tab(app: &mut GpuCandidate, tab: String) {
         app.folder_menu_open = false;
     }
     app.settings_workbench.save_notice = None;
+    app.settings_workbench.save_note = None;
     app.settings_workbench.save_details_open = false;
     app.settings_workbench.tab = tab;
     app.settings_workbench.legacy_category = Some(app.panel_state.settings_category);

@@ -1,31 +1,36 @@
 use std::ffi::c_void;
 
-use windows::core::BOOL;
+use windows::core::Interface;
 use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, HMODULE, HWND};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDeviceAndSwapChain, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext,
-    ID3D11PixelShader, ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView,
-    ID3D11Texture2D, ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_BUFFER_DESC, D3D11_COMPARISON_NEVER, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA,
-    D3D11_TEXTURE2D_DESC, D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_IMMUTABLE,
-    D3D11_VIEWPORT,
+    D3D11CreateDevice, ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11PixelShader,
+    ID3D11RenderTargetView, ID3D11SamplerState, ID3D11ShaderResourceView, ID3D11Texture2D,
+    ID3D11VertexShader, D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_SHADER_RESOURCE, D3D11_BUFFER_DESC,
+    D3D11_COMPARISON_NEVER, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+    D3D11_SAMPLER_DESC, D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
+    D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_USAGE_DEFAULT, D3D11_USAGE_IMMUTABLE, D3D11_VIEWPORT,
+};
+use windows::Win32::Graphics::DirectComposition::{
+    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_MODE_DESC, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    IDXGISwapChain, DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC, DXGI_SWAP_EFFECT_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_PRESENT, DXGI_SCALING_STRETCH,
+    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 
 use crate::transition::{FrozenFrame, TransitionEffect, TRANSITION_CATALOG};
 
 const VERTEX_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/transition.vs.cso"));
 const PIXEL_SHADER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/transition.ps.cso"));
+
+const COMPOSITE_MODE: f32 = 0.0;
+const REVEAL_MODE: f32 = 1.0;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -35,7 +40,8 @@ struct TransitionConstants {
     old_aspect: f32,
     new_aspect: f32,
     style: f32,
-    padding: [f32; 3],
+    mode: f32,
+    padding: [f32; 2],
 }
 
 pub struct D3d11TransitionRenderer {
@@ -43,7 +49,10 @@ pub struct D3d11TransitionRenderer {
     height: u32,
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    swap_chain: IDXGISwapChain,
+    swap_chain: IDXGISwapChain1,
+    composition: IDCompositionDevice,
+    _composition_target: IDCompositionTarget,
+    _visual: IDCompositionVisual,
     target: ID3D11RenderTargetView,
     vertex_shader: ID3D11VertexShader,
     pixel_shader: ID3D11PixelShader,
@@ -64,52 +73,61 @@ impl D3d11TransitionRenderer {
     pub fn new(hwnd: *mut c_void, outgoing: &FrozenFrame) -> Result<Self, String> {
         validate_frame(outgoing)?;
 
-        let description = DXGI_SWAP_CHAIN_DESC {
-            BufferDesc: DXGI_MODE_DESC {
-                Width: outgoing.width,
-                Height: outgoing.height,
-                RefreshRate: DXGI_RATIONAL {
-                    Numerator: 0,
-                    Denominator: 1,
-                },
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                ..Default::default()
-            },
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: 2,
-            OutputWindow: HWND(hwnd),
-            Windowed: BOOL(1),
-            SwapEffect: DXGI_SWAP_EFFECT_DISCARD,
-            Flags: 0,
-        };
-
-        let mut swap_chain = None;
         let mut device = None;
         let mut context = None;
         unsafe {
-            D3D11CreateDeviceAndSwapChain(
+            D3D11CreateDevice(
                 None,
                 D3D_DRIVER_TYPE_HARDWARE,
                 HMODULE::default(),
                 D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                 Some(&[D3D_FEATURE_LEVEL_11_0]),
                 D3D11_SDK_VERSION,
-                Some(&description),
-                Some(&mut swap_chain),
                 Some(&mut device),
                 None,
                 Some(&mut context),
             )
         }
         .map_err(|error| format!("Could not create the D3D11 transition device: {error}"))?;
-
-        let swap_chain = swap_chain.ok_or("D3D11 did not return a transition swap chain")?;
-        let device = device.ok_or("D3D11 did not return a transition device")?;
+        let device: ID3D11Device = device.ok_or("D3D11 did not return a transition device")?;
         let context = context.ok_or("D3D11 did not return a transition context")?;
+
+        let dxgi: IDXGIDevice = device
+            .cast()
+            .map_err(|error| format!("Could not access the DXGI transition device: {error}"))?;
+        let factory: IDXGIFactory2 =
+            unsafe { dxgi.GetAdapter().and_then(|adapter| adapter.GetParent()) }.map_err(
+                |error| format!("Could not access the DXGI transition factory: {error}"),
+            )?;
+        let description = DXGI_SWAP_CHAIN_DESC1 {
+            Width: outgoing.width,
+            Height: outgoing.height,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            Scaling: DXGI_SCALING_STRETCH,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+            AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+            ..Default::default()
+        };
+        let swap_chain =
+            unsafe { factory.CreateSwapChainForComposition(&device, &description, None) }
+                .map_err(|error| format!("Could not create the transition swap chain: {error}"))?;
+        let composition: IDCompositionDevice = unsafe { DCompositionCreateDevice(&dxgi) }
+            .map_err(|error| format!("Could not create the transition composition: {error}"))?;
+        let (composition_target, visual) = (|| unsafe {
+            let target = composition.CreateTargetForHwnd(HWND(hwnd), true)?;
+            let visual = composition.CreateVisual()?;
+            visual.SetContent(&swap_chain)?;
+            target.SetRoot(&visual)?;
+            composition.Commit()?;
+            Ok::<_, windows::core::Error>((target, visual))
+        })()
+        .map_err(|error| format!("Could not bind the transition composition: {error}"))?;
 
         let back_buffer: ID3D11Texture2D = unsafe { swap_chain.GetBuffer(0) }
             .map_err(|error| format!("Could not access the transition back buffer: {error}"))?;
@@ -162,6 +180,9 @@ impl D3d11TransitionRenderer {
             device,
             context,
             swap_chain,
+            composition,
+            _composition_target: composition_target,
+            _visual: visual,
             target,
             vertex_shader,
             pixel_shader,
@@ -175,39 +196,56 @@ impl D3d11TransitionRenderer {
 
     pub fn render(
         &mut self,
-        incoming: &FrozenFrame,
+        incoming: Option<&FrozenFrame>,
         effect: TransitionEffect,
         progress: f32,
     ) -> Result<(), String> {
-        validate_frame(incoming)?;
-        if incoming.width != self.width || incoming.height != self.height {
-            return Err("The incoming frame does not match the D3D11 transition surface".into());
-        }
-        let identity = incoming.rgba.as_ptr() as usize;
-        if self.incoming.as_ref().map(|texture| texture.identity) != Some(identity) {
-            let (texture, view) = create_input_texture(&self.device, incoming)?;
-            self.incoming = Some(InputTexture {
-                identity,
-                texture,
-                view,
-            });
-        }
-        let incoming = self
-            .incoming
-            .as_ref()
-            .expect("incoming texture initialized");
+        let aspect = self.width as f32 / self.height.max(1) as f32;
+        let (new_view, new_aspect, mode) = match incoming {
+            Some(incoming) => {
+                validate_frame(incoming)?;
+                if incoming.width != self.width || incoming.height != self.height {
+                    return Err(
+                        "The incoming frame does not match the D3D11 transition surface".into(),
+                    );
+                }
+                let identity = incoming.rgba.as_ptr() as usize;
+                if self.incoming.as_ref().map(|texture| texture.identity) != Some(identity) {
+                    let (texture, view) = create_input_texture(&self.device, incoming)?;
+                    self.incoming = Some(InputTexture {
+                        identity,
+                        texture,
+                        view,
+                    });
+                }
+                let incoming = self
+                    .incoming
+                    .as_ref()
+                    .expect("incoming texture initialized");
+                (
+                    incoming.view.clone(),
+                    incoming.texture_description_aspect(),
+                    COMPOSITE_MODE,
+                )
+            }
+            None if effect.needs_incoming_frame() => {
+                return Err(format!(
+                    "{} transforms the incoming picture and cannot reveal a live wallpaper",
+                    effect.key()
+                ));
+            }
+            None => (self.outgoing_view.clone(), aspect, REVEAL_MODE),
+        };
         let constants = TransitionConstants {
             progress: progress.clamp(0.0, 1.0),
-            target_aspect: self.width as f32 / self.height.max(1) as f32,
-            old_aspect: self.width as f32 / self.height.max(1) as f32,
-            new_aspect: incoming.texture_description_aspect(),
+            target_aspect: aspect,
+            old_aspect: aspect,
+            new_aspect,
             style: shader_style(effect)? as f32,
-            padding: [0.0; 3],
+            mode,
+            padding: [0.0; 2],
         };
-        let views = [
-            Some(self.outgoing_view.clone()),
-            Some(incoming.view.clone()),
-        ];
+        let views = [Some(self.outgoing_view.clone()), Some(new_view)];
         let targets = [Some(self.target.clone())];
         let constant_buffers = [Some(self.constants.clone())];
         let samplers = [Some(self.sampler.clone())];
@@ -253,6 +291,15 @@ impl D3d11TransitionRenderer {
         result
             .ok()
             .map_err(|error| format!("Could not present the D3D11 transition frame: {error}"))
+    }
+
+    pub fn commit(&self) -> Result<(), String> {
+        unsafe {
+            self.composition
+                .Commit()
+                .and_then(|()| self.composition.WaitForCommitCompletion())
+        }
+        .map_err(|error| format!("Could not commit the transition composition: {error}"))
     }
 }
 
@@ -419,13 +466,24 @@ mod tests {
             effect: TransitionEffect,
             progress: f32,
         ) -> Vec<u8> {
+            self.render_with(outgoing, Some(incoming), effect, progress)
+        }
+
+        fn render_with(
+            &self,
+            outgoing: &FrozenFrame,
+            incoming: Option<&FrozenFrame>,
+            effect: TransitionEffect,
+            progress: f32,
+        ) -> Vec<u8> {
             use windows::Win32::Graphics::Direct3D11::{
                 D3D11_BIND_RENDER_TARGET, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE,
                 D3D11_MAP_READ, D3D11_USAGE_STAGING,
             };
             let (width, height) = (outgoing.width, outgoing.height);
             let (_old_texture, old_view) = create_input_texture(&self.device, outgoing).unwrap();
-            let (_new_texture, new_view) = create_input_texture(&self.device, incoming).unwrap();
+            let (_new_texture, new_view) =
+                create_input_texture(&self.device, incoming.unwrap_or(outgoing)).unwrap();
             let mut description = D3D11_TEXTURE2D_DESC {
                 Width: width,
                 Height: height,
@@ -448,7 +506,12 @@ mod tests {
                 old_aspect: aspect,
                 new_aspect: aspect,
                 style: shader_style(effect).unwrap() as f32,
-                padding: [0.0; 3],
+                mode: if incoming.is_some() {
+                    COMPOSITE_MODE
+                } else {
+                    REVEAL_MODE
+                },
+                padding: [0.0; 2],
             };
             unsafe {
                 let mut target = None;
@@ -538,6 +601,185 @@ mod tests {
             height,
             rgba,
         }
+    }
+
+    fn blue_cells(width: u32, height: u32, swapped: bool) -> FrozenFrame {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let cell = ((x / 10 + y / 10) % 2 == 1) != swapped;
+                let shade = if swapped {
+                    y * 255 / height
+                } else {
+                    x * 255 / width
+                } as u8;
+                rgba.extend_from_slice(&[shade, 255 - shade, if cell { 255 } else { 128 }, 255]);
+            }
+        }
+        FrozenFrame {
+            width,
+            height,
+            rgba,
+        }
+    }
+
+    #[test]
+    fn mask_effects_blend_identically_for_any_incoming_picture() {
+        let replay = Replay::new();
+        let (width, height) = (160u32, 90u32);
+        let outgoing = patterned(width, height, false);
+        let incoming = [
+            blue_cells(width, height, false),
+            blue_cells(width, height, true),
+        ];
+        let mut failures = Vec::new();
+        for effect in TRANSITION_CATALOG {
+            let mut largest = 0.0f32;
+            for progress in [0.1, 0.25, 0.5, 0.75, 0.9] {
+                let masks: Vec<Vec<f32>> = incoming
+                    .iter()
+                    .map(|frame| {
+                        replay
+                            .render(&outgoing, frame, effect, progress)
+                            .chunks_exact(4)
+                            .zip(frame.rgba.chunks_exact(4))
+                            .map(|(out, new)| f32::from(out[2]) / f32::from(new[2]))
+                            .collect()
+                    })
+                    .collect();
+                for (first, second) in masks[0].iter().zip(&masks[1]) {
+                    largest = largest.max((first - second).abs());
+                }
+            }
+            println!("mask dependence {effect:?}: {largest:.4}");
+            if (largest > 0.02) != effect.needs_incoming_frame() {
+                failures.push(format!(
+                    "{effect:?}: incoming dependence {largest:.4}, flagged {}",
+                    effect.needs_incoming_frame()
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{}",
+            failures.join(
+                "
+"
+            )
+        );
+    }
+
+    #[test]
+    fn reveal_mode_alpha_is_the_inverse_of_the_composite_mask() {
+        let replay = Replay::new();
+        let steps = [0.0, 0.001, 0.1, 0.25, 0.5, 0.75, 0.9, 0.999, 1.0];
+        let mut failures = Vec::new();
+        let mut check = |passed: bool, message: String| {
+            if !passed {
+                failures.push(message);
+            }
+        };
+        for (width, height) in [(160u32, 90u32), (210, 90)] {
+            let (outgoing, incoming) = (
+                patterned(width, height, false),
+                patterned(width, height, true),
+            );
+            let pixels = (width * height) as f32;
+            for effect in TRANSITION_CATALOG
+                .into_iter()
+                .filter(|effect| !effect.needs_incoming_frame())
+            {
+                let name = format!("{effect:?} at {width}x{height}");
+                for progress in steps {
+                    let composite = replay.render(&outgoing, &incoming, effect, progress);
+                    let reveal = replay.render_with(&outgoing, None, effect, progress);
+                    let (mut alpha_error, mut colour_error) = (0u8, 0u8);
+                    for ((mixed, revealed), old) in composite
+                        .chunks_exact(4)
+                        .zip(reveal.chunks_exact(4))
+                        .zip(outgoing.rgba.chunks_exact(4))
+                    {
+                        alpha_error = alpha_error.max(revealed[3].abs_diff(255 - mixed[2]));
+                        for channel in 0..3 {
+                            let premultiplied = (f32::from(old[channel]) * f32::from(revealed[3])
+                                / 255.0)
+                                .round() as u8;
+                            colour_error =
+                                colour_error.max(revealed[channel].abs_diff(premultiplied));
+                        }
+                    }
+                    check(
+                        alpha_error <= 1,
+                        format!("{name} at {progress}: alpha differs from 1 - mask by {alpha_error}/255"),
+                    );
+                    check(
+                        colour_error <= 1,
+                        format!(
+                            "{name} at {progress}: premultiplied colour off by {colour_error}/255"
+                        ),
+                    );
+                    check(
+                        composite.chunks_exact(4).all(|pixel| pixel[3] == 255),
+                        format!("{name} at {progress}: composite output is not opaque"),
+                    );
+                    let alphas = || reveal.chunks_exact(4).map(|pixel| pixel[3]);
+                    if progress == 0.0 {
+                        check(
+                            alphas().all(|alpha| alpha == 255),
+                            format!("{name}: the first frame is not fully opaque"),
+                        );
+                    } else if progress == 0.001 {
+                        let lowest = alphas().min().unwrap();
+                        check(
+                            f32::from(lowest) / 255.0 >= 1.0 - MAX_FIRST_FRAME_MASK,
+                            format!("{name}: first animated frame alpha falls to {lowest}/255"),
+                        );
+                    } else if progress == 0.999 {
+                        let clear = alphas()
+                            .filter(|alpha| f32::from(*alpha) / 255.0 <= 0.02)
+                            .count() as f32
+                            / pixels;
+                        check(
+                            clear >= 0.995,
+                            format!("{name}: only {clear} of the cover is clear at 99.9%"),
+                        );
+                    } else if progress == 1.0 {
+                        check(
+                            reveal.iter().all(|value| *value == 0),
+                            format!("{name}: the final frame is not fully transparent"),
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{}",
+            failures.join(
+                "
+"
+            )
+        );
+    }
+
+    #[test]
+    #[ignore = "Composite replay digest; compare its output before and after a shader change"]
+    fn composite_replay_digest() {
+        use sha2::{Digest, Sha256};
+        let replay = Replay::new();
+        let mut hasher = Sha256::new();
+        for (width, height) in [(160u32, 90u32), (210, 90)] {
+            let (outgoing, incoming) = (
+                patterned(width, height, false),
+                patterned(width, height, true),
+            );
+            for effect in TRANSITION_CATALOG {
+                for progress in [0.0, 0.001, 0.1, 0.25, 0.5, 0.75, 0.9, 0.999, 1.0] {
+                    hasher.update(replay.render(&outgoing, &incoming, effect, progress));
+                }
+            }
+        }
+        println!("digest composite {:x}", hasher.finalize());
     }
 
     // 99.9% residual limit: about twice the largest measured value (Warp 0.130,

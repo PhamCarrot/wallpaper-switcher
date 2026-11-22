@@ -3,22 +3,24 @@ use std::ptr::{null, null_mut};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    GetLastError, SetLastError, BOOL, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    GetLastError, SetLastError, BOOL, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
+use windows_sys::Win32::Graphics::Dwm::DwmFlush;
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, StretchDIBits, UpdateWindow, BITMAPINFO,
+    BeginPaint, EndPaint, InvalidateRect, MapWindowPoints, StretchDIBits, UpdateWindow, BITMAPINFO,
     BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, PAINTSTRUCT, SRCCOPY,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, FindWindowExW,
     FindWindowW, GetAncestor, GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect, IsWindow,
-    IsWindowVisible, PeekMessageW, RegisterClassExW, SendMessageTimeoutW, SetParent,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, GA_ROOT,
-    GWLP_USERDATA, GWL_STYLE, GW_HWNDNEXT, GW_HWNDPREV, HTTRANSPARENT, HWND_BOTTOM, HWND_TOP, MSG,
-    PM_REMOVE, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SW_SHOW, WM_ERASEBKGND, WM_NCCREATE, WM_NCDESTROY,
-    WM_NCHITTEST, WM_PAINT, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    IsWindowVisible, PeekMessageW, RegisterClassExW, SendMessageTimeoutW,
+    SetLayeredWindowAttributes, SetParent, SetWindowLongPtrW, SetWindowPos, CREATESTRUCTW,
+    CS_HREDRAW, CS_VREDRAW, GA_ROOT, GWLP_USERDATA, GWL_STYLE, GW_HWNDNEXT, GW_HWNDPREV,
+    HTTRANSPARENT, HWND_BOTTOM, HWND_TOP, LWA_ALPHA, MSG, PM_REMOVE, SMTO_ABORTIFHUNG,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WM_ERASEBKGND, WM_NCCREATE,
+    WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 use crate::d3d11_transition::D3d11TransitionRenderer;
@@ -26,7 +28,7 @@ use crate::monitor::DesktopRect;
 use crate::transition::{render_effect, FrozenFrame, TransitionEffect};
 
 const SPAWN_WORKERW: u32 = 0x052c;
-const CLASS_NAME: &str = "WallpaperSwitcherTransition";
+pub(crate) const CLASS_NAME: &str = "WallpaperSwitcherTransition";
 
 struct WindowState {
     width: u32,
@@ -127,6 +129,8 @@ unsafe fn destroy_created_window(take: impl FnOnce() -> *mut WindowState) {
 
 pub struct DesktopTransitionSession {
     hwnd: HWND,
+    host: HWND,
+    raised: bool,
     outgoing: FrozenFrame,
     gpu: Option<D3d11TransitionRenderer>,
 }
@@ -163,21 +167,36 @@ impl DesktopTransitionSession {
     }
 
     fn show_inner(outgoing: FrozenFrame, target: DesktopRect) -> Result<Self, String> {
+        let (host, fallback) = wallpaper_host()?;
+        Self::show_on_host(outgoing, target, host, fallback)
+    }
+
+    fn show_on_host(
+        outgoing: FrozenFrame,
+        target: DesktopRect,
+        host: HWND,
+        fallback: HWND,
+    ) -> Result<Self, String> {
         if outgoing.width != target.width() || outgoing.height != target.height() {
             return Err("The frozen frame does not match the target monitor".to_string());
         }
-        let worker_host = wallpaper_host()?;
+        let raised = raised_desktop_children(host).is_some();
         register_window_class()?;
 
         let class_name = wide(CLASS_NAME);
         let title = wide("Wallpaper Switcher Transition");
         let instance = unsafe { GetModuleHandleW(null()) };
+        let styles = WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
+        let mut extended = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT;
+        if raised {
+            extended |= WS_EX_LAYERED;
+        }
         let hwnd = create_transition_window(WindowState::new(&outgoing), |parameter| unsafe {
             CreateWindowExW(
-                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
+                extended,
                 class_name.as_ptr(),
                 title.as_ptr(),
-                WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                WS_POPUP | styles,
                 target.left,
                 target.top,
                 target.width() as i32,
@@ -188,79 +207,101 @@ impl DesktopTransitionSession {
                 parameter,
             )
         })?;
+        let mut session = Self {
+            hwnd,
+            host: null_mut(),
+            raised,
+            outgoing,
+            gpu: None,
+        };
         unsafe {
-            SetWindowLongPtrW(
-                hwnd,
-                GWL_STYLE,
-                (WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN) as isize,
-            );
-            let progman_class = wide("Progman");
-            let progman = FindWindowW(progman_class.as_ptr(), null());
-            let mut host = null_mut();
+            if SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_CHILD | styles) as isize) == 0 {
+                return Err(last_error("Could not set the transition child style"));
+            }
             // Progman is stable across Wallpaper Engine scene changes. A
             // WorkerW can be replaced during a provider handoff, which would
             // destroy its child and invalidate the transition frame storage.
-            for candidate in [progman, worker_host] {
+            for candidate in [host, fallback] {
                 if candidate.is_null() {
                     continue;
                 }
                 SetParent(hwnd, candidate);
                 if GetParent(hwnd) == candidate {
-                    host = candidate;
+                    session.host = candidate;
                     break;
                 }
             }
-            if host.is_null() {
-                DestroyWindow(hwnd);
+            if session.host.is_null() {
                 return Err(last_error(
                     "Windows refused to place the transition at the wallpaper layer",
                 ));
             }
-            let mut host_rect: RECT = std::mem::zeroed();
-            if GetWindowRect(host, &mut host_rect) == 0 {
-                DestroyWindow(hwnd);
-                return Err(last_error("Could not read wallpaper host geometry"));
+            if raised && SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA) == 0 {
+                return Err(last_error(
+                    "Could not enable the layered transition surface",
+                ));
             }
-            SetWindowLongPtrW(
-                hwnd,
-                GWL_STYLE,
-                (WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN) as isize,
-            );
-            let def_view = wide("SHELLDLL_DefView");
-            let insert_after =
-                if FindWindowExW(host, null_mut(), def_view.as_ptr(), null()).is_null() {
-                    HWND_TOP
-                } else {
-                    // Progman owns the desktop-icon view. Keep the transition below
-                    // every icon child so only the wallpaper pixels are replaced.
-                    HWND_BOTTOM
-                };
+            let mut origin = POINT {
+                x: target.left,
+                y: target.top,
+            };
+            SetLastError(0);
+            if MapWindowPoints(null_mut(), session.host, &mut origin, 1) == 0 && GetLastError() != 0
+            {
+                return Err(last_error(
+                    "Could not map the display into the wallpaper host",
+                ));
+            }
+            let icons = desktop_icon_view(session.host);
+            let insert_after = if raised {
+                if icons.is_null() {
+                    return Err(
+                        "The raised desktop icon view was replaced during preparation".into(),
+                    );
+                }
+                icons
+            } else if icons.is_null() {
+                HWND_TOP
+            } else {
+                HWND_BOTTOM
+            };
             if SetWindowPos(
                 hwnd,
                 insert_after,
-                target.left - host_rect.left,
-                target.top - host_rect.top,
+                origin.x,
+                origin.y,
                 target.width() as i32,
                 target.height() as i32,
-                SWP_NOACTIVATE,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
             ) == 0
             {
-                let error = last_error("Windows refused the transition window position");
-                DestroyWindow(hwnd);
-                return Err(error);
+                return Err(last_error("Windows refused the transition window position"));
             }
-            ShowWindow(hwnd, SW_SHOW);
-            UpdateWindow(hwnd);
+        }
+        session.ensure_wallpaper_layer()?;
+        // The outgoing CPU frame covers the desktop before the provider changes.
+        session.present()?;
+        let flush = unsafe { DwmFlush() };
+        if flush < 0 {
+            return Err(format!(
+                "Could not commit the outgoing transition frame: {flush:#010x}"
+            ));
         }
         crate::apply_trace::event(
             "d3d-create-start",
-            format!("width={} height={}", outgoing.width, outgoing.height),
+            format!(
+                "width={} height={}",
+                session.outgoing.width, session.outgoing.height
+            ),
         );
-        let gpu = match D3d11TransitionRenderer::new(hwnd, &outgoing) {
+        session.gpu = match D3d11TransitionRenderer::new(hwnd, &session.outgoing) {
             Ok(renderer) => {
                 crate::apply_trace::event(
                     "d3d-create-complete",
-                    format!("width={} height={}", outgoing.width, outgoing.height),
+                    format!(
+                        "width={} height={}",
+                        session.outgoing.width, session.outgoing.height
+                    ),
                 );
                 Some(renderer)
             }
@@ -272,11 +313,49 @@ impl DesktopTransitionSession {
                 None
             }
         };
-        Ok(Self {
-            hwnd,
-            outgoing,
-            gpu,
-        })
+        Ok(session)
+    }
+
+    pub(crate) fn ensure_wallpaper_layer(&self) -> Result<(), String> {
+        if unsafe { IsWindowVisible(self.hwnd) == 0 || GetParent(self.hwnd) != self.host } {
+            return Err("The transition surface lost its wallpaper host".into());
+        }
+        if self.raised {
+            let (icons, renderer) = raised_desktop_children(self.host)
+                .ok_or("The raised desktop lost its icon or wallpaper layer")?;
+            if !window_is_above(icons, self.hwnd) || !window_is_above(self.hwnd, renderer) {
+                // If Explorer replaced WorkerW, reclaim only our own position.
+                if unsafe {
+                    SetWindowPos(
+                        self.hwnd,
+                        icons,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                    )
+                } == 0
+                    || !window_is_above(icons, self.hwnd)
+                    || !window_is_above(self.hwnd, renderer)
+                {
+                    return Err(
+                        "Could not place the transition between the desktop icons and renderer"
+                            .into(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn show_in_owned_host(
+        outgoing: FrozenFrame,
+        target: DesktopRect,
+        host: HWND,
+    ) -> Result<Self, String> {
+        Self::show_on_host(outgoing, target, host, null_mut())
     }
 
     pub fn play(
@@ -369,6 +448,7 @@ impl DesktopTransitionSession {
     }
 
     pub fn present(&self) -> Result<(), String> {
+        self.ensure_wallpaper_layer()?;
         if let Some(renderer) = &self.gpu {
             renderer.present()?;
         } else {
@@ -381,8 +461,9 @@ impl DesktopTransitionSession {
                 if InvalidateRect(self.hwnd, null(), 0) == 0 || UpdateWindow(self.hwnd) == 0 {
                     return Err("Windows did not update the CPU transition surface".into());
                 }
-                // UpdateWindow can dispatch WM_PAINT synchronously. Read the
-                // current state again after that callback has returned.
+                // A layered child can defer painting until its queue is drained.
+                pump_messages();
+                // The paint or destroy callback may have run while pumping.
                 let state = GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *const WindowState;
                 if state.is_null() || !(*state).painted {
                     return Err("The CPU transition surface did not paint the frame".into());
@@ -502,11 +583,43 @@ fn register_window_class() -> Result<(), String> {
     Ok(())
 }
 
-fn wallpaper_host() -> Result<HWND, String> {
+pub(crate) fn desktop_icon_view(parent: HWND) -> HWND {
+    let class = wide("SHELLDLL_DefView");
+    unsafe { FindWindowExW(parent, null_mut(), class.as_ptr(), null()) }
+}
+
+fn raised_desktop_children(parent: HWND) -> Option<(HWND, HWND)> {
+    let icons = desktop_icon_view(parent);
+    if icons.is_null() {
+        return None;
+    }
+    let class = wide("WorkerW");
+    let renderer = unsafe { FindWindowExW(parent, null_mut(), class.as_ptr(), null()) };
+    (!renderer.is_null()).then_some((icons, renderer))
+}
+
+pub(crate) fn window_is_above(above: HWND, below: HWND) -> bool {
+    let mut sibling = below;
+    for _ in 0..4096 {
+        sibling = unsafe { GetWindow(sibling, GW_HWNDPREV) };
+        if sibling.is_null() {
+            return false;
+        }
+        if sibling == above {
+            return true;
+        }
+    }
+    false
+}
+
+fn wallpaper_host() -> Result<(HWND, HWND), String> {
     let progman_class = wide("Progman");
     let progman = unsafe { FindWindowW(progman_class.as_ptr(), null()) };
     if progman.is_null() {
         return Err("Windows desktop host (Progman) was not found".to_string());
+    }
+    if raised_desktop_children(progman).is_some() {
+        return Ok((progman, null_mut()));
     }
     let mut ignored = 0usize;
     unsafe {
@@ -520,6 +633,9 @@ fn wallpaper_host() -> Result<HWND, String> {
             &mut ignored,
         );
     }
+    if raised_desktop_children(progman).is_some() {
+        return Ok((progman, null_mut()));
+    }
     let mut host: HWND = null_mut();
     unsafe { EnumWindows(Some(find_wallpaper_host), &mut host as *mut HWND as LPARAM) };
     if host.is_null() {
@@ -529,7 +645,7 @@ fn wallpaper_host() -> Result<HWND, String> {
     if host.is_null() {
         Err("Windows wallpaper WorkerW was not found".to_string())
     } else {
-        Ok(host)
+        Ok((progman, host))
     }
 }
 
@@ -739,7 +855,7 @@ mod tests {
 
     #[test]
     fn windows_wallpaper_host_is_discoverable() {
-        assert!(!wallpaper_host().unwrap().is_null());
+        assert!(!wallpaper_host().unwrap().0.is_null());
     }
 
     #[test]

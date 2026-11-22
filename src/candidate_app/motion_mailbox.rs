@@ -98,7 +98,6 @@ mod tests {
             ),
             selection: Default::default(),
             presentation: None,
-            filter_wave: None,
             ordinary: None,
             hex: None,
             wall: None,

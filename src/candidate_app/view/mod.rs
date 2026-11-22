@@ -414,7 +414,6 @@ pub(super) fn view(app: &GpuCandidate, _id: window::Id) -> Element<'_, Message> 
     let mut cards = if let Some(entries) = &ordinary {
         entries
             .iter()
-            .filter(|e| !e.outgoing)
             .filter_map(|entry| {
                 let mut card = donor_scene::presented_hit_card(entry)?;
                 if entry.hex_style {
@@ -440,7 +439,7 @@ pub(super) fn view(app: &GpuCandidate, _id: window::Id) -> Element<'_, Message> 
         )
     };
     // Ordinary cards already carry the source-validated layer and aspect from
-    // ordinary_base_frame. Rechecking them here repeats filesystem metadata work
+    // ordinary_frame. Rechecking them here repeats filesystem metadata work
     // on every menu/scene animation frame.
     if ordinary.is_none() {
         let loaded_layers: HashSet<_> = app.posters.iter().map(|poster| poster.layer).collect();
@@ -485,6 +484,10 @@ pub(super) fn view(app: &GpuCandidate, _id: window::Id) -> Element<'_, Message> 
         .or(app.detail_source);
     let snapshot = Arc::new(GallerySnapshot {
         ordinary,
+        held_wall: app
+            .wall_colour_hold
+            .as_ref()
+            .map(|hold| (hold.entries.clone(), hold.clip)),
         defer_near_restore: match app.gallery_mode {
             GalleryMode::Wall => app
                 .wall_presentation
@@ -496,13 +499,7 @@ pub(super) fn view(app: &GpuCandidate, _id: window::Id) -> Element<'_, Message> 
                 .is_some_and(|p| !p.camera.settled()),
             _ => false,
         },
-        wall_clip: (app.gallery_mode == GalleryMode::Wall).then(|| {
-            let composition = gallery_layout_params_for_app(app).wall;
-            app.wall_presentation.as_ref().map_or_else(
-                || gpu_gallery::wall_frame(app.viewport, composition).clip,
-                |p| p.clip(app.viewport, composition),
-            )
-        }),
+        wall_clip: (app.gallery_mode == GalleryMode::Wall).then(|| app.wall_frame_clip()),
         depth: app.depth_frame.clone().map(|mut frame| {
             for e in &mut frame.cards {
                 if let Some(card) = cards.iter().find(|c| c.index == e.card.index) {
@@ -535,7 +532,7 @@ pub(super) fn view(app: &GpuCandidate, _id: window::Id) -> Element<'_, Message> 
         },
     });
     let scene: Element<'_, GalleryMessage> = shader(GalleryProgram {
-        prewarm: (app.atlas_entry.is_some() || app.wall_colour_roll_held()).then(|| {
+        prewarm: (app.atlas_entry.is_some() || app.wall_colour_hold.is_some()).then(|| {
             (
                 app.atlas_prewarm_key(),
                 !app.poster_loading && app.poster_request_key.is_some(),

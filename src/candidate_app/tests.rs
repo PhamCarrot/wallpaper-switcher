@@ -934,10 +934,7 @@ fn d3_application_fixture(count: usize) -> (GpuCandidate, Arc<std::sync::atomic:
         preset_wheel: None,
         depth_revision: Default::default(),
         depth_frame: Default::default(),
-        depth_roll: Default::default(),
-        ordinary_roll: None,
-        ordinary_transition_issue: None,
-        depth_roll_fallbacks: 0,
+        wall_colour_hold: None,
         depth_presentation: Default::default(),
         deterministic_animation: false,
         view_legacy_lookups: Default::default(),
@@ -2742,43 +2739,51 @@ fn theme_integration_invalid_hex_keeps_applied_snapshot_and_usable_draft() {
 }
 
 #[test]
-fn d4b_filter_replacement_starts_with_cut_live_geometry_and_no_stale_detail() {
+fn d4b_filter_replacement_publishes_full_current_cards_and_closes_stale_detail() {
     let (mut app, submissions) = d4a_fixture(12);
     app.detail_open = true;
     app.detail_progress = 1.0;
     app.depth_detail_id = Some("item-0000".into());
-    let old = app.depth_frame.clone().unwrap();
-    app.sort_order = SortOrder::Newest;
-    app.refresh_filter();
-    app.rebuild_depth_frame();
-    let next = app.depth_frame.as_ref().unwrap();
-    assert!(
-        next.cards.is_empty(),
-        "incoming zero-width cut must be omitted from draw, hit, detail and demand"
-    );
-    assert!(next
-        .hit(old.cards.last().unwrap().card.center[0], 450.0)
-        .is_none());
+    for order in [SortOrder::Newest, SortOrder::Colour, SortOrder::Newest] {
+        app.sort_order = order;
+        app.refresh_filter();
+        app.rebuild_depth_frame();
+        for step in 0..3 {
+            if step != 0 {
+                d4a_motion_tick(&mut app, 0.05);
+            }
+            let current = app.depth_frame.as_ref().unwrap();
+            let raw = donor_scene::depth_instances(
+                current,
+                &GalleryColors::default(),
+                1.0,
+                &d4a_scene(&app),
+            );
+            assert_eq!(raw.len(), current.cards.len());
+            assert!(!current.cards.is_empty());
+            for (entry, instance) in current.cards.iter().zip(raw) {
+                assert_eq!(
+                    entry.id,
+                    app.wallpapers[app.filtered_indices[entry.filtered_index]].id
+                );
+                assert_eq!(instance.rect[..2], entry.card.center);
+                assert_eq!(instance.rect[2], entry.card.size[0] * 0.5);
+                assert_eq!(instance.crop, entry.crop_uv);
+                assert!(entry.card.size[0] > 1.0);
+            }
+            let selected = current.cards.last().unwrap();
+            assert_eq!(
+                current
+                    .hit(selected.card.center[0], selected.card.center[1])
+                    .unwrap()
+                    .id,
+                selected.id
+            );
+        }
+    }
     assert!(!app.detail_open);
     assert!(app.depth_detail_id.is_none());
     assert_eq!(submissions.load(Ordering::Acquire), 0);
-}
-
-#[test]
-fn d4b_filter_cut_blocks_current_detail_geometry_at_start() {
-    let (mut app, _) = d4a_fixture(12);
-    app.sort_order = SortOrder::Newest;
-    app.refresh_filter();
-    app.rebuild_depth_frame();
-    assert!(
-        app.depth_frame
-            .as_ref()
-            .unwrap()
-            .cards
-            .iter()
-            .all(|entry| !entry.card.selected),
-        "a fully removed incoming card cannot host active current-card chrome/detail actions"
-    );
 }
 
 fn d4b_seed_resident(app: &mut GpuCandidate) {
@@ -2817,7 +2822,19 @@ fn d4b_requests(app: &GpuCandidate) -> Vec<PosterRequestIdentity> {
         app.depth_frame.as_ref().unwrap(),
         &app.filtered_indices,
         &app.wallpapers,
-        app.depth_roll.as_ref().map_or(&[], |r| r.old.as_slice()),
+    )
+}
+fn d4b_sources(
+    app: &GpuCandidate,
+    requests: &[PosterRequestIdentity],
+) -> Vec<poster_worker::PosterSource> {
+    gallery::poster_sources_bounded(
+        requests,
+        &app.poster_slots,
+        &[],
+        app.catalog_generation.load(Ordering::Acquire),
+        gpu_gallery::MAX_POSTERS,
+        false,
     )
 }
 fn d4b_complete(
@@ -2825,13 +2842,7 @@ fn d4b_complete(
     requests: &[PosterRequestIdentity],
     fail: bool,
 ) -> Vec<poster_worker::PosterSource> {
-    let pins: &[DepthGhost] = app.depth_roll.as_ref().map_or(&[], |r| r.old.as_slice());
-    let sources = depth_poster_sources(
-        requests,
-        &app.poster_slots,
-        pins,
-        app.catalog_generation.load(Ordering::Acquire),
-    );
+    let sources = d4b_sources(app, requests);
     let generation = app.poster_generation.fetch_add(1, Ordering::AcqRel) + 1;
     app.poster_mailbox
         .expect(generation, sources.clone())
@@ -2943,7 +2954,6 @@ fn d5_late_window_open_cannot_revive_hidden_or_replace_owned_depth_window() {
     assert_eq!(app.window, Some(id));
     assert!(app.depth_frame.is_none());
     assert!(app.depth_camera.is_none());
-    assert!(app.depth_roll.is_none());
     assert!(app.posters.is_empty());
     assert_eq!(
         app.poster_generation.load(Ordering::Acquire),
@@ -2978,7 +2988,7 @@ fn d5_benchmark_mode_changes_cancel_depth_ownership_without_saving_profile() {
         (40, GalleryMode::Wall),
     ] {
         let mut app = d4b_disjoint_fixture(5);
-        assert!(!app.depth_roll.as_ref().unwrap().old.is_empty());
+        assert!(!app.depth_frame.as_ref().unwrap().cards.is_empty());
         let saved_gallery = app.state.gallery.clone();
         let old_motion_generation = app.motion_generation.load(Ordering::Acquire);
         let old_camera = app.depth_camera.unwrap();
@@ -2990,10 +3000,6 @@ fn d5_benchmark_mode_changes_cancel_depth_ownership_without_saving_profile() {
 
         let _ = update(&mut app, Message::Wake(Wake::BenchmarkNavigate(step)));
         assert_eq!(app.gallery_mode, expected);
-        assert!(
-            app.depth_roll.is_none(),
-            "benchmark mode exit retained Depth pins"
-        );
         assert!(app.depth_frame.is_none());
         assert!(app.depth_camera.is_none());
         assert!(app.depth_presentation.is_none());
@@ -3015,7 +3021,6 @@ fn d5_benchmark_mode_changes_cancel_depth_ownership_without_saving_profile() {
                 state: old_camera,
                 selection: HashMap::new(),
                 presentation: Some(DepthPresentation::target(&CandidateState::default())),
-                filter_wave: Some(0.2),
                 ordinary: None,
                 hex: None,
                 wall: None,
@@ -3044,210 +3049,105 @@ fn d5_benchmark_mode_changes_cancel_depth_ownership_without_saving_profile() {
         assert_eq!(app.gallery_mode, GalleryMode::Depth);
         assert_eq!(app.depth_camera.unwrap().value(), position as f32);
         assert_eq!(app.depth_camera.unwrap().target, position as f32);
-        assert!(app.depth_roll.is_none());
         assert_eq!(app.state.gallery, saved_gallery);
         assert!(!app.state_path.exists());
     }
 }
 
 #[test]
-fn d4b_exact_32_union_pins_layers_and_completion_preserves_exact_objects() {
-    let mut app = d4b_disjoint_fixture(11);
-    assert_eq!(app.depth_roll_fallbacks, 0);
-    let old = app.depth_roll.as_ref().unwrap().old.clone();
-    assert_eq!(old.len(), 21);
-    let requests = d4b_requests(&app);
-    assert_eq!(requests.len(), 11);
-    let sources = d4b_complete(&mut app, &requests, false);
-    assert_eq!(sources.len(), 11);
-    let old_layers: HashSet<_> = old.iter().map(|g| g.slot.layer).collect();
-    assert_eq!(old_layers.len(), 21);
-    assert!(sources.iter().all(|s| !old_layers.contains(&s.layer)));
-    assert_eq!(app.posters.len(), 32);
-    assert_eq!(
-        app.posters
+fn d4b_disjoint_replacements_allocate_only_current_layers_and_exact_sources() {
+    for count in [11, 21] {
+        let mut app = d4b_disjoint_fixture(count);
+        assert!(app.posters.is_empty());
+        assert!(app.poster_slots.is_empty());
+        let requests = d4b_requests(&app);
+        assert_eq!(requests.len(), count);
+        let sources = d4b_complete(&mut app, &requests, false);
+        assert_eq!(sources.len(), count);
+        assert_eq!(
+            app.posters
+                .iter()
+                .map(|p| p.layer)
+                .collect::<HashSet<_>>()
+                .len(),
+            count
+        );
+        for source in sources {
+            let slot = &app.poster_slots[&source.index];
+            assert_eq!(slot.layer, source.layer);
+            assert_eq!(slot.item_id, source.item_id);
+            assert_eq!(slot.source, source.path);
+            assert!(app
+                .posters
+                .iter()
+                .any(|p| p.layer == source.layer && p.source == source.path));
+        }
+        let params = app.depth_presentation.unwrap().params;
+        let resources = app.posters.clone();
+        for _ in 0..60 {
+            d4a_motion_tick(&mut app, 0.05);
+        }
+        let current = app.depth_presentation.unwrap().params;
+        assert_eq!(
+            (
+                current.width,
+                current.height,
+                current.spacing,
+                current.falloff,
+                current.corner_radius,
+                current.skew,
+                current.visible_count
+            ),
+            (
+                params.width,
+                params.height,
+                params.spacing,
+                params.falloff,
+                params.corner_radius,
+                params.skew,
+                params.visible_count
+            )
+        );
+        assert_eq!(app.depth_frame.as_ref().unwrap().cards.len(), count);
+        assert_eq!(d4b_requests(&app), requests);
+        assert_eq!(app.posters.len(), count);
+        assert!(resources
             .iter()
-            .map(|p| p.layer)
-            .collect::<HashSet<_>>()
-            .len(),
-        32
-    );
-    for ghost in old {
-        let slot = app.poster_slots.get(&ghost.index).unwrap();
-        assert_eq!(slot, &ghost.slot);
-        assert!(app
-            .posters
-            .iter()
-            .any(|poster| poster.same_resource(&ghost.poster)));
+            .all(|exact| app.posters.iter().any(|p| p.same_resource(exact))));
     }
-    for source in sources {
-        let slot = app.poster_slots.get(&source.index).unwrap();
-        assert_eq!(slot.layer, source.layer);
-        assert_eq!(slot.item_id, source.item_id);
-        assert_eq!(slot.source, source.path);
-        assert!(app
-            .posters
-            .iter()
-            .any(|p| p.layer == source.layer && p.source == source.path));
-    }
-    for _ in 0..60 {
-        d4a_motion_tick(&mut app, 0.05);
-    }
-    assert!(app.depth_roll.is_none());
-    assert!(app.depth_frame.as_ref().unwrap().outgoing.is_empty());
-    let requests = d4b_requests(&app);
-    d4b_complete(&mut app, &requests, false);
-    assert_eq!(app.posters.len(), 11);
-    assert!(app
-        .poster_slots
-        .keys()
-        .all(|index| app.filtered_indices.contains(index)));
 }
 
 #[test]
-fn d4b_overload_ends_only_ghost_phase_and_preserves_actual_live_layout() {
-    let mut app = d4b_disjoint_fixture(21);
-    assert_eq!(app.depth_roll_fallbacks, 1);
-    assert!(app.depth_roll.as_ref().unwrap().old.is_empty());
-    assert!(app.depth_frame.as_ref().unwrap().outgoing.is_empty());
-    assert_eq!(
-        app.depth_frame.as_ref().unwrap().live_poster_indices.len(),
-        21
-    );
-    let params = app.depth_presentation.unwrap().params;
-    let requests = d4b_requests(&app);
-    assert_eq!(requests.len(), 21);
-    let sources = d4b_complete(&mut app, &requests, false);
-    assert_eq!(sources.len(), 21);
-    assert_eq!(app.posters.len(), 21);
-    for _ in 0..60 {
-        d4a_motion_tick(&mut app, 0.05);
-    }
-    assert!(app.depth_roll.is_none());
-    let current = app.depth_presentation.unwrap().params;
-    assert_eq!(
-        [
-            current.width,
-            current.height,
-            current.spacing,
-            current.falloff,
-            current.corner_radius,
-            current.skew
-        ],
-        [
-            params.width,
-            params.height,
-            params.spacing,
-            params.falloff,
-            params.corner_radius,
-            params.skew
-        ]
-    );
-    assert_eq!(current.visible_count, params.visible_count);
-    assert_eq!(app.depth_frame.as_ref().unwrap().cards.len(), 21);
-    assert_eq!(app.depth_roll_fallbacks, 1);
-}
-
-#[test]
-fn d4b_same_cell_identity_reuse_and_media_path_catalog_rejection() {
+fn d4b_sort_reuses_current_resource_and_rejects_changed_media() {
     let (mut app, _) = d4a_fixture(21);
     app.selected = Some(10);
     app.reset_depth_transients();
     app.rebuild_depth_frame();
     d4b_seed_resident(&mut app);
+    let slot = app.poster_slots[&10].clone();
+    let exact = app
+        .posters
+        .iter()
+        .find(|p| p.layer == slot.layer)
+        .unwrap()
+        .clone();
     app.sort_order = SortOrder::Newest;
     app.refresh_filter();
     app.rebuild_depth_frame();
-    let f = app.depth_frame.as_ref().unwrap();
-    assert!(f
-        .cards
-        .iter()
-        .any(|c| c.id == "item-0010" && c.card.size[0] > 1.0));
-    assert!(!f.outgoing.iter().any(|c| c.id == "item-0010"));
-    let pins = app.depth_roll.as_ref().unwrap().old.clone();
-    let ghost = pins.first().unwrap().clone();
-    let request = PosterRequestIdentity {
-        index: ghost.index,
-        item_id: ghost.slot.item_id.clone(),
-        source: ghost.slot.source.clone(),
-        kind: ghost.slot.kind,
-    };
-    assert!(ghost_matches_request(&ghost, &request, 0));
-    assert!(
-        depth_poster_sources(&[request.clone()], &app.poster_slots, &[ghost.clone()], 0).is_empty()
-    );
-    let mut bad = request.clone();
-    bad.kind = if bad.kind == crate::poster_worker::PosterKind::Video {
-        crate::poster_worker::PosterKind::Still
-    } else {
-        crate::poster_worker::PosterKind::Video
-    };
-    assert!(!ghost_matches_request(&ghost, &bad, 0));
-    bad = request.clone();
-    bad.source = "changed-source.png".into();
-    assert!(!ghost_matches_request(&ghost, &bad, 0));
-    bad = request.clone();
-    bad.item_id = "reused-index".into();
-    assert!(!ghost_matches_request(&ghost, &bad, 0));
-    assert!(!ghost_matches_request(&ghost, &request, 1));
-    app.wallpapers[ghost.index].source = WallpaperSource::LocalVideo;
+    assert_eq!(app.poster_slots[&10], slot);
+    assert!(app.posters.iter().any(|p| p.same_resource(&exact)));
+    app.wallpapers[10].source = WallpaperSource::LocalVideo;
+    app.wallpapers[10].file_target = "changed-poster.mp4".into();
     app.rebuild_depth_frame();
-    assert!(!app
-        .depth_frame
-        .as_ref()
-        .unwrap()
-        .outgoing
-        .iter()
-        .any(|c| c.card.index == ghost.index));
-    assert!(!app
-        .depth_roll
-        .as_ref()
-        .unwrap()
-        .old
-        .iter()
-        .any(|c| c.index == ghost.index));
+    assert!(!app.poster_slots.contains_key(&10));
+    assert!(!app.posters.iter().any(|p| p.same_resource(&exact)));
 }
 
 #[test]
-fn d4b_interrupted_visual_history_is_current_bounded_and_missing_old_omitted() {
+fn d4b_rapid_filter_reversals_keep_only_current_card_ids_and_the_atlas_bound() {
     let mut app = d4b_disjoint_fixture(11);
-    let mut maximum = 0;
     for iteration in 0..80 {
         d4a_motion_tick(&mut app, 0.05);
-        let before = app.depth_frame.clone().unwrap();
-        let captured = app.capture_depth_roll().unwrap();
-        let presented: Vec<_> = before.cards.iter().chain(before.outgoing.iter()).collect();
-        let order: Vec<_> = captured
-            .old
-            .iter()
-            .map(|g| {
-                presented
-                    .iter()
-                    .position(|c| {
-                        c.id == g.body.id
-                            && c.card.center == g.body.card.center
-                            && c.card.size == g.body.card.size
-                            && c.crop_uv == g.body.crop_uv
-                    })
-                    .unwrap()
-            })
-            .collect();
-        assert!(
-            order.windows(2).all(|pair| pair[0] < pair[1]),
-            "interrupted captured stream preserves the current painter order"
-        );
-        for g in &captured.old {
-            assert!(before
-                .cards
-                .iter()
-                .chain(before.outgoing.iter())
-                .any(|c| c.id == g.body.id
-                    && c.card.center == g.body.card.center
-                    && c.card.size == g.body.card.size
-                    && c.crop_uv == g.body.crop_uv));
-        }
-        maximum = maximum.max(captured.old.len());
-        assert!(captured.old.len() <= gpu_gallery::MAX_POSTERS);
         app.sort_order = if iteration % 2 == 0 {
             SortOrder::Newest
         } else {
@@ -3255,27 +3155,26 @@ fn d4b_interrupted_visual_history_is_current_bounded_and_missing_old_omitted() {
         };
         app.refresh_filter();
         app.rebuild_depth_frame();
-        let r = app.depth_roll.as_ref().unwrap();
-        assert!(r.old.len() <= 32 && r.incoming.len() + r.completed.len() <= 24);
-        assert!(app.depth_frame.as_ref().unwrap().cards.len() <= 24);
+        let frame = app.depth_frame.as_ref().unwrap();
+        assert_eq!(frame.cards.len(), 11);
+        assert_eq!(
+            frame
+                .cards
+                .iter()
+                .map(|c| &c.id)
+                .collect::<HashSet<_>>()
+                .len(),
+            11
+        );
+        assert!(frame
+            .cards
+            .iter()
+            .all(|c| c.card.size[0] > 1.0 && app.filtered_indices.contains(&c.card.index)));
         let requests = d4b_requests(&app);
+        assert!(requests.len() <= gpu_gallery::MAX_POSTERS);
         d4b_complete(&mut app, &requests, iteration % 7 == 0);
-        assert!(app.posters.len() <= 32);
+        assert!(app.posters.len() <= gpu_gallery::MAX_POSTERS);
     }
-    assert!(maximum > 0);
-    app.depth_roll = None;
-    app.poster_slots.clear();
-    app.posters = Arc::new(Vec::new());
-    app.rebuild_depth_frame();
-    app.sort_order = if app.sort_order == SortOrder::Colour {
-        SortOrder::Newest
-    } else {
-        SortOrder::Colour
-    };
-    app.refresh_filter();
-    app.rebuild_depth_frame();
-    assert!(app.depth_frame.as_ref().unwrap().outgoing.is_empty());
-    assert!(app.depth_roll.as_ref().unwrap().old.is_empty());
 }
 
 #[test]
@@ -3283,12 +3182,11 @@ fn d4b_catalog_hide_mode_empty_reopen_same_mode_and_stale_completion_consumers()
     for path in 0..6 {
         let mut app = d4b_disjoint_fixture(11);
         let requests = d4b_requests(&app);
+        d4b_complete(&mut app, &requests, false);
         let old_generation = app.poster_generation.load(Ordering::Acquire);
         let old_motion = app.motion_generation.load(Ordering::Acquire);
-        let old = app.depth_roll.as_ref().unwrap().old.clone();
         let _ = update(&mut app, Message::SetGalleryMode(GalleryMode::Depth));
         assert_eq!(app.motion_generation.load(Ordering::Acquire), old_motion);
-        assert_eq!(app.depth_roll.as_ref().unwrap().old.len(), old.len());
         match path {
             0 => {
                 let _ = app.set_visible(false, "d4b-hide");
@@ -3313,7 +3211,7 @@ fn d4b_catalog_hide_mode_empty_reopen_same_mode_and_stale_completion_consumers()
                 let generation = app.catalog_scan_generation.fetch_add(1, Ordering::AcqRel) + 1;
                 let wallpapers = app.wallpapers.clone();
                 let mut entries = app.catalog.clone();
-                entries[0].modified_unix += 1; // A content change revokes outgoing catalog bodies.
+                entries[0].modified_unix += 1;
                 let _ = update(
                     &mut app,
                     Message::Wake(Wake::CatalogLoaded {
@@ -3322,13 +3220,17 @@ fn d4b_catalog_hide_mode_empty_reopen_same_mode_and_stale_completion_consumers()
                         entries,
                     }),
                 );
-                assert!(app.depth_roll.as_ref().unwrap().old.is_empty());
-                assert!(app.depth_frame.as_ref().unwrap().cards.is_empty());
+                let published = app.depth_frame.as_ref().unwrap();
+                assert!(!published.cards.is_empty());
+                assert!(published.cards.iter().all(|card| card.card.size[0] > 1.0));
             }
         }
-        if path != 5 {
-            assert!(app.depth_roll.is_none());
+        if path == 4 {
+            assert!(app.posters.is_empty());
+            assert!(app.depth_frame.as_ref().unwrap().cards.is_empty());
         }
+        let settled = app.posters.clone();
+        let slots = app.poster_slots.clone();
         let source = poster_worker::PosterSource {
             index: requests[0].index,
             layer: 0,
@@ -3354,79 +3256,54 @@ fn d4b_catalog_hide_mode_empty_reopen_same_mode_and_stale_completion_consumers()
             )
             .unwrap();
         let _ = update(&mut app, Message::Wake(Wake::PostersReady));
-        assert!(
-            !app.posters
-                .iter()
-                .any(|p| old.iter().any(|g| p.same_resource(&g.poster))),
-            "lifetime path {path}"
-        );
+        assert!(Arc::ptr_eq(&app.posters, &settled), "lifetime path {path}");
+        assert_eq!(app.poster_slots, slots);
         assert!(app.motion_generation.load(Ordering::Acquire) > old_motion);
         if path <= 2 {
             let _ = app.set_visible(true, "d4b-reopen");
-            assert!(app.depth_roll.is_none());
+            assert!(app.visible);
         }
     }
 }
 
 #[test]
-fn d4b_cut_render_hit_detail_revision_and_ghost_noninteraction() {
+fn d4b_full_card_render_hit_and_detail_reject_stale_revision() {
     let mut app = d4b_disjoint_fixture(11);
     d4a_motion_tick(&mut app, 0.05);
     let stale = app.depth_frame.as_ref().unwrap().revision;
-    let old = app
-        .depth_frame
-        .as_ref()
-        .unwrap()
-        .outgoing
-        .first()
-        .unwrap()
-        .clone();
-    assert!(app
-        .depth_frame
-        .as_ref()
-        .unwrap()
-        .hit(old.card.center[0], old.card.center[1])
-        .is_none());
-    let _ = update(
-        &mut app,
-        Message::DepthDonorDetail(
-            stale,
-            old.id.clone(),
-            donor_back_layout::DetailIntent::Apply,
-        ),
-    );
-    assert!(!app.apply_pending);
     for _ in 0..5 {
         d4a_motion_tick(&mut app, 0.05);
     }
     let frame = app.depth_frame.as_ref().unwrap();
     let raw = donor_scene::depth_instances(frame, &GalleryColors::default(), 1.0, &d4a_scene(&app));
-    assert_eq!(raw.len(), frame.cards.len() + frame.outgoing.len());
-    for (body, instance) in frame.cards.iter().chain(frame.outgoing.iter()).zip(&raw) {
+    assert_eq!(raw.len(), frame.cards.len());
+    for (body, instance) in frame.cards.iter().zip(&raw) {
         assert_eq!(instance.rect[..2], body.card.center);
         assert_eq!(instance.rect[2], body.card.size[0] * 0.5);
         assert_eq!(instance.crop, body.crop_uv);
-        if frame.cards.iter().any(|c| std::ptr::eq(c, body)) {
-            let expected = frame.cards.iter().rev().find(|c| {
-                donor_layout::depth_contains(
-                    c.card.center,
-                    c.card.size,
-                    c.card.skew_distance,
-                    [c.card.corner_radius; 4],
-                    body.card.center,
-                )
-            });
-            assert_eq!(
-                frame
-                    .hit(body.card.center[0], body.card.center[1])
-                    .map(|c| &c.id),
-                expected.map(|c| &c.id)
-            );
-        } else {
-            assert_eq!(instance.flip[0], 0.0);
-        }
+        let expected = frame.cards.iter().rev().find(|c| {
+            donor_layout::depth_contains(
+                c.card.center,
+                c.card.size,
+                c.card.skew_distance,
+                [c.card.corner_radius; 4],
+                body.card.center,
+            )
+        });
+        assert_eq!(
+            frame
+                .hit(body.card.center[0], body.card.center[1])
+                .map(|c| &c.id),
+            expected.map(|c| &c.id)
+        );
     }
     let identity = app.wallpapers[app.selected.unwrap()].id.clone();
+    app.detail_open = true;
+    app.detail_progress = 1.0;
+    app.depth_detail_id = Some(identity.clone());
+    let revision = app.depth_frame.as_ref().unwrap().revision;
+    assert!(detail_controls_active(&app));
+    let before = app.state.favorites.contains(&identity);
     let _ = update(
         &mut app,
         Message::DepthDonorDetail(
@@ -3435,13 +3312,7 @@ fn d4b_cut_render_hit_detail_revision_and_ghost_noninteraction() {
             donor_back_layout::DetailIntent::Favorite,
         ),
     );
-    assert!(!app.state.favorites.contains(&identity) || app.filter_rule.favorites_only);
-    app.detail_open = true;
-    app.detail_progress = 1.0;
-    app.depth_detail_id = Some(identity.clone());
-    let revision = app.depth_frame.as_ref().unwrap().revision;
-    assert!(detail_controls_active(&app));
-    let before = app.state.favorites.contains(&identity);
+    assert_eq!(app.state.favorites.contains(&identity), before);
     let _ = update(
         &mut app,
         Message::DepthDonorDetail(
@@ -3454,44 +3325,10 @@ fn d4b_cut_render_hit_detail_revision_and_ghost_noninteraction() {
 }
 
 #[test]
-fn d4b_finish_and_overload_release_without_completion_or_demand_change() {
+fn d4b_stalled_gui_latest_slot_stale_rejection_and_failure_retry() {
     let mut app = d4b_disjoint_fixture(11);
     let requests = d4b_requests(&app);
-    d4b_complete(&mut app, &requests, false);
-    let old = app.depth_roll.as_ref().unwrap().old.clone();
-    for _ in 0..40 {
-        d4a_motion_tick(&mut app, 0.05);
-    }
-    assert!(app.depth_roll.is_none());
-    assert_eq!(
-        requests,
-        d4b_requests(&app),
-        "same live demand cannot defer ghost release"
-    );
-    assert!(!app
-        .posters
-        .iter()
-        .any(|p| old.iter().any(|g| p.same_resource(&g.poster))));
-    assert_eq!(app.posters.len(), 11);
-    assert!(app
-        .poster_slots
-        .keys()
-        .all(|i| app.filtered_indices.contains(i)));
-    let mut app = d4b_disjoint_fixture(21);
-    assert_eq!(app.depth_roll_fallbacks, 1);
-    assert!(
-        app.posters.is_empty(),
-        "overload releases outgoing pixels immediately, before any new completion"
-    );
-    assert!(app.poster_slots.is_empty());
-}
-
-#[test]
-fn d4b_stalled_gui_latest_slot_stale_rejection_and_failure_retry_preserve_pins() {
-    let mut app = d4b_disjoint_fixture(11);
-    let pins = app.depth_roll.as_ref().unwrap().old.clone();
-    let requests = d4b_requests(&app);
-    let sources = depth_poster_sources(&requests, &app.poster_slots, &pins, 0);
+    let sources = d4b_sources(&app, &requests);
     let wakes = std::sync::atomic::AtomicUsize::new(0);
     let make = |generation| poster_worker::PosterCompletion {
         generation,
@@ -3547,7 +3384,7 @@ fn d4b_stalled_gui_latest_slot_stale_rejection_and_failure_retry_preserve_pins()
                 }
             }
             _ => {
-                first.source.layer = pins[0].slot.layer;
+                first.source.layer = sources[1].layer;
                 first.poster =
                     gpu_gallery::video_placeholder_poster(&first.source.path, first.source.layer);
             }
@@ -3559,10 +3396,7 @@ fn d4b_stalled_gui_latest_slot_stale_rejection_and_failure_retry_preserve_pins()
             .unwrap();
     }
     let _ = update(&mut app, Message::Wake(Wake::PostersReady));
-    assert_eq!(app.posters.len(), 32);
-    for pin in &pins {
-        assert!(app.posters.iter().any(|p| p.same_resource(&pin.poster)));
-    }
+    assert_eq!(app.posters.len(), 11);
     assert!(app.poster_mailbox.take().unwrap().is_none());
     let generation = app.poster_generation.load(Ordering::Acquire);
     app.poster_mailbox
@@ -3596,20 +3430,17 @@ fn d4b_stalled_gui_latest_slot_stale_rejection_and_failure_retry_preserve_pins()
     d4b_complete(&mut app, &requests, true);
     assert!(
         app.poster_failure,
-        "outgoing-only pins do not hide failed current live decoding"
+        "empty completion must report failed current decoding"
     );
-    assert_eq!(app.posters.len(), 21);
-    for pin in &pins {
-        assert!(app.posters.iter().any(|p| p.same_resource(&pin.poster)));
-    }
+    assert!(app.posters.is_empty());
     app.invalidate_poster_work();
     d4b_complete(&mut app, &requests, false);
     assert!(!app.poster_failure);
-    assert_eq!(app.posters.len(), 32);
+    assert_eq!(app.posters.len(), 11);
 }
 
 #[test]
-fn d4b_resize_geometry_style_and_detail_edits_cancel_only_obsolete_roll() {
+fn d4b_resize_geometry_style_and_detail_edits_preserve_current_camera() {
     for kind in 0..4 {
         let mut app = d4b_disjoint_fixture(11);
         d4a_motion_tick(&mut app, 0.05);
@@ -3631,8 +3462,6 @@ fn d4b_resize_geometry_style_and_detail_edits_cancel_only_obsolete_roll() {
             2 => app.edit_depth(|d| d.shadows = !d.shadows),
             _ => app.edit_depth(|d| d.detail.animate_back = !d.detail.animate_back),
         }
-        assert!(app.depth_roll.is_none());
-        assert!(app.depth_frame.as_ref().unwrap().outgoing.is_empty());
         assert_eq!(app.selected, selection);
         assert_eq!(app.depth_camera.unwrap().x, camera);
         assert!(app
@@ -3643,38 +3472,7 @@ fn d4b_resize_geometry_style_and_detail_edits_cancel_only_obsolete_roll() {
 }
 
 #[test]
-fn d4b_presented_history_bound_has_explicit_fallback_with_shared_textures() {
-    let (mut app, _) = d4a_fixture(64);
-    app.selected = Some(20);
-    app.state.gallery.depth.visible_count = 21.0;
-    app.depth_presentation = None;
-    app.reset_depth_transients();
-    app.rebuild_depth_frame();
-    d4b_seed_resident(&mut app);
-    let live = app.depth_frame.as_ref().unwrap().cards.clone();
-    assert_eq!(live.len(), 21);
-    let outgoing = (0..32)
-        .map(|i| {
-            let mut body = live[i % live.len()].clone();
-            body.card.center[0] = 20.0 + 10.0 * i as f32;
-            body
-        })
-        .collect();
-    app.depth_frame.as_mut().unwrap().outgoing = outgoing;
-    let captured = app.capture_depth_roll().unwrap();
-    assert_eq!(app.depth_roll_fallbacks, 1);
-    assert!(captured.old.is_empty(),"history above 32 ends the outgoing phase rather than truncating/sorting/snapping stored scenes");
-    assert_eq!(captured.wave, 0.0);
-    assert_eq!(app.depth_frame.as_ref().unwrap().cards.len(), 21);
-    assert_eq!(
-        app.posters.len(),
-        21,
-        "many visual pieces do not allocate more texture objects"
-    );
-}
-
-#[test]
-fn d4b_reused_middle_cell_stays_complete_across_actual_rebuilds_and_motion() {
+fn d4b_reused_middle_card_keeps_full_geometry_across_rebuilds_and_motion() {
     let (mut app, _) = d4a_fixture(21);
     app.selected = Some(10);
     app.reset_depth_transients();
@@ -3718,21 +3516,13 @@ fn d4b_reused_middle_cell_stays_complete_across_actual_rebuilds_and_motion() {
                 .map(|c| c.id.as_str()),
             Some("item-0010")
         );
-        assert!(!frame.outgoing.iter().any(|c| c.id == "item-0010"));
+        assert_eq!(
+            frame.cards.iter().filter(|c| c.id == "item-0010").count(),
+            1
+        );
         assert!(detail_controls_active(&app));
         assert!(frame.revision > first);
     }
-    let cell = gpu_gallery::depth_roll_cell(expected.card.center);
-    let roll = app.depth_roll.as_ref().unwrap();
-    assert_eq!(
-        roll.completed.get(&cell).unwrap().identity.item_id,
-        "item-0010"
-    );
-    assert!(roll.incoming.len() + roll.completed.len() <= 24);
-    app.wallpapers[10].preview_path = Some("new-exact-source.png".into());
-    app.rebuild_depth_frame();
-    assert!(!app.depth_roll.as_ref().unwrap().completed.contains_key(&cell),
-            "reused ID at the same cell cannot keep a completed marker after path/media identity replacement");
 }
 
 #[test]
@@ -3934,7 +3724,6 @@ fn p310_motion_marker_drains_latest_and_rejects_hidden_or_stale_frames() {
         state: GalleryMotionState::absolute_camera(value, value, 250.0, 50.0, 50.0),
         selection: Default::default(),
         presentation: None,
-        filter_wave: None,
         ordinary: None,
         hex: None,
         wall: None,
@@ -3999,14 +3788,6 @@ fn d4a_motion_tick(app: &mut GpuCandidate, dt: f32) -> bool {
             hex: None,
             wall: None,
             scene: None,
-            filter_wave: app.depth_roll.as_ref().map(|r| {
-                (r.wave
-                    + gpu_gallery::depth_roll_step(
-                        dt,
-                        app.state.gallery_motion_speed.duration_ms() as f32,
-                    ))
-                .min(1.6)
-            }),
         },
         &app.motion_generation,
         || true,
@@ -4162,7 +3943,6 @@ fn d4a_morph_frame_demand_hits_resize_and_stale_generation_share_current_geometr
             state: camera,
             selection: HashMap::new(),
             presentation: Some(start),
-            filter_wave: None,
             ordinary: None,
             hex: None,
             wall: None,
@@ -4762,7 +4542,6 @@ fn d3_actual_consumer_camera_detail_and_mailbox_lifetimes() {
                 state: camera,
                 selection: HashMap::new(),
                 presentation: None,
-                filter_wave: None,
                 ordinary: None,
                 hex: None,
                 wall: None,
@@ -4787,7 +4566,6 @@ fn d3_actual_consumer_camera_detail_and_mailbox_lifetimes() {
                 state: stale,
                 selection: HashMap::new(),
                 presentation: None,
-                filter_wave: None,
                 ordinary: None,
                 hex: None,
                 wall: None,
@@ -4817,7 +4595,6 @@ fn d3_actual_consumer_camera_detail_and_mailbox_lifetimes() {
                 state: stale,
                 selection: HashMap::new(),
                 presentation: None,
-                filter_wave: None,
                 ordinary: None,
                 hex: None,
                 wall: None,
@@ -5636,6 +5413,7 @@ fn d3_actual_widget_publication_and_consumer_keep_ids_and_button_semantics() {
         poster_feedback: None,
         snapshot: Arc::new(GallerySnapshot {
             defer_near_restore: false,
+            held_wall: None,
             ordinary: None,
             cards: frame.cards.iter().map(|c| c.card).collect(),
             wall_clip: None,

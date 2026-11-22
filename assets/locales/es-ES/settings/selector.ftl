@@ -1,8 +1,8 @@
 settings-selector-layout-card = Diseño
 settings-selector-display-mode-label = Modo de visualización
 settings-selector-display-mode-desc = Elige cómo se ordenan las tarjetas de fondos en el selector.
-settings-selector-filter-motion-label = Movimiento del filtro
-settings-selector-filter-motion-desc = Qué tan rápido gira el rollo cuando cambian los resultados del filtro. Los tres pesos compartidos están en los ajustes de Movimiento.
+settings-selector-filter-motion-label = Velocidad de movimiento de la galería
+settings-selector-filter-motion-desc = Controla la velocidad de movimiento en la galería.
 settings-selector-presets-card = Preajustes
 settings-selector-presets-card-desc = Guarda los ajustes de diseño actuales o aplica un conjunto guardado. Cada modo de visualización mantiene sus propios preajustes.
 settings-selector-preset-name-label = Nombre

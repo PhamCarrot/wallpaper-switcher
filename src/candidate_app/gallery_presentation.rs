@@ -847,11 +847,11 @@ impl GpuCandidate {
     }
 
     /// One current frame supplies the snapshot and the poster requester.
-    pub(super) fn ordinary_base_frame(&self) -> Vec<CardPresentation> {
-        self.ordinary_base_frame_with_source_selector(poster_media_for_item)
+    pub(super) fn ordinary_frame(&self) -> Vec<CardPresentation> {
+        self.ordinary_frame_with_source_selector(poster_media_for_item)
     }
 
-    pub(super) fn ordinary_base_frame_with_source_selector(
+    pub(super) fn ordinary_frame_with_source_selector(
         &self,
         mut select_source: impl FnMut(&WallpaperItem) -> (std::path::PathBuf, poster_worker::PosterKind),
     ) -> Vec<CardPresentation> {
@@ -1017,10 +1017,6 @@ impl GpuCandidate {
             };
             result.push(CardPresentation {
                 card,
-                outgoing: false,
-                roll: 1.0,
-                captured_raw: None,
-                retained: None,
                 id: wallpaper.id.clone(),
                 source,
                 catalog_generation: self.catalog_generation.load(Ordering::Acquire),
@@ -1075,7 +1071,7 @@ impl GpuCandidate {
         if let Some(card) = self.external_detail_card() {
             indices.push(card.index);
         }
-        for entry in self.ordinary_base_frame().iter().rev() {
+        for entry in self.ordinary_frame().iter().rev() {
             if indices.len() >= limit {
                 break;
             }
@@ -1137,7 +1133,7 @@ impl GpuCandidate {
         let mut union: HashSet<_> = indices
             .iter()
             .copied()
-            .chain(self.gallery_pins().iter().map(|pin| pin.index))
+            .chain(self.wall_colour_pins().iter().map(|pin| pin.index))
             .collect();
         for index in prefetch {
             if indices.len() >= request_limit {
@@ -1158,7 +1154,7 @@ impl GpuCandidate {
         if self.gallery_mode == GalleryMode::Depth {
             return None;
         }
-        self.ordinary_capacity_issue_for_frame(&self.ordinary_base_frame())
+        self.ordinary_capacity_issue_for_frame(&self.ordinary_frame())
     }
 
     pub(super) fn ordinary_capacity_issue_for_frame(
@@ -1171,11 +1167,7 @@ impl GpuCandidate {
         ) {
             return None;
         }
-        let mut required: HashSet<_> = frame
-            .iter()
-            .filter(|e| !e.outgoing)
-            .map(|e| e.card.index)
-            .collect();
+        let mut required: HashSet<_> = frame.iter().map(|e| e.card.index).collect();
         if let Some(card) = self.external_detail_card() {
             required.insert(card.index);
         }
@@ -1271,4 +1263,47 @@ pub(super) fn position_crop(aspect: f32, crop: [f32; 4], position: f32, zoom: f3
         w,
         h,
     ]
+}
+
+impl GpuCandidate {
+    pub(super) fn external_detail_card(&self) -> Option<gpu_gallery::SliceCard> {
+        if !self.detail_open
+            || !matches!(
+                self.gallery_mode,
+                GalleryMode::Wall | GalleryMode::Geometric
+            )
+        {
+            return None;
+        }
+        let index = self.selected?;
+        let w = self.wallpapers.get(index)?;
+        if self.depth_detail_id.as_deref() != Some(w.id.as_str()) {
+            return None;
+        }
+        let g = self.detail_source?;
+        let slot = self.poster_slots.get(&index).filter(|s| {
+            s.catalog_generation == self.catalog_generation.load(Ordering::Acquire)
+                && poster_slot_matches(s, w)
+        });
+        let poster = slot.and_then(|s| {
+            self.posters
+                .iter()
+                .find(|p| p.layer == s.layer && p.source == s.source)
+        });
+        Some(gpu_gallery::SliceCard {
+            triangle_direction: 0,
+            index,
+            center: g.center,
+            size: g.size,
+            layer: poster.map(|p| p.layer),
+            selected: true,
+            opacity: 1.0,
+            skew_distance: g.skew_distance,
+            edge_tilt_distance: g.edge_tilt_distance,
+            rotation: g.rotation,
+            corner_radius: 0.0,
+            shape: 0,
+            poster_aspect_ratio: poster.map_or(16.0 / 9.0, |p| p.aspect_ratio),
+        })
+    }
 }

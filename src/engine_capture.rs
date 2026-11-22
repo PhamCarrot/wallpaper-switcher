@@ -1,14 +1,23 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use windows::Graphics::Capture::GraphicsCaptureItem;
+use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext};
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows_sys::Win32::UI::HiDpi::{
+    SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, GetAncestor, GetClassNameW, GetDesktopWindow, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, GA_ROOT,
+    EnumChildWindows, GetAncestor, GetClassNameW, GetDesktopWindow, GetShellWindow, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, IsChild, IsWindowVisible, GA_PARENT, GA_ROOT,
 };
 
+use crate::desktop_transition::desktop_icon_view;
 use crate::monitor::DesktopRect;
 use crate::transition::FrozenFrame;
 
@@ -54,7 +63,9 @@ fn presenter_overlap(window: &EngineWindow, target: DesktopRect) -> Result<i64, 
         return Err("hidden");
     }
     if window.class_name == "WPEEventWindow"
-        || (!window.class_name.starts_with("WPEDesktop") && window.title != "WPELiveWallpaper")
+        || (window.class_name != "WPEVideoWallpaper"
+            && !window.class_name.starts_with("WPEDesktop")
+            && window.title != "WPELiveWallpaper")
     {
         return Err("not-a-presenter");
     }
@@ -72,6 +83,7 @@ struct ApplyCapture {
     phase: &'static str,
     endpoint: (usize, u32),
     overlay_windows: Vec<usize>,
+    progress: Arc<Mutex<String>>,
 }
 
 pub(crate) fn capture_for_apply(
@@ -88,6 +100,7 @@ pub(crate) fn capture_for_apply(
         phase,
         endpoint,
         overlay_windows: overlay_windows.to_vec(),
+        progress: Arc::default(),
     };
     crate::apply_trace::event_for_lazy(operation, "transition-engine-capture-start", || {
         format!("display={display:?} phase={phase} endpoint={endpoint:?} target={target:?}")
@@ -187,6 +200,9 @@ fn capture_frame_with_worker(
 ) -> CaptureResponse {
     let deadline = Instant::now() + timeout;
     let busy = CaptureBusyGuard::acquire(busy)?;
+    let progress = capture
+        .as_ref()
+        .map(|details| Arc::clone(&details.progress));
     // Keep disconnection cleanup bound to this sender, even if the worker
     // releases busy before this caller receives its response.
     let mut worker = worker.lock().unwrap_or_else(|error| error.into_inner());
@@ -222,9 +238,18 @@ fn capture_frame_with_worker(
     match response_receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(result) => result,
         Err(error) => Err(match error {
-            mpsc::RecvTimeoutError::Timeout => {
-                "Wallpaper Engine frame capture exceeded its 5-second deadline".to_string()
-            }
+            mpsc::RecvTimeoutError::Timeout => match progress {
+                Some(progress) => {
+                    let stage = progress.lock().unwrap_or_else(|error| error.into_inner());
+                    if stage.is_empty() {
+                        "Wallpaper Engine timed out before the capture worker began processing"
+                            .into()
+                    } else {
+                        format!("Wallpaper Engine capture deadline exceeded: {stage}")
+                    }
+                }
+                None => "Wallpaper Engine frame capture exceeded its 5-second deadline".into(),
+            },
             mpsc::RecvTimeoutError::Disconnected => {
                 *worker = None;
                 "The Wallpaper Engine capture worker did not return a frame".to_string()
@@ -414,10 +439,18 @@ mod capture_submission_tests {
             &BUSY,
             &worker,
             Duration::from_millis(100),
-            None,
+            Some(ApplyCapture {
+                operation: 0,
+                display: "test-display".into(),
+                phase: "incoming",
+                endpoint: (0, 0),
+                overlay_windows: Vec::new(),
+                progress: Arc::default(),
+            }),
             |rx| {
                 thread = Some(std::thread::spawn(move || {
-                    respond_to_capture(rx.recv().unwrap(), |_, _, _| {
+                    respond_to_capture(rx.recv().unwrap(), |_, _, details| {
+                        record_stage(&details.unwrap().progress, "waiting for an incoming frame");
                         release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
                         Ok(frame())
                     });
@@ -427,7 +460,9 @@ mod capture_submission_tests {
                 Ok(())
             },
         );
-        assert!(result.unwrap_err().contains("exceeded"));
+        let error = result.unwrap_err();
+        assert!(error.contains("deadline exceeded"));
+        assert!(error.contains("waiting for an incoming frame"));
         assert!(BUSY.load(Ordering::Acquire));
         let refused = capture_frame_with_worker(
             target(),
@@ -523,7 +558,7 @@ fn capture_worker(receiver: mpsc::Receiver<CaptureRequest>) {
             match (&initialized, details) {
                 (Ok(_), Some(details)) => {
                     crate::apply_trace::with_operation(details.operation, || {
-                        capture_frame_wgc_on_worker(target, deadline, &details)
+                        capture_frame_on_worker(target, deadline, &details)
                     })
                 }
                 (Err(error), _) => Err(error.clone()),
@@ -550,6 +585,27 @@ struct CaptureWindow {
     presenter_rect: DesktopRect,
     root: HWND,
     source_rect: DesktopRect,
+}
+
+struct PhysicalWindowCoordinates(DPI_AWARENESS_CONTEXT);
+
+impl PhysicalWindowCoordinates {
+    fn enter() -> Result<Self, String> {
+        let previous =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        if previous.is_null() {
+            return Err(last_error(
+                "Could not use physical window coordinates for capture",
+            ));
+        }
+        Ok(Self(previous))
+    }
+}
+
+impl Drop for PhysicalWindowCoordinates {
+    fn drop(&mut self) {
+        unsafe { SetThreadDpiAwarenessContext(self.0) };
+    }
 }
 
 impl CaptureWindow {
@@ -584,17 +640,21 @@ fn wait_for_presenter<T>(
     deadline: Instant,
     mut attempt: impl FnMut() -> Result<PresenterAttempt<T>, String>,
 ) -> Result<T, String> {
+    let mut last_rejection = None;
     loop {
         if Instant::now() >= deadline {
-            return Err("The presenter did not become ready before the capture deadline".into());
+            return Err(last_rejection.unwrap_or_else(|| {
+                "The presenter did not become ready before the capture deadline".into()
+            }));
         }
         match attempt()? {
             PresenterAttempt::Ready(ready) => return Ok(ready),
             PresenterAttempt::Retry(reason) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining <= Duration::from_millis(20) {
+                if remaining.is_zero() {
                     return Err(reason);
                 }
+                last_rejection = Some(reason);
                 std::thread::sleep(remaining.min(Duration::from_millis(30)));
             }
         }
@@ -633,25 +693,7 @@ fn current_capture_window(
             eligible.push(candidate);
         }
     }
-    match choose_presenter(eligible, target) {
-        PresenterAttempt::Ready(window)
-            if shares_capture_root(window.root, target, &details.overlay_windows) =>
-        {
-            if log_candidates {
-                crate::apply_trace::event_lazy("transition-engine-shared-capture-root", || {
-                    format!(
-                        "display={:?} phase={} candidate={window:?} overlays={:?}",
-                        details.display, details.phase, details.overlay_windows
-                    )
-                });
-            }
-            Ok(PresenterAttempt::Retry(
-                "The Wallpaper Engine capture host also contains the visible transition surface"
-                    .into(),
-            ))
-        }
-        result => Ok(result),
-    }
+    Ok(choose_presenter(eligible, target))
 }
 
 fn covers(outer: DesktopRect, inner: DesktopRect) -> bool {
@@ -696,6 +738,196 @@ fn shares_capture_root(root: HWND, target: DesktopRect, overlay_windows: &[usize
     })
 }
 
+fn contains_overlay(presenter: HWND, overlays: &[usize]) -> bool {
+    overlays
+        .iter()
+        .any(|hwnd| unsafe { *hwnd as HWND == presenter || IsChild(presenter, *hwnd as HWND) != 0 })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WallpaperWorker {
+    hwnd: HWND,
+    rect: DesktopRect,
+    thread: u32,
+    process: u32,
+}
+
+fn wallpaper_worker(
+    window: &CaptureWindow,
+    target: DesktopRect,
+    overlays: &[usize],
+    shell: HWND,
+) -> Result<WallpaperWorker, &'static str> {
+    if shell.is_null() || window.root != shell || desktop_icon_view(shell).is_null() {
+        return Err("presenter is not under the shell desktop with a sibling icon view");
+    }
+    let hwnd = unsafe { GetAncestor(window.presenter, GA_PARENT) };
+    let mut shell_process = 0;
+    let mut process = 0;
+    let thread = unsafe {
+        GetWindowThreadProcessId(shell, &mut shell_process);
+        GetWindowThreadProcessId(hwnd, &mut process)
+    };
+    if thread == 0
+        || process == 0
+        || process != shell_process
+        || unsafe { GetAncestor(hwnd, GA_PARENT) } != shell
+        || unsafe { window_string(hwnd, GetClassNameW) } != "WorkerW"
+        || unsafe { IsWindowVisible(hwnd) } == 0
+    {
+        return Err("presenter has no visible intermediate WorkerW owned by the shell");
+    }
+    let rect = window_rect(hwnd)
+        .filter(|rect| covers(*rect, target))
+        .ok_or("WorkerW does not cover the physical target display")?;
+    if contains_overlay(hwnd, overlays) {
+        return Err("WorkerW contains the outgoing transition cover");
+    }
+
+    struct Children {
+        presenter: HWND,
+        found: bool,
+        rejection: Option<&'static str>,
+    }
+    unsafe extern "system" fn inspect(hwnd: HWND, param: LPARAM) -> BOOL {
+        let children = &mut *(param as *mut Children);
+        let class = window_string(hwnd, GetClassNameW);
+        children.rejection = match class.as_str() {
+            "SHELLDLL_DefView" | "SysListView32" => Some("WorkerW contains desktop icons"),
+            crate::desktop_transition::CLASS_NAME => Some("WorkerW contains a transition cover"),
+            _ if hwnd == children.presenter => {
+                children.found = true;
+                None
+            }
+            _ if IsWindowVisible(hwnd) != 0 => Some("WorkerW contains another visible window"),
+            _ => None,
+        };
+        i32::from(children.rejection.is_none())
+    }
+    let mut children = Children {
+        presenter: window.presenter,
+        found: false,
+        rejection: None,
+    };
+    unsafe {
+        EnumChildWindows(
+            hwnd,
+            Some(inspect),
+            (&mut children as *mut Children) as LPARAM,
+        )
+    };
+    if let Some(reason) = children.rejection {
+        return Err(reason);
+    }
+    if !children.found {
+        return Err("WorkerW no longer contains the selected presenter");
+    }
+    Ok(WallpaperWorker {
+        hwnd,
+        rect,
+        thread,
+        process,
+    })
+}
+
+const UNWRITTEN_PIXEL: u8 = 91;
+
+/// Copy the window into an owned top-down bitmap, retaining the fourth byte
+/// until the target crop has been checked for unwritten pixels.
+fn copy_window_pixels(hwnd: HWND, rect: DesktopRect) -> Result<FrozenFrame, String> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, SelectObject,
+        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+    };
+    use windows_sys::Win32::Storage::Xps::PrintWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsHungAppWindow, PW_RENDERFULLCONTENT};
+
+    struct WindowBuffer {
+        dc: HDC,
+        bitmap: HBITMAP,
+        previous: HGDIOBJ,
+    }
+    impl Drop for WindowBuffer {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.previous.is_null() {
+                    SelectObject(self.dc, self.previous);
+                }
+                DeleteDC(self.dc);
+                if !self.bitmap.is_null() {
+                    DeleteObject(self.bitmap);
+                }
+            }
+        }
+    }
+
+    let width = rect.width();
+    let height = rect.height();
+    let len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|bytes| *bytes > 0 && *bytes <= isize::MAX as usize)
+        .ok_or("invalid bitmap dimensions")?;
+    if unsafe { IsHungAppWindow(hwnd) } != 0 {
+        return Err("the window is unresponsive".into());
+    }
+    let dc = unsafe { CreateCompatibleDC(null_mut()) };
+    if dc.is_null() {
+        return Err(last_error(
+            "Could not create the presenter capture device context",
+        ));
+    }
+    let mut buffer = WindowBuffer {
+        dc,
+        bitmap: null_mut(),
+        previous: null_mut(),
+    };
+    let mut info: BITMAPINFO = unsafe { std::mem::zeroed() };
+    info.bmiHeader = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: width as i32,
+        biHeight: -(height as i32),
+        biPlanes: 1,
+        biBitCount: 32,
+        biCompression: BI_RGB,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let mut bits = null_mut();
+    buffer.bitmap =
+        unsafe { CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0) };
+    if buffer.bitmap.is_null() || bits.is_null() {
+        return Err(last_error(
+            "Could not allocate the presenter capture bitmap",
+        ));
+    }
+    buffer.previous = unsafe { SelectObject(dc, buffer.bitmap) };
+    if buffer.previous.is_null() {
+        return Err(last_error("Could not select the presenter capture bitmap"));
+    }
+    unsafe {
+        std::ptr::write_bytes(bits.cast::<u8>(), UNWRITTEN_PIXEL, len);
+        // The request's busy guard stays with this worker if the synchronous
+        // window copy outlives the caller's deadline.
+        if PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT) == 0 {
+            return Err("Windows could not copy pixels from the window".into());
+        }
+        if GdiFlush() == 0 {
+            return Err("Windows could not finish copying the window".into());
+        }
+        let bgra = std::slice::from_raw_parts(bits.cast::<u8>(), len);
+        let mut rgba = Vec::with_capacity(len);
+        for pixel in bgra.chunks_exact(4) {
+            rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+        }
+        Ok(FrozenFrame {
+            width,
+            height,
+            rgba,
+        })
+    }
+}
+
 fn validate_capture_target(target: DesktopRect, details: &ApplyCapture) -> Result<(), String> {
     let current = crate::native_wallpaper::monitor_rect_in_current_apartment(&details.display)?;
     if current != target {
@@ -704,124 +936,343 @@ fn validate_capture_target(target: DesktopRect, details: &ApplyCapture) -> Resul
     Ok(())
 }
 
-fn capture_frame_wgc_on_worker(
+fn record_stage(progress: &Mutex<String>, stage: impl Into<String>) {
+    *progress.lock().unwrap_or_else(|error| error.into_inner()) = stage.into();
+}
+
+struct CaptureGraphics {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    winrt: IDirect3DDevice,
+    interop: IGraphicsCaptureItemInterop,
+}
+
+impl CaptureGraphics {
+    fn new() -> Result<Self, String> {
+        use windows::core::{factory, Interface};
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::Graphics::Direct3D::{
+            D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP,
+        };
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11CreateDevice, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+        };
+        use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
+        fn create_device(
+            driver: D3D_DRIVER_TYPE,
+        ) -> windows::core::Result<(ID3D11Device, ID3D11DeviceContext)> {
+            let mut device = None;
+            let mut context = None;
+            unsafe {
+                D3D11CreateDevice(
+                    None,
+                    driver,
+                    HMODULE::default(),
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                    None,
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )?;
+            }
+            Ok((device.unwrap(), context.unwrap()))
+        }
+
+        let (device, context) = create_device(D3D_DRIVER_TYPE_HARDWARE)
+            .or_else(|_| create_device(D3D_DRIVER_TYPE_WARP))
+            .map_err(|error| format!("Could not create a capture graphics device: {error}"))?;
+        let dxgi: IDXGIDevice = device
+            .cast()
+            .map_err(|error| format!("Could not access the DXGI capture device: {error}"))?;
+        let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }
+            .map_err(|error| format!("Could not bridge the capture device to WinRT: {error}"))?;
+        let winrt = inspectable
+            .cast()
+            .map_err(|error| format!("Could not access the WinRT capture device: {error}"))?;
+        let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+            .map_err(|error| format!("Windows Graphics Capture is unavailable: {error}"))?;
+        Ok(Self {
+            device,
+            context,
+            winrt,
+            interop,
+        })
+    }
+
+    fn read_window(
+        &self,
+        hwnd: HWND,
+        deadline: Instant,
+        current: &impl Fn() -> bool,
+        progress: &Mutex<String>,
+    ) -> Result<PresenterAttempt<FrozenFrame>, String> {
+        if Instant::now() >= deadline {
+            return Ok(PresenterAttempt::Retry(
+                "The Wallpaper Engine capture surface was not ready within the frame budget".into(),
+            ));
+        }
+        if !current() {
+            return Ok(PresenterAttempt::Retry(
+                "The Wallpaper Engine capture surface moved or was replaced".into(),
+            ));
+        }
+        record_stage(progress, "creating the Windows Graphics Capture item");
+        let item: GraphicsCaptureItem = unsafe {
+            self.interop
+                .CreateForWindow(windows::Win32::Foundation::HWND(hwnd))
+        }
+        .map_err(|error| {
+            format!("Could not target the Wallpaper Engine capture surface: {error}")
+        })?;
+        read_capture_item(
+            &item,
+            &self.winrt,
+            &self.device,
+            &self.context,
+            deadline,
+            current,
+            progress,
+        )
+    }
+}
+
+fn read_presenter(
+    graphics: &mut Option<CaptureGraphics>,
+    window: &CaptureWindow,
+    target: DesktopRect,
+    overlays: &[usize],
+    deadline: Instant,
+    presenter_current: impl Fn() -> bool,
+    progress: &Mutex<String>,
+    shell_root: impl Fn() -> HWND,
+) -> Result<PresenterAttempt<FrozenFrame>, String> {
+    let needs_isolation = || {
+        shares_capture_root(window.root, target, overlays)
+            || (window.presenter != window.root && !desktop_icon_view(window.root).is_null())
+    };
+    let isolate = needs_isolation();
+    let current = || {
+        presenter_current()
+            && if isolate {
+                !contains_overlay(window.presenter, overlays)
+            } else {
+                !needs_isolation()
+            }
+    };
+    if !current() {
+        return Ok(PresenterAttempt::Retry(
+            "The Wallpaper Engine capture surface moved or contains the outgoing overlay".into(),
+        ));
+    }
+    if isolate {
+        if window.presenter == window.root {
+            return Ok(PresenterAttempt::Retry(
+                "The shared wallpaper host has no isolated presenter child".into(),
+            ));
+        }
+        return read_isolated_presenter(
+            window,
+            target,
+            overlays,
+            deadline,
+            &current,
+            progress,
+            shell_root,
+            copy_window_pixels,
+        );
+    }
+
+    let hwnd = window.root;
+    let rect = window.source_rect;
+    let surface = format!("WGC independent root hwnd={hwnd:?} rect={rect:?}");
+    crate::apply_trace::event_lazy("transition-engine-capture-surface", || surface.clone());
+    let graphics = match graphics {
+        Some(graphics) => graphics,
+        None => {
+            record_stage(
+                progress,
+                format!("{surface}: initializing the capture graphics device"),
+            );
+            graphics.insert(CaptureGraphics::new().map_err(|error| format!("{surface}: {error}"))?)
+        }
+    };
+    let deadline = deadline.min(Instant::now() + Duration::from_secs(2));
+    let frame = match graphics.read_window(hwnd, deadline, &current, progress) {
+        Ok(PresenterAttempt::Ready(frame)) => frame,
+        Ok(PresenterAttempt::Retry(reason)) => {
+            return Ok(PresenterAttempt::Retry(format!("{surface}: {reason}")))
+        }
+        Err(error) if !current() => {
+            return Ok(PresenterAttempt::Retry(format!("{surface}: {error}")))
+        }
+        Err(error) => return Err(format!("{surface}: {error}")),
+    };
+    if !current() {
+        return Ok(PresenterAttempt::Retry(format!(
+            "{surface}: surface changed during readback"
+        )));
+    }
+    if Instant::now() >= deadline {
+        return Ok(PresenterAttempt::Retry(format!(
+            "{surface}: frame exceeded the readback budget"
+        )));
+    }
+    let frame = match crop_to_monitor(&frame, rect, target) {
+        Ok(frame) => frame,
+        Err(reason) => return Ok(PresenterAttempt::Retry(format!("{surface}: {reason}"))),
+    };
+    Ok(if has_visible_detail(&frame.rgba) {
+        PresenterAttempt::Ready(frame)
+    } else {
+        PresenterAttempt::Retry(format!(
+            "{surface}: could not distinguish an empty capture from dark or uniform artwork"
+        ))
+    })
+}
+
+fn read_isolated_presenter(
+    window: &CaptureWindow,
+    target: DesktopRect,
+    overlays: &[usize],
+    deadline: Instant,
+    current: &dyn Fn() -> bool,
+    progress: &Mutex<String>,
+    shell_root: impl Fn() -> HWND,
+    copy: impl Fn(HWND, DesktopRect) -> Result<FrozenFrame, String>,
+) -> Result<PresenterAttempt<FrozenFrame>, String> {
+    let read = |hwnd, rect, name, current: &dyn Fn() -> bool| {
+        let surface = format!("PrintWindow {name} hwnd={hwnd:?} rect={rect:?}");
+        crate::apply_trace::event_lazy("transition-engine-capture-surface", || surface.clone());
+        record_stage(progress, surface.clone());
+        let frame: Result<FrozenFrame, String> = (|| {
+            if Instant::now() >= deadline || !current() {
+                return Err("surface changed or the capture deadline elapsed".into());
+            }
+            let copied = copy(hwnd, rect)?;
+            if Instant::now() >= deadline || !current() {
+                return Err(
+                    "surface changed or the capture deadline elapsed during readback".into(),
+                );
+            }
+            let mut frame = crop_to_monitor(&copied, rect, target)?;
+            finish_window_copy(&mut frame.rgba)?;
+            Ok(frame)
+        })();
+        match frame {
+            Ok(frame) => Ok(frame),
+            Err(reason) => Err(format!("{surface}: {reason}")),
+        }
+    };
+    let child_error = match read(
+        window.presenter,
+        window.presenter_rect,
+        "presenter child",
+        current,
+    ) {
+        Ok(frame) => return Ok(PresenterAttempt::Ready(frame)),
+        Err(reason) => reason,
+    };
+    crate::apply_trace::event_lazy("transition-engine-capture-surface-rejected", || {
+        child_error.clone()
+    });
+    if Instant::now() >= deadline || !current() {
+        return Ok(PresenterAttempt::Retry(child_error));
+    }
+    let worker = || wallpaper_worker(window, target, overlays, shell_root());
+    let selected = match worker() {
+        Ok(selected) => selected,
+        Err(reason) => {
+            return Ok(PresenterAttempt::Retry(format!(
+                "{child_error}; WorkerW unavailable: {reason}"
+            )))
+        }
+    };
+    return Ok(
+        match read(selected.hwnd, selected.rect, "wallpaper WorkerW", &|| {
+            current() && worker().as_ref() == Ok(&selected)
+        }) {
+            Ok(frame) => PresenterAttempt::Ready(frame),
+            Err(reason) => PresenterAttempt::Retry(format!("{child_error}; {reason}")),
+        },
+    );
+}
+
+fn finish_window_copy(rgba: &mut [u8]) -> Result<(), &'static str> {
+    let mut has_content = false;
+    for pixel in rgba.chunks_exact_mut(4) {
+        if pixel == [UNWRITTEN_PIXEL; 4] {
+            return Err("destination contains unwritten pixels");
+        }
+        has_content |= pixel[..3] != [0; 3];
+        pixel[3] = 255;
+    }
+    if !has_content {
+        return Err("all-black pixels cannot distinguish empty capture from black artwork");
+    }
+    Ok(())
+}
+
+fn capture_frame_on_worker(
     target: DesktopRect,
     capture_deadline: Instant,
     details: &ApplyCapture,
 ) -> Result<FrozenFrame, String> {
-    use windows::core::{factory, Interface};
-    use windows::Graphics::Capture::GraphicsCaptureItem;
-    use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
-    use windows::Win32::Foundation::{HMODULE, HWND as WinHwnd};
-    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
-    use windows::Win32::Graphics::Direct3D11::{
-        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        D3D11_SDK_VERSION,
-    };
-    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
-    use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
-    use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
-    fn create_device(
-        driver: windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE,
-    ) -> windows::core::Result<(ID3D11Device, ID3D11DeviceContext)> {
-        let mut device = None;
-        let mut context = None;
-        unsafe {
-            D3D11CreateDevice(
-                None,
-                driver,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )?;
-        }
-        Ok((device.unwrap(), context.unwrap()))
-    }
+    let _coordinates = PhysicalWindowCoordinates::enter()?;
+    let progress = &details.progress;
+    let mut graphics = None;
 
-    let (device, context) = create_device(D3D_DRIVER_TYPE_HARDWARE)
-        .or_else(|_| create_device(D3D_DRIVER_TYPE_WARP))
-        .map_err(|error| format!("Could not create a capture graphics device: {error}"))?;
-    let dxgi_device: IDXGIDevice = device
-        .cast()
-        .map_err(|error| format!("Could not access the DXGI capture device: {error}"))?;
-    let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) }
-        .map_err(|error| format!("Could not bridge the capture device to WinRT: {error}"))?;
-    let winrt_device: IDirect3DDevice = inspectable
-        .cast()
-        .map_err(|error| format!("Could not access the WinRT capture device: {error}"))?;
-
-    let interop = factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
-        .map_err(|error| format!("Windows Graphics Capture is unavailable: {error}"))?;
-    // WGC needs a top-level window. Resolve and revalidate its exact root
-    // under the confirmed control process before creating the capture item.
     let mut attempts = 0usize;
     wait_for_presenter(capture_deadline, || {
-        let log_candidates = attempts.is_multiple_of(8);
-        attempts += 1;
-        let window = match current_capture_window(target, details, log_candidates)? {
-            PresenterAttempt::Ready(window) => window,
-            PresenterAttempt::Retry(reason) => return Ok(PresenterAttempt::Retry(reason)),
-        };
-        validate_capture_target(target, details)?;
-        let current = || {
-            window.current(target, details.endpoint)
-                && !shares_capture_root(window.root, target, &details.overlay_windows)
-        };
-        if !current() {
-            return Ok(PresenterAttempt::Retry(
-                "The Wallpaper Engine capture host moved or was replaced".into(),
-            ));
-        }
-        let captured: windows::core::Result<GraphicsCaptureItem> =
-            unsafe { interop.CreateForWindow(WinHwnd(window.root)) };
-        let item = match captured {
-            Ok(item) => item,
-            Err(error) if current() => {
-                return Err(format!(
-                    "Could not target Wallpaper Engine's render window: {error}"
-                ));
-            }
-            Err(_) => {
-                return Ok(PresenterAttempt::Retry(
-                    "The Wallpaper Engine presenter was replaced before capture".into(),
-                ))
-            }
-        };
-        crate::apply_trace::event_lazy("transition-engine-presenter-selected", || {
-            format!(
-                "display={:?} phase={} candidate={window:?}",
-                details.display, details.phase
-            )
-        });
-        let deadline = (Instant::now() + Duration::from_secs(2)).min(capture_deadline);
-        let frame =
-            match read_capture_item(&item, &winrt_device, &device, &context, deadline, &current) {
-                Ok(PresenterAttempt::Ready(frame)) => frame,
-                Ok(PresenterAttempt::Retry(reason)) => return Ok(PresenterAttempt::Retry(reason)),
-                Err(error) if !current() => return Ok(PresenterAttempt::Retry(error)),
-                Err(error) => return Err(error),
+        let attempt = (|| {
+            record_stage(
+                progress,
+                "checking the verified Engine presenter and display",
+            );
+            let log_candidates = attempts.is_multiple_of(8);
+            attempts += 1;
+            let window = match current_capture_window(target, details, log_candidates)? {
+                PresenterAttempt::Ready(window) => window,
+                PresenterAttempt::Retry(reason) => return Ok(PresenterAttempt::Retry(reason)),
             };
-        validate_capture_target(target, details)?;
-        if !current() {
-            return Ok(PresenterAttempt::Retry(
-                "Wallpaper Engine's capture root changed while reading its frame".into(),
-            ));
+            validate_capture_target(target, details)?;
+            crate::apply_trace::event_lazy("transition-engine-presenter-selected", || {
+                format!(
+                    "display={:?} phase={} candidate={window:?}",
+                    details.display, details.phase
+                )
+            });
+            let frame = read_presenter(
+                &mut graphics,
+                &window,
+                target,
+                &details.overlay_windows,
+                capture_deadline,
+                || window.current(target, details.endpoint),
+                progress,
+                || unsafe { GetShellWindow() },
+            )?;
+            if matches!(frame, PresenterAttempt::Ready(_)) {
+                validate_capture_target(target, details)?;
+                if !matches!(current_capture_window(target, details, false)?, PresenterAttempt::Ready(current) if current == window)
+                {
+                    return Ok(PresenterAttempt::Retry(
+                        "The verified presenter changed or became ambiguous after frame readback"
+                            .into(),
+                    ));
+                }
+                if Instant::now() >= capture_deadline {
+                    return Ok(PresenterAttempt::Retry(
+                        "Wallpaper Engine's frame exceeded the capture deadline".into(),
+                    ));
+                }
+            }
+            Ok(frame)
+        })();
+        if let Ok(PresenterAttempt::Retry(reason)) = &attempt {
+            record_stage(progress, reason.clone());
         }
-        let frame = match crop_to_monitor(&frame, window.source_rect, target) {
-            Ok(frame) => frame,
-            Err(reason) => return Ok(PresenterAttempt::Retry(reason)),
-        };
-        Ok(if has_visible_detail(&frame.rgba) {
-            PresenterAttempt::Ready(frame)
-        } else {
-            PresenterAttempt::Retry(
-                "Wallpaper Engine returned a blank frame for the target monitor".into(),
-            )
-        })
+        attempt
     })
 }
 
@@ -832,6 +1283,7 @@ fn read_capture_item(
     context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
     deadline: Instant,
     current: impl Fn() -> bool,
+    progress: &Mutex<String>,
 ) -> Result<PresenterAttempt<FrozenFrame>, String> {
     use windows::Graphics::Capture::Direct3D11CaptureFramePool;
     use windows::Graphics::DirectX::DirectXPixelFormat;
@@ -844,6 +1296,7 @@ fn read_capture_item(
             "The Wallpaper Engine presenter has no frame size yet".into(),
         ));
     }
+    record_stage(progress, "starting the Windows Graphics Capture session");
     let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         winrt_device,
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -864,6 +1317,7 @@ fn read_capture_item(
         session
             .StartCapture()
             .map_err(|error| format!("Could not start Wallpaper Engine capture: {error}"))?;
+        record_stage(progress, "waiting for a frame from the capture surface");
         loop {
             if !current() {
                 return Ok(PresenterAttempt::Retry(
@@ -876,25 +1330,36 @@ fn read_capture_item(
                     "No Wallpaper Engine frame arrived within the capture time budget".into(),
                 ));
             }
-            if let Ok(frame) = pool.TryGetNextFrame() {
-                let result = frame
-                    .ContentSize()
-                    .map_err(|error| format!("Could not read the captured content size: {error}"))
-                    .and_then(|content| {
-                        if content != size {
-                            return Ok(PresenterAttempt::Retry(
-                                "The Wallpaper Engine frame changed size during capture".into(),
-                            ));
-                        }
-                        read_capture_texture(&frame, device, context, deadline)
-                            .map(PresenterAttempt::Ready)
-                    });
-                // Release the frame before closing the pool, including on error.
-                let _ = frame.Close();
-                drop(frame);
-                return result;
-            }
-            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            let frame = match pool.TryGetNextFrame() {
+                Ok(frame) => frame,
+                // Projected COM replaces a successful null frame with an empty error.
+                Err(error) if error.code().0 == 0 => {
+                    std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Could not retrieve a Wallpaper Engine frame: {error}"
+                    ))
+                }
+            };
+            record_stage(progress, "reading back the captured texture");
+            let result = frame
+                .ContentSize()
+                .map_err(|error| format!("Could not read the captured content size: {error}"))
+                .and_then(|content| {
+                    if content != size {
+                        return Ok(PresenterAttempt::Retry(
+                            "The Wallpaper Engine frame changed size during capture".into(),
+                        ));
+                    }
+                    read_capture_texture(&frame, device, context, deadline)
+                        .map(PresenterAttempt::Ready)
+                });
+            // Release the frame before closing the pool, including on error.
+            let _ = frame.Close();
+            drop(frame);
+            return result;
         }
     })();
     let _ = session.Close();
@@ -1100,6 +1565,7 @@ mod tests {
     #[test]
     #[ignore = "requires a running Wallpaper Engine wallpaper"]
     fn report_render_windows_for_running_engine() {
+        let _coordinates = PhysicalWindowCoordinates::enter().unwrap();
         let endpoint = crate::engine_ipc::control_window_identity().unwrap();
         let windows = windows_for_process(endpoint.1);
         for window in &windows {
@@ -1116,6 +1582,7 @@ mod tests {
             phase: "diagnostic",
             endpoint,
             overlay_windows: Vec::new(),
+            progress: Arc::default(),
         };
         match current_capture_window(monitor.rect, &details, true).unwrap() {
             PresenterAttempt::Ready(selected) => eprintln!("selected={selected:?}"),
@@ -1124,7 +1591,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a running non-solid Wallpaper Engine wallpaper"]
+    #[ignore = "requires a running Wallpaper Engine wallpaper"]
     fn captures_the_actual_engine_render_window() {
         let monitor = crate::native_wallpaper::monitors()
             .unwrap()
@@ -1157,6 +1624,21 @@ mod tests {
 #[cfg(test)]
 mod presenter_tests {
     use super::*;
+
+    #[test]
+    fn copied_dark_artwork_is_distinct_from_an_unwritten_or_zeroed_buffer() {
+        assert_eq!(
+            finish_window_copy(&mut [UNWRITTEN_PIXEL; 8]),
+            Err("destination contains unwritten pixels")
+        );
+        assert!(finish_window_copy(&mut [0; 8])
+            .unwrap_err()
+            .contains("all-black pixels"));
+        let mut dark = [1, 2, 3, 0, 1, 2, 3, 0];
+        finish_window_copy(&mut dark).unwrap();
+        assert_eq!(dark, [1, 2, 3, 255, 1, 2, 3, 255]);
+        assert!(finish_window_copy(&mut [0, 0, 0, 255]).is_err());
+    }
 
     #[test]
     fn capture_crop_requires_the_full_physical_extent_before_using_its_origin() {
@@ -1248,7 +1730,7 @@ mod presenter_tests {
                 "still no friendly presenter".into(),
             ))
         });
-        assert!(unavailable.is_err());
+        assert_eq!(unavailable, Err("still no friendly presenter".into()));
         assert!(attempts >= 1);
         let mut changed = 0;
         let result = wait_for_presenter::<()>(Instant::now() + Duration::from_secs(1), || {
@@ -1299,4 +1781,33 @@ mod presenter_tests {
             PresenterAttempt::Retry(reason) if reason.starts_with("Multiple")
         ));
     }
+
+    #[test]
+    fn video_window_class_is_eligible_without_a_scene_title() {
+        let target = DesktopRect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let mut video = EngineWindow {
+            hwnd: 1usize as HWND,
+            class_name: "WPEVideoWallpaper".into(),
+            title: "WPEVideoWallpaper".into(),
+            rect: target,
+            visible: true,
+        };
+        assert_eq!(presenter_overlap(&video, target), Ok(1920 * 1080));
+        video.class_name.push_str("Helper");
+        assert_eq!(presenter_overlap(&video, target), Err("not-a-presenter"));
+        video.class_name = "WPEDesktopDX11Window".into();
+        assert_eq!(presenter_overlap(&video, target), Ok(1920 * 1080));
+        video.class_name = "WPEEventWindow".into();
+        video.title = "WPELiveWallpaper".into();
+        assert_eq!(presenter_overlap(&video, target), Err("not-a-presenter"));
+    }
 }
+
+#[cfg(test)]
+#[path = "engine_capture/owned_fixture.rs"]
+mod owned_fixture;

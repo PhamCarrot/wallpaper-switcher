@@ -188,6 +188,7 @@ fn primitive(posters: Vec<Poster>, near: usize) -> GalleryPrimitive {
         poster_feedback: None,
         snapshot: Arc::new(GallerySnapshot {
             defer_near_restore: false,
+            held_wall: None,
             cards,
             posters: Arc::new(posters),
             ordinary: None,
@@ -266,10 +267,6 @@ fn stable_visible_poster_priority_uses_crop_dpi_and_budget() {
                     loading_eligible: false,
                     entrance: 1.0,
                     launch: LaunchAnimation::None,
-                    outgoing: false,
-                    roll: 0.0,
-                    captured_raw: None,
-                    retained: None,
                 }
             })
             .collect(),
@@ -543,10 +540,6 @@ fn p53_cropped_ordinary_edge_can_settle_at_far_quality() {
         loading_eligible: false,
         entrance: 1.0,
         launch: LaunchAnimation::None,
-        outgoing: false,
-        roll: 0.0,
-        captured_raw: None,
-        retained: None,
     }]);
     frame.prewarm = Some((test_key(72), true));
     frame.poster_feedback = Some(record);
@@ -824,6 +817,227 @@ fn render_frame_pixels(
     );
     queue.submit([encoder.finish()]);
     read_mip(device, queue, &target, 0, 0, extent, None)
+}
+
+#[test]
+#[ignore = "Owned WGPU Slices silhouette and pointer readback"]
+fn slices_outline_and_pointer_match_before_and_after_texture_residency() {
+    use crate::donor_scene::{CardPresentation, CardReadiness, LaunchAnimation, SurfacePayload};
+
+    let (device, queue) = device(false);
+    for wobble in [false, true] {
+        let mut pipeline =
+            GalleryPipeline::new(&device, &queue, wgpu::TextureFormat::Bgra8UnormSrgb);
+        let poster = video_placeholder_poster(Path::new("owned-slices-outline.png"), 0);
+        *poster.pixels.lock().unwrap() = PosterPixels::Restoring;
+        *poster.far_pixels.lock().unwrap() = PosterPixels::Restoring;
+        let mut frame = primitive(vec![poster.clone()], 1);
+        let mut card = frame.snapshot.cards[0];
+        card.size = [135.0, 300.0];
+        card.skew_distance = 45.0;
+        card.edge_tilt_distance = 2.0;
+        let mut entry = CardPresentation {
+            card,
+            id: "owned-slices".into(),
+            source: poster.source.clone(),
+            catalog_generation: 0,
+            selection: 1.0,
+            hovered: false,
+            radii: [16.0; 4],
+            crop: crate::donor_scene::poster_crop_uv(poster.aspect_ratio, card.size),
+            payload: if wobble {
+                SurfacePayload::Wobble {
+                    pad: 1.35,
+                    bend: 0.8,
+                    parallax: 0.2,
+                }
+            } else {
+                SurfacePayload::Plain
+            },
+            readiness: CardReadiness::Loading,
+            source_style: true,
+            hex_style: false,
+            wall_border: None,
+            shadows: false,
+            loading_eligible: true,
+            entrance: 1.0,
+            launch: LaunchAnimation::None,
+        };
+        let mut render = |frame: &mut GalleryPrimitive, entry: &CardPresentation| {
+            let snapshot = Arc::make_mut(&mut frame.snapshot);
+            snapshot.scene.visibility = 1.0;
+            snapshot.scene.time = 0.6;
+            snapshot.ordinary = Some(vec![entry.clone()]);
+            prepare(frame, &mut pipeline, &device, &queue);
+            render_frame_pixels(frame, &pipeline, &device, &queue)
+        };
+        entry.card.layer = None;
+        let pending = render(&mut frame, &entry);
+        entry.readiness = CardReadiness::Unavailable;
+        let matte = render(&mut frame, &entry);
+        entry.card.layer = Some(poster.layer);
+        entry.readiness = CardReadiness::Ready;
+        let deferred = render(&mut frame, &entry);
+        *poster.far_pixels.lock().unwrap() = PosterPixels::Ready(
+            PosterEncoding::FarRgba,
+            PosterEncoding::FarRgba.encode(art(), 1.0).unwrap(),
+        );
+        let ready = render(&mut frame, &entry);
+        for pixels in [&pending, &matte, &deferred] {
+            assert_eq!(
+                pixels.iter().skip(3).step_by(4).collect::<Vec<_>>(),
+                ready.iter().skip(3).step_by(4).collect::<Vec<_>>(),
+                "same fill and border coverage before and after upload, wobble={wobble}",
+            );
+        }
+        let offset = |x: usize, y: usize| (y * 640 + x) * 4;
+        let center = offset(320, 240);
+        assert_eq!(ready[center + 3], 255);
+        assert_ne!(pending[center..center + 3], matte[center..center + 3]);
+        assert_ne!(ready[center..center + 3], matte[center..center + 3]);
+        let padded = offset(400, 240);
+        assert_eq!(ready[padded + 3], 0);
+        assert_eq!(frame.snapshot.hit(400.5, 240.5), None);
+
+        for y in (90..390).step_by(7) {
+            for x in (225..415).step_by(3) {
+                let neighbors = [
+                    offset(x - 1, y),
+                    offset(x + 1, y),
+                    offset(x, y - 1),
+                    offset(x, y + 1),
+                ];
+                let inside = neighbors.iter().all(|i| ready[i + 3] == 255);
+                let outside = neighbors.iter().all(|i| ready[i + 3] == 0);
+                if inside || outside {
+                    let point = [x as f32 + 0.5, y as f32 + 0.5];
+                    for layer in [None, Some(poster.layer)] {
+                        entry.card.layer = layer;
+                        assert_eq!(
+                            crate::donor_scene::presented_slice_contains(
+                                &entry,
+                                &frame.snapshot.colors,
+                                [640.0, 480.0],
+                                point
+                            ),
+                            inside,
+                            "wobble={wobble} layer={layer:?} point={point:?}"
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "wobble={wobble}: pending, unavailable, deferred upload, and ready coverage match"
+        );
+    }
+}
+
+#[test]
+#[ignore = "Owned Wall Colour patterned GPU readback"]
+fn wall_colour_renders_the_held_or_current_full_order() {
+    use crate::donor_scene::{CardPresentation, CardReadiness, LaunchAnimation, SurfacePayload};
+
+    let (device, queue) = device(false);
+    let mut pipeline = GalleryPipeline::new(&device, &queue, wgpu::TextureFormat::Bgra8UnormSrgb);
+    let posters: Vec<_> = (0..2)
+        .map(|index| {
+            let poster = video_placeholder_poster(
+                Path::new(if index == 0 { "red.png" } else { "green.png" }),
+                index,
+            );
+            let pixels = std::array::from_fn::<_, 2, _>(|stripe| {
+                if index == 0 {
+                    [215, 30 + stripe as u8 * 40, 20, 255]
+                } else {
+                    [25, 210, 30 + stripe as u8 * 40, 255]
+                }
+            });
+            let mut rgba = Vec::with_capacity(POSTER_BYTES);
+            for _ in 0..POSTER_HEIGHT {
+                for x in 0..POSTER_WIDTH {
+                    rgba.extend_from_slice(&pixels[usize::from(x >= POSTER_WIDTH / 2)]);
+                }
+            }
+            *poster.far_pixels.lock().unwrap() = PosterPixels::Ready(
+                PosterEncoding::FarRgba,
+                PosterEncoding::FarRgba
+                    .encode(Arc::new(rgba.into()), 1.0)
+                    .unwrap(),
+            );
+            *poster.pixels.lock().unwrap() = PosterPixels::Unavailable;
+            poster
+        })
+        .collect();
+    let mut frame = primitive(posters.clone(), 0);
+    let snapshot = Arc::make_mut(&mut frame.snapshot);
+    snapshot.scene.visibility = 1.0;
+    let old: Vec<_> = snapshot
+        .cards
+        .iter()
+        .copied()
+        .zip(&posters)
+        .map(|(mut card, poster)| {
+            card.center[0] = if card.index == 0 { 190.0 } else { 450.0 };
+            card.size = [190.0, 160.0];
+            CardPresentation {
+                card,
+                id: poster.source.to_string_lossy().into_owned(),
+                source: poster.source.clone(),
+                catalog_generation: 0,
+                selection: 0.0,
+                hovered: false,
+                radii: [0.0; 4],
+                crop: [0.0, 0.0, 1.0, 1.0],
+                payload: SurfacePayload::Plain,
+                readiness: CardReadiness::Ready,
+                source_style: false,
+                hex_style: false,
+                wall_border: Some((0.0, 0.0)),
+                shadows: false,
+                loading_eligible: false,
+                entrance: 1.0,
+                launch: LaunchAnimation::None,
+            }
+        })
+        .collect();
+    let old_clip = [0.0, 0.0, 640.0, 480.0];
+    snapshot.ordinary = Some(old.clone());
+    snapshot.wall_clip = Some(old_clip);
+    prepare(&frame, &mut pipeline, &device, &queue);
+    let before = render_frame_pixels(&frame, &pipeline, &device, &queue);
+    let sample = |pixels: &[u8], x: usize| {
+        let start = (240 * 640 + x) * 4;
+        <[u8; 4]>::try_from(&pixels[start..start + 4]).unwrap()
+    };
+    assert!(sample(&before, 145)[2] > 190 && sample(&before, 405)[1] > 190);
+    assert_ne!(sample(&before, 145), sample(&before, 235));
+    assert_ne!(sample(&before, 405), sample(&before, 495));
+
+    let snapshot = Arc::make_mut(&mut frame.snapshot);
+    snapshot.held_wall = Some((Arc::new(old.clone()), old_clip));
+    let mut incoming = old;
+    for entry in &mut incoming {
+        entry.card.center[0] = 640.0 - entry.card.center[0];
+    }
+    snapshot.cards = incoming.iter().map(|entry| entry.card).collect();
+    snapshot.ordinary = Some(incoming);
+    prepare(&frame, &mut pipeline, &device, &queue);
+    assert_eq!(
+        render_frame_pixels(&frame, &pipeline, &device, &queue),
+        before
+    );
+    assert!(frame.snapshot.hit(145.0, 240.0).is_none());
+
+    Arc::make_mut(&mut frame.snapshot).held_wall = None;
+    prepare(&frame, &mut pipeline, &device, &queue);
+    let after = render_frame_pixels(&frame, &pipeline, &device, &queue);
+    for x in [112, 145, 190, 235, 268] {
+        assert_eq!(sample(&after, x), sample(&before, x + 260));
+        assert_eq!(sample(&after, x + 260), sample(&before, x));
+    }
+    assert_eq!(sample(&after, 320), [0; 4]);
+    assert_eq!(frame.snapshot.hit(145.0, 240.0), Some(1));
 }
 
 #[test]

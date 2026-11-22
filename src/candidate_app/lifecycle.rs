@@ -817,24 +817,7 @@ impl GpuCandidate {
         self.motion_generation.fetch_add(1, Ordering::AcqRel);
         self.motion = 0.0;
         self.motion_velocity = 0.0;
-        if self.depth_roll.is_some() || self.ordinary_roll.is_some() {
-            self.posters = Arc::new(
-                self.posters
-                    .iter()
-                    .filter(|p| {
-                        self.poster_slots.iter().any(|(index, slot)| {
-                            self.filtered_indices.contains(index) && slot.layer == p.layer
-                        })
-                    })
-                    .cloned()
-                    .collect(),
-            );
-            self.poster_slots
-                .retain(|index, _| self.filtered_indices.contains(index));
-        }
-        self.depth_roll = None;
-        self.ordinary_roll = None;
-        self.ordinary_transition_issue = None;
+        self.wall_colour_hold = None;
         self.depth_frame = None;
         self.depth_camera = None;
         self.depth_presentation = None;

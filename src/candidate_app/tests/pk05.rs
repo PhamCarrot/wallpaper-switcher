@@ -1361,7 +1361,6 @@ fn pk05_production_compositions_and_public_routes() {
         assert_eq!(app.selected, Some(1));
         // The fixture has no UI frame delivery. Settle the incoming catalogue
         // roll before opening the detail owner, as required for a hit-ready card.
-        app.ordinary_roll = None;
         app.deterministic_animation = true;
         app.start_detail(true, "pk05-headless-detail");
         app.detail_progress = 1.0;

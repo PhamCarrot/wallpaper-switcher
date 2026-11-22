@@ -662,10 +662,6 @@ fn reduce(app: &mut GpuCandidate, message: Message) -> Task<Message> {
                 });
                 return Task::none();
             }
-            // Capture before resource/catalog invalidation. A new catalog
-            // revision invalidates outgoing ownership even for reused ID/path;
-            // omit those old bodies truthfully, retain incoming roll presentation.
-            let catalog_roll = app.capture_depth_roll().is_some();
             let revision = app.catalog_generation.fetch_add(1, Ordering::AcqRel) + 1;
             app.retain_catalog_posters(&wallpapers, revision);
             app.clear_engine_properties();
@@ -674,7 +670,7 @@ fn reduce(app: &mut GpuCandidate, message: Message) -> Task<Message> {
                 .and_then(|index| app.wallpapers.get(index))
                 .map(|wallpaper| wallpaper.id.clone());
             app.invalidate_tag_editor();
-            // Never capture outgoing geometry using old indices against the new vectors.
+            // Discard the old geometry before installing the new indexed vectors.
             app.filtered_indices.clear();
             app.presentation_inputs = None;
             app.wallpapers = wallpapers;
@@ -710,19 +706,6 @@ fn reduce(app: &mut GpuCandidate, message: Message) -> Task<Message> {
                     .depth_presentation
                     .is_some_and(|p| !p.entrance.settled())
             {
-                app.start_motion(0.0);
-            }
-            if catalog_roll
-                && app.visible
-                && app.gallery_mode == GalleryMode::Depth
-                && !app.filtered_indices.is_empty()
-            {
-                app.depth_roll = Some(DepthRoll {
-                    wave: 0.0,
-                    old: Vec::new(),
-                    incoming: HashMap::new(),
-                    completed: HashMap::new(),
-                });
                 app.start_motion(0.0);
             }
             apply_trace::event_lazy(PLAYLIST_CATALOG_SNAPSHOT_STAGE, || {
@@ -875,8 +858,9 @@ fn reduce(app: &mut GpuCandidate, message: Message) -> Task<Message> {
                         )
                     });
                     app.reveal_gallery_layout();
-                } else {
-                    app.release_wall_colour_roll("posters-resident");
+                } else if app.wall_colour_hold.is_some() {
+                    app.release_wall_colour_hold("posters-resident");
+                    app.schedule_posters();
                 }
             }
             return Task::none();
@@ -957,7 +941,7 @@ fn reduce(app: &mut GpuCandidate, message: Message) -> Task<Message> {
                 app.poster_generation.load(Ordering::Acquire),
                 app.visible,
             ) {
-                let pins = app.gallery_pins();
+                let pins = app.wall_colour_pins().to_vec();
                 let valid_posters: Vec<_> = posters
                     .into_iter()
                     .filter(|decoded| {
@@ -1484,7 +1468,6 @@ fn reduce(app: &mut GpuCandidate, message: Message) -> Task<Message> {
             state,
             selection,
             presentation,
-            filter_wave,
             ordinary,
             hex,
             wall,
@@ -1504,18 +1487,10 @@ fn reduce(app: &mut GpuCandidate, message: Message) -> Task<Message> {
                     }
                 }
                 if app.gallery_mode == GalleryMode::Depth {
-                    if let (Some(roll), Some(wave)) = (&mut app.depth_roll, filter_wave) {
-                        roll.advance_to(wave);
-                    }
                     app.depth_camera = Some(state);
                     app.depth_selection = selection;
                     if presentation.is_some() {
                         app.depth_presentation = presentation;
-                    }
-                }
-                if let (Some(roll), Some(wave)) = (&mut app.ordinary_roll, filter_wave) {
-                    if roll.poster_wait_deadline.is_none() {
-                        roll.advance_to(wave);
                     }
                 }
                 app.motion = value;
@@ -1540,11 +1515,12 @@ fn reduce(app: &mut GpuCandidate, message: Message) -> Task<Message> {
                     }
                     app.wall_presentation = Some(p);
                 }
-                if app.ordinary_roll.as_ref().is_some_and(|roll| {
-                    roll.poster_wait_deadline
-                        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-                }) {
-                    app.release_wall_colour_roll("poster-wait-expired");
+                if app
+                    .wall_colour_hold
+                    .as_ref()
+                    .is_some_and(|hold| std::time::Instant::now() >= hold.deadline)
+                {
+                    app.release_wall_colour_hold("poster-wait-expired");
                 }
                 if matches!(
                     app.gallery_mode,
@@ -1688,7 +1664,7 @@ fn reduce(app: &mut GpuCandidate, message: Message) -> Task<Message> {
                 return app.native_visibility.apply(id, false, None);
             }
             if app.viewport != [width, height] {
-                app.depth_roll = None;
+                app.release_wall_colour_hold("viewport-changed");
             }
             let previous_visible = app.visible;
             let previous_window = app.window;
@@ -1721,7 +1697,9 @@ fn reduce(app: &mut GpuCandidate, message: Message) -> Task<Message> {
         }
         Message::WindowResized { id, width, height } => {
             if app.visible && app.window == Some(id) {
-                app.depth_roll = None;
+                if app.viewport != [width, height] {
+                    app.release_wall_colour_hold("viewport-changed");
+                }
                 app.viewport = [width, height];
                 apply_gallery_viewport_policy(
                     &mut app.state.gallery,
@@ -2074,6 +2052,9 @@ fn reduce(app: &mut GpuCandidate, message: Message) -> Task<Message> {
                     app,
                     Message::Gallery(GalleryMessage::Wheel(amount, sequence)),
                 );
+            }
+            if app.wall_colour_hold.is_some() {
+                return Task::none();
             }
             if let GalleryMessage::Pointer {
                 index,
@@ -2433,9 +2414,7 @@ fn reduce(app: &mut GpuCandidate, message: Message) -> Task<Message> {
             }
             if !app.filtered_indices.is_empty() {
                 if app.gallery_mode == GalleryMode::Wall {
-                    if app.wall_colour_roll_held() {
-                        app.ordinary_roll = None;
-                    }
+                    app.wall_colour_hold = None;
                     let step = app.state.gallery.wall.card_height + app.state.gallery.wall.gap_y;
                     app.sync_wall_presentation();
                     if let Some(p) = &mut app.wall_presentation {
@@ -2611,9 +2590,6 @@ fn reduce(app: &mut GpuCandidate, message: Message) -> Task<Message> {
         }
         Message::CycleGalleryMotionSpeed => {
             app.state.gallery_motion_speed = app.state.gallery_motion_speed.next();
-            if app.gallery_mode == GalleryMode::Depth && app.depth_roll.is_some() {
-                app.start_motion(0.0);
-            }
             app.persist_state();
         }
         Message::CycleGalleryVariation => app.cycle_gallery_motion(),

@@ -1,8 +1,8 @@
 settings-selector-layout-card = 布局
 settings-selector-display-mode-label = 显示模式
 settings-selector-display-mode-desc = 选择壁纸卡片在选择器中的排列方式。
-settings-selector-filter-motion-label = 筛选动效
-settings-selector-filter-motion-desc = 筛选结果变化时滚动的速度。三种共用速度在动效设置中调整。
+settings-selector-filter-motion-label = 图库动效速度
+settings-selector-filter-motion-desc = 调整图库中的移动速度。
 settings-selector-presets-card = 预设
 settings-selector-presets-card-desc = 保存当前布局设置或应用已保存的一组设置。每种显示模式都有自己的预设。
 settings-selector-preset-name-label = 名称

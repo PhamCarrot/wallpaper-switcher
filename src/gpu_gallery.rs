@@ -31,7 +31,7 @@ const POSTER_GROWTH_LAYERS: u32 = 8;
 const NEAR_MIP_COUNT: u32 = 6;
 pub const MAX_POSTERS: usize = 32;
 /// Maximum number of logical poster slots shared by drawing and demand.
-/// Depth's retained outgoing/live resource contract remains MAX_POSTERS.
+/// Depth's resource contract remains MAX_POSTERS.
 pub const MAX_ORDINARY_POSTERS: usize = 256;
 static POSTER_LAYER_LIMIT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(MAX_ORDINARY_POSTERS);
@@ -1090,6 +1090,8 @@ pub struct SliceCard {
 #[derive(Debug, Clone)]
 pub struct GallerySnapshot {
     pub ordinary: Option<Vec<crate::donor_scene::CardPresentation>>,
+    /// The frozen Wall cards and clip used only while the current order prewarms.
+    pub(crate) held_wall: Option<(Arc<Vec<crate::donor_scene::CardPresentation>>, [f32; 4])>,
     pub(crate) defer_near_restore: bool,
     pub cards: Vec<SliceCard>,
     pub posters: Arc<Vec<Poster>>,
@@ -1105,7 +1107,7 @@ pub struct GallerySnapshot {
 
 impl GallerySnapshot {
     fn hit(&self, x: f32, y: f32) -> Option<usize> {
-        if self.wall_clip.is_some_and(|clip| !inside_clip(clip, x, y)) {
+        if self.held_wall.is_some() || self.wall_clip.is_some_and(|clip| !inside_clip(clip, x, y)) {
             return None;
         }
         if let Some(entries) = &self.ordinary {
@@ -1128,7 +1130,10 @@ impl GallerySnapshot {
     }
 
     fn physical_clip(&self, scale: f32) -> [f32; 4] {
-        self.wall_clip
+        self.held_wall
+            .as_ref()
+            .map(|(_, clip)| *clip)
+            .or(self.wall_clip)
             .map_or([-1.0e9, -1.0e9, 1.0e9, 1.0e9], |clip| {
                 clip.map(|v| v * scale)
             })
@@ -1166,8 +1171,10 @@ impl GallerySnapshot {
                 .unwrap_or(false)
         };
         let mut snapshot = self.clone();
+        if let Some((held, _)) = snapshot.held_wall.take() {
+            snapshot.ordinary = Some(held.as_ref().clone());
+        }
         if let Some(entries) = &mut snapshot.ordinary {
-            entries.retain(|e| e.retained.as_ref().is_none_or(&is_resident));
             for entry in entries {
                 if entry.card.layer.is_some_and(|layer| !layer_resident(layer)) {
                     entry.card.layer = None;
@@ -1368,9 +1375,8 @@ impl shader::Program<GalleryMessage> for GalleryProgram {
             *state = *modifiers;
             return None;
         }
-        // Mode entry is hidden. A held Colour roll still displays outgoing
-        // art, so let the wheel interrupt it without treating a click as a
-        // backdrop hit or restarting its motion from pointer hover.
+        // Mode entry is hidden. The wheel can interrupt a visible Wall Colour hold;
+        // pointer hits and hover belong to the current layout once it is revealed.
         if self.prewarm.is_some()
             && (self.snapshot.scene.visibility == 0.0
                 || !matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. })))
@@ -3135,7 +3141,35 @@ impl Primitive for GalleryPrimitive {
             .limits()
             .max_texture_array_layers
             .min(MAX_POSTERS as u32);
-        let order = snapshot.upload_order(scale, limit);
+        // A texture already shown in the held Wall frame keeps its near slot
+        // while incoming posters claim the rest of the near budget.
+        let mut held_near = [false; MAX_ORDINARY_POSTERS];
+        let mut pinned_near_count = 0;
+        if let Some((entries, _)) = &snapshot.held_wall {
+            for (poster, _) in &pipeline.near_slots {
+                if entries
+                    .iter()
+                    .any(|entry| entry.card.layer == Some(poster.layer))
+                    && snapshot
+                        .posters
+                        .iter()
+                        .any(|wanted| wanted.same_resource(poster))
+                {
+                    held_near[poster.layer as usize] = true;
+                    pinned_near_count += 1;
+                }
+            }
+        }
+        let mut remaining_near = limit.saturating_sub(pinned_near_count);
+        let mut order = snapshot.upload_order(scale, limit);
+        for (poster, near) in &mut order {
+            if held_near.get(poster.layer as usize) == Some(&true) {
+                *near = true;
+            } else {
+                *near &= remaining_near > 0;
+                remaining_near -= u32::from(*near);
+            }
+        }
         let defer_near = snapshot.defer_near_restore && self.prewarm.is_none();
         let mut allow_near_restore = [!defer_near
             && (snapshot.ordinary.is_none() || snapshot.depth.is_some());
@@ -5210,6 +5244,7 @@ mod tests {
             poster_feedback: None,
             snapshot: Arc::new(GallerySnapshot {
                 defer_near_restore: false,
+                held_wall: None,
                 ordinary: None,
                 wall_clip: None,
                 depth: None,
@@ -5695,6 +5730,7 @@ mod tests {
             prewarm: None,
             snapshot: Arc::new(GallerySnapshot {
                 defer_near_restore: false,
+                held_wall: None,
                 cards: cards[..count].to_vec(),
                 posters: Arc::new(posters[..count].to_vec()),
                 ordinary: None,
@@ -6449,6 +6485,7 @@ mod tests {
         );
         let snapshot = GallerySnapshot {
             defer_near_restore: false,
+            held_wall: None,
             ordinary: None,
             cards: cards.clone(),
             posters: Arc::new(Vec::new()),
@@ -6760,6 +6797,7 @@ mod tests {
             poster_feedback: None,
             snapshot: Arc::new(GallerySnapshot {
                 defer_near_restore: false,
+                held_wall: None,
                 ordinary: None,
                 wall_clip: None,
                 depth: None,
@@ -6860,6 +6898,7 @@ mod tests {
             poster_feedback: None,
             snapshot: Arc::new(GallerySnapshot {
                 defer_near_restore: false,
+                held_wall: None,
                 ordinary: None,
                 wall_clip: None,
                 depth: None,
@@ -7424,9 +7463,6 @@ pub(crate) struct DepthSnapshotCard {
     pub crop_uv: [f32; 4],
     pub hovered: bool,
     pub selection_progress: f32,
-    /// Captured shader-only visual state for outgoing bodies, never actions.
-    pub visual_detail_progress: Option<f32>,
-    pub retained_texture: Option<Poster>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct DepthSnapshot {
@@ -7438,16 +7474,13 @@ pub(crate) struct DepthSnapshot {
     pub launch: crate::donor_scene::LaunchAnimation,
     pub detail: crate::donor_scene::DepthDetailPresentation,
     pub cards: Vec<DepthSnapshotCard>,
-    /// Visual-only outgoing stream. Never consumed by hit/detail/chrome.
-    pub outgoing: Vec<DepthSnapshotCard>,
-    /// Upcoming current-window demand before the zero-width incoming cut;
-    /// bounded alongside geometry, so hidden incoming bodies can preload.
+    /// Visible poster demand in front-to-back order.
     pub live_poster_indices: Vec<usize>,
     pub poster_anchor: usize,
 }
 /// Exact successful upload ownership is required before any Depth image body
 /// may sample a layer. A failed/unavailable live upload uses the existing solid
-/// placeholder; an unavailable outgoing image is omitted. Physical old atlas
+/// placeholder. Physical old atlas
 /// bytes may remain, but no instance can sample them as a different identity.
 fn missing_depth_live_cards(frame: &DepthSnapshot, available: impl Fn(u32) -> bool) -> usize {
     frame
@@ -7474,13 +7507,12 @@ fn depth_resident_instances(
     crate::apply_trace::event_lazy("gallery-frame-residency", || {
         let missing_cards = missing_depth_live_cards(frame, &available);
         format!(
-            "depth_model=true revision={} wanted={} resident={} missing_cards={} cards={} outgoing={}",
+            "depth_model=true revision={} wanted={} resident={} missing_cards={} cards={}",
             frame.revision,
             wanted.len(),
             resident.len(),
             missing_cards,
             frame.cards.len(),
-            frame.outgoing.len(),
         )
     });
     // Only texture bindings change; never compute a second geometry frame.
@@ -7490,66 +7522,7 @@ fn depth_resident_instances(
             body.card.layer = None;
         }
     }
-    frame.outgoing.retain(|body| {
-        body.retained_texture.as_ref().is_some_and(|exact| {
-            body.card.layer == Some(exact.layer)
-                && wanted.iter().any(|p| p.same_resource(exact))
-                && resident.iter().any(|p| p.same_resource(exact))
-        })
-    });
     crate::donor_scene::depth_instances(&frame, colors, scale, scene)
-}
-
-/// Donor reel cut applied to the same logical geometry and content-relative
-/// crop consumed by drawing, rounded/skewed input and inline detail. Widths
-/// here are full widths (InstanceRaw uses half widths). A <0.5px half-width
-/// body is omitted, matching the donor outgoing/body eligibility threshold.
-pub(crate) fn depth_roll_cut(body: &mut DepthSnapshotCard, fraction: f32, incoming: bool) -> bool {
-    let fraction = fraction.clamp(0.0, 1.0);
-    let half_width = body.card.size[0] * 0.5;
-    if incoming {
-        body.card.center[0] += half_width * (1.0 - fraction);
-        body.card.size[0] *= fraction;
-        body.crop_uv[2] *= fraction;
-    } else {
-        body.card.center[0] -= half_width * fraction;
-        body.card.size[0] *= 1.0 - fraction;
-        body.crop_uv[0] += body.crop_uv[2] * fraction;
-        body.crop_uv[2] *= 1.0 - fraction;
-    }
-    body.card.corner_radius = body
-        .card
-        .corner_radius
-        .min(body.card.size[0] * 0.5)
-        .min(body.card.size[1] * 0.5);
-    body.card.size[0].is_finite()
-        && body.card.size[0] >= 1.0
-        && body.card.size[1].is_finite()
-        && body.card.size[1] > 0.0
-        && body.card.opacity > 0.0001
-}
-
-pub(crate) fn depth_roll_cell(center: [f32; 2]) -> (i32, i32) {
-    (
-        (center[0] * 0.5).round() as i32,
-        (center[1] * 0.5).round() as i32,
-    )
-}
-
-pub(crate) fn depth_roll_start(x: f32, viewport_width: f32) -> f32 {
-    -0.6 * (x / viewport_width.max(1.0)).clamp(0.0, 1.0)
-}
-
-pub(crate) fn depth_roll_step(dt: f32, duration_ms: f32) -> f32 {
-    if !dt.is_finite() || dt <= 0.0 {
-        return 0.0;
-    }
-    dt.min(0.05) * 1000.0 / duration_ms.max(50.0)
-}
-
-pub(crate) fn depth_roll_fraction(phase: f32) -> f32 {
-    let t = phase.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
 }
 
 impl DepthSnapshot {
@@ -7602,7 +7575,6 @@ impl DepthSnapshot {
             entrance: 1.0,
             launch: crate::donor_scene::LaunchAnimation::None,
             detail: crate::donor_scene::DepthDetailPresentation::default(),
-            outgoing: Vec::new(),
             poster_anchor: frame.cards.last().map_or(0, |entry| entry.filtered_index),
             live_poster_indices: frame.cards.iter().rev().map(|e| e.card.index).collect(),
             cards: frame
@@ -7615,8 +7587,6 @@ impl DepthSnapshot {
                     crop_uv: entry.crop_uv,
                     hovered: entry.hovered,
                     selection_progress: if entry.card.selected { 1.0 } else { 0.0 },
-                    visual_detail_progress: None,
-                    retained_texture: None,
                 })
                 .collect(),
         }
@@ -7857,7 +7827,7 @@ mod d4b_cut_tests {
     use super::*;
 
     #[test]
-    fn d4b_actual_resident_binding_omits_unavailable_or_overwritten_old_layer() {
+    fn d4b_depth_draw_uses_current_geometry_and_requires_exact_atlas_identity() {
         let ids = [DepthItem {
             id: "exact",
             master_index: 7,
@@ -7876,9 +7846,6 @@ mod d4b_cut_tests {
         ));
         let exact = video_placeholder_poster(std::path::Path::new("exact-old.png"), 3);
         frame.cards[0].card.layer = Some(3);
-        let mut ghost = frame.cards[0].clone();
-        ghost.retained_texture = Some(exact.clone());
-        frame.outgoing = vec![ghost];
         let scene = DonorSceneState {
             stage: Default::default(),
             camera: 0.0,
@@ -7895,11 +7862,7 @@ mod d4b_cut_tests {
         };
         let colors = GalleryColors::default();
         let raw = depth_resident_instances(&frame, &[exact.clone()], &[], &colors, 1.0, &scene);
-        assert_eq!(
-            raw.len(),
-            1,
-            "unavailable old image is omitted while live geometry remains"
-        );
+        assert_eq!(raw.len(), 1, "missing GPU residency retains one full card");
         assert_eq!(
             raw[0].params[3], 0.0,
             "live texture failure is a truthful solid placeholder"
@@ -7912,22 +7875,21 @@ mod d4b_cut_tests {
             1.0,
             &scene,
         );
-        assert_eq!(raw.len(), 2);
-        assert!(raw
-            .iter()
-            .all(|body| body.misc[1] == 3 && body.params[3] == 1.0));
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].misc[1], 3);
+        assert_eq!(raw[0].params[3], 1.0);
         // A different resource using the very same ID/path/layer cannot be an
         // exact old image, even if its upload succeeded in the shared atlas.
         let changed = video_placeholder_poster(std::path::Path::new("exact-old.png"), 3);
         assert!(!changed.same_resource(&exact));
-        let raw =
-            depth_resident_instances(&frame, &[changed.clone()], &[changed], &colors, 1.0, &scene);
+        let raw = depth_resident_instances(&frame, &[changed], &[exact], &colors, 1.0, &scene);
         assert_eq!(
             raw.len(),
             1,
-            "bare layer/path agreement never authorizes a wrong-image ghost"
+            "a stale layer leaves the current card in place"
         );
         assert_eq!(raw[0].rect[2], frame.cards[0].card.size[0] * 0.5);
+        assert_eq!(raw[0].params[3], 0.0);
     }
 
     #[test]
@@ -7984,10 +7946,7 @@ mod d4b_cut_tests {
         let mut unavailable = unassigned.clone();
         unavailable.card.index = 5;
         unavailable.card.layer = Some(7);
-        let mut stale_ghost = frame.cards[0].clone();
-        stale_ghost.retained_texture = Some(video_placeholder_poster(&poster.source, poster.layer));
         frame.cards.extend([unassigned, unavailable]);
-        frame.outgoing.push(stale_ghost);
         let absent = video_placeholder_poster(Path::new("absent.png"), 7);
         let wanted = [poster.clone(), absent];
         assert_eq!(
@@ -8053,16 +8012,16 @@ mod d4b_cut_tests {
     }
 
     #[test]
-    fn d4b_extreme_cut_does_not_leave_hits_outside_drawn_quad() {
+    fn d4b_skewed_depth_card_excludes_hits_outside_drawn_quad() {
         let ids = [DepthItem {
-            id: "cut",
+            id: "skewed",
             master_index: 7,
             source_aspect: Some(2.0),
         }];
-        let mut f = DepthSnapshot::from_frame(depth_frame(
+        let f = DepthSnapshot::from_frame(depth_frame(
             &ids,
             1,
-            Some("cut"),
+            Some("skewed"),
             None,
             0.0,
             [1200.0, 900.0],
@@ -8073,18 +8032,20 @@ mod d4b_cut_tests {
             },
             1.0,
         ));
-        assert!(depth_roll_cut(&mut f.cards[0], 0.01, true));
         let body = &f.cards[0].card;
         let p = [
-            body.center[0] - body.skew_distance * 0.25,
+            body.center[0] - body.size[0] * 0.5 - 3.0,
             body.center[1] + body.size[1] * 0.25,
         ];
         assert!(p[0] < body.center[0] - body.size[0] * 0.5 - 2.0);
-        assert!(f.hit(p[0],p[1]).is_none(),"an extreme narrow/skewed cut must not retain a target beyond the raster quad, away from AA");
+        assert!(
+            f.hit(p[0], p[1]).is_none(),
+            "a skewed card must exclude points beyond the raster quad"
+        );
     }
 
     #[test]
-    fn d4b_shader_silhouette_oracle_matches_cut_hits_away_from_aa() {
+    fn d4b_shader_silhouette_oracle_matches_full_card_hits_away_from_aa() {
         let ids = [DepthItem {
             id: "oracle",
             master_index: 7,
@@ -8092,7 +8053,7 @@ mod d4b_cut_tests {
         }];
         for skew in [-100.0, 0.0, 100.0] {
             for radius in [0.0, 45.0] {
-                let base = DepthSnapshot::from_frame(depth_frame(
+                let f = DepthSnapshot::from_frame(depth_frame(
                     &ids,
                     1,
                     None,
@@ -8107,113 +8068,37 @@ mod d4b_cut_tests {
                     },
                     1.0,
                 ));
-                for fraction in [0.01, 0.1, 0.25, 0.5, 1.0] {
-                    let mut f = base.clone();
-                    assert!(depth_roll_cut(&mut f.cards[0], fraction, true));
-                    let b = &f.cards[0].card;
-                    let hw = b.size[0] * 0.5;
-                    let hh = b.size[1] * 0.5;
-                    let sx = b.skew_distance * 0.5;
-                    let bx = (hw - sx.abs()).max(1.0);
-                    let by = hh.max(1.0);
-                    let r = b.corner_radius;
-                    for ix in -12..=12 {
-                        for iy in -12..=12 {
-                            let x = ix as f32 * (hw + sx.abs() + 6.0) / 10.0;
-                            let y = iy as f32 * (hh + 6.0) / 10.0;
-                            // Independent production WGSL inverse and rounded SDF;
-                            // shader's padded raster quad and viewport are separate clips.
-                            let qx = x + sx * y / by;
-                            let dx = qx.abs() - bx + r;
-                            let dy = y.abs() - by + r;
-                            let sdf = dx.max(dy).min(0.0) + dx.max(0.0).hypot(dy.max(0.0)) - r;
-                            let clip = (x.abs() - hw).max(y.abs() - hh);
-                            if sdf.abs() < 2.01 || clip.abs() < 2.01 {
-                                continue;
-                            }
-                            let expected = sdf < 0.0 && clip < 0.0;
-                            assert_eq!(f.hit(b.center[0]+x,b.center[1]+y).is_some(),expected,
-                            "skew={skew} radius={radius} fraction={fraction} x={x} y={y} sdf={sdf} clip={clip}");
+                let b = &f.cards[0].card;
+                let hw = b.size[0] * 0.5;
+                let hh = b.size[1] * 0.5;
+                let sx = b.skew_distance * 0.5;
+                let bx = (hw - sx.abs()).max(1.0);
+                let by = hh.max(1.0);
+                let r = b.corner_radius;
+                for ix in -12..=12 {
+                    for iy in -12..=12 {
+                        let x = ix as f32 * (hw + sx.abs() + 6.0) / 10.0;
+                        let y = iy as f32 * (hh + 6.0) / 10.0;
+                        // Independent production WGSL inverse and rounded SDF;
+                        // shader's padded raster quad and viewport are separate clips.
+                        let qx = x + sx * y / by;
+                        let dx = qx.abs() - bx + r;
+                        let dy = y.abs() - by + r;
+                        let sdf = dx.max(dy).min(0.0) + dx.max(0.0).hypot(dy.max(0.0)) - r;
+                        let clip = (x.abs() - hw).max(y.abs() - hh);
+                        if sdf.abs() < 2.01 || clip.abs() < 2.01 {
+                            continue;
                         }
+                        let expected = sdf < 0.0 && clip < 0.0;
+                        assert_eq!(
+                            f.hit(b.center[0] + x, b.center[1] + y).is_some(),
+                            expected,
+                            "skew={skew} radius={radius} x={x} y={y} sdf={sdf} clip={clip}"
+                        );
                     }
                 }
             }
         }
-    }
-
-    #[test]
-    fn d4b_independent_cut_timing_crop_and_rounded_skew_oracle() {
-        for aspect in [0.25, 0.5, 2.0, 4.0] {
-            let ids = [DepthItem {
-                id: "oracle",
-                master_index: 7,
-                source_aspect: Some(aspect),
-            }];
-            let params = donor_layout::DepthParams {
-                corner_radius: 50.0,
-                skew: 30.0,
-                ..Default::default()
-            };
-            let base = DepthSnapshot::from_frame(depth_frame(
-                &ids,
-                9,
-                Some("oracle"),
-                None,
-                0.0,
-                [1200.0, 900.0],
-                [600.0, 1200.0],
-                params,
-                1.0,
-            ))
-            .cards
-            .remove(0);
-            for phase in [-0.6, 0.0, 0.25, 0.5, 0.75, 1.0, 2.0] {
-                let t: f32 = phase;
-                let t = t.clamp(0.0, 1.0);
-                let f = t * t * (3.0 - 2.0 * t);
-                assert_eq!(depth_roll_fraction(phase), f);
-                for incoming in [false, true] {
-                    let mut cut = base.clone();
-                    let included = depth_roll_cut(&mut cut, f, incoming);
-                    let remaining = if incoming { f } else { 1.0 - f };
-                    assert!((cut.card.size[0] - base.card.size[0] * remaining).abs() < 1e-4);
-                    let offset = if incoming { 1.0 - f } else { -f };
-                    assert!(
-                        (cut.card.center[0]
-                            - base.card.center[0]
-                            - base.card.size[0] * 0.5 * offset)
-                            .abs()
-                            < 1e-4
-                    );
-                    assert!((cut.crop_uv[2] - base.crop_uv[2] * remaining).abs() < 1e-6);
-                    assert!(
-                        (cut.crop_uv[0]
-                            - base.crop_uv[0]
-                            - if incoming { 0.0 } else { base.crop_uv[2] * f })
-                        .abs()
-                            < 1e-6
-                    );
-                    assert_eq!(included, cut.card.size[0] >= 1.0);
-                    assert_eq!(cut.card.skew_distance, base.card.skew_distance);
-                    assert!(cut.card.corner_radius <= cut.card.size[0] * 0.5);
-                    assert!(cut.crop_uv[0] >= base.crop_uv[0] - 1e-6);
-                    assert!(
-                        cut.crop_uv[0] + cut.crop_uv[2] <= base.crop_uv[0] + base.crop_uv[2] + 1e-6
-                    );
-                }
-            }
-        }
-        for x in [-1.0, 0.0, 300.0, 600.0, 1200.0, 2400.0] {
-            assert_eq!(
-                depth_roll_start(x, 1200.0),
-                -0.6 * (x / 1200.0).clamp(0.0, 1.0)
-            );
-        }
-        for duration in [0.0, 1.0, 50.0, 180.0, 250.0, 450.0] {
-            assert_eq!(depth_roll_step(1.0, duration), 50.0 / duration.max(50.0));
-            assert_eq!(depth_roll_step(0.025, duration), 25.0 / duration.max(50.0));
-        }
-        assert_eq!(depth_roll_step(f32::NAN, 450.0), 0.0);
     }
 }
 

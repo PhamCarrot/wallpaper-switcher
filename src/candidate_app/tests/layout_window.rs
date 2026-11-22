@@ -435,7 +435,6 @@ fn p56_terminal_motion_frame_preserves_demand_and_navigation_restarts() {
             state: GalleryMotionState::with_velocity(0.0, 0.0, 0.0, 250),
             selection: Default::default(),
             presentation: None,
-            filter_wave: None,
             ordinary,
             hex: None,
             wall: None,
@@ -486,16 +485,8 @@ fn p56_owned_producers_publish_terminal_frames_stop_and_restart() {
                             .motion_mailbox
                             .take()
                             .expect("motion marker without payload");
-                        if let Wake::MotionFrame {
-                            state,
-                            scene,
-                            filter_wave,
-                            ..
-                        } = &frame
-                        {
-                            terminal = state.settled()
-                                && scene.is_none_or(|s| !s.unsettled())
-                                && filter_wave.is_none_or(|wave| wave >= 1.6);
+                        if let Wake::MotionFrame { state, scene, .. } = &frame {
+                            terminal = state.settled() && scene.is_none_or(|s| !s.unsettled());
                         }
                         let _ = update(app, Message::Wake(frame));
                     } else {
@@ -587,22 +578,13 @@ fn p56_owned_producers_publish_terminal_frames_stop_and_restart() {
         }
         app.schedule_posters();
         let layout = drain(&mut app, &mut rx);
-        // The same producer advances filter waves even with a settled camera.
-        app.ordinary_roll = Some(ordinary_roll::OrdinaryRoll {
-            wave: 0.0,
-            old: Vec::new(),
-            incoming: HashMap::new(),
-            poster_wait_deadline: None,
-        });
-        app.start_motion(0.0);
-        let filter = drain(&mut app, &mut rx);
         app.visible = false;
         app.stop_gallery_transients("owned-p56-hide");
         app.visible = true;
         app.restart_gallery_entrance();
         app.start_motion(0.0);
         let reopen = drain(&mut app, &mut rx);
-        println!("P56 mode={mode:?} initial={first} navigation={navigation} layout={layout} filter={filter} reopen={reopen} quiet_ms=250 terminal_drained=true");
+        println!("P56 mode={mode:?} initial={first} navigation={navigation} layout={layout} reopen={reopen} quiet_ms=250 terminal_drained=true");
         app.stop_gallery_transients("owned-p56-stop");
         assert_eq!(submissions.load(Ordering::Acquire), 0);
     }

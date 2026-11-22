@@ -1,8 +1,8 @@
 settings-selector-layout-card = التخطيط
 settings-selector-display-mode-label = وضع العرض
 settings-selector-display-mode-desc = اختر طريقة ترتيب بطاقات الخلفيات في المنتقي.
-settings-selector-filter-motion-label = حركة التصفية
-settings-selector-filter-motion-desc = سرعة دوران الشريط عند تغيّر نتائج التصفية. الأوزان الثلاثة المشتركة موجودة في إعدادات الحركة.
+settings-selector-filter-motion-label = سرعة الحركة في المعرض
+settings-selector-filter-motion-desc = تضبط سرعة الحركة داخل المعرض.
 settings-selector-presets-card = الإعدادات المسبقة
 settings-selector-presets-card-desc = احفظ إعدادات التخطيط الحالية أو طبّق مجموعة محفوظة. يحتفظ كل وضع عرض بإعداداته المسبقة الخاصة.
 settings-selector-preset-name-label = الاسم

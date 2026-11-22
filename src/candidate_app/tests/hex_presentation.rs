@@ -759,26 +759,6 @@ fn t1_triangle_direction_agrees_across_frames_materials_hits_and_detail() {
             );
         }
     }
-    let captured = app.capture_ordinary_roll().unwrap().unwrap();
-    let b = captured
-        .old
-        .iter()
-        .find(|g| g.entry.card.index == 1)
-        .unwrap();
-    assert_eq!(b.entry.card.triangle_direction, 1);
-    assert_eq!(b.pin.body.card, b.entry.card);
-    let raw = b.entry.captured_raw.as_ref().unwrap();
-    assert!(raw
-        .iter()
-        .all(|r| ((r.misc[3] >> 8) & 15) == 2 && r.shape[1] == 0.0));
-    let mut outgoing = b.entry.clone();
-    outgoing.roll = 0.5;
-    assert!(donor_scene::presented_hit_card(&outgoing).is_none());
-    let replay =
-        donor_scene::presented_instances(&[outgoing], &GalleryColors::default(), 1.0, &scene);
-    assert!(replay
-        .iter()
-        .all(|r| ((r.misc[3] >> 8) & 15) == 2 && r.shape[1] == 0.0));
     let b = app
         .ordinary_frame()
         .into_iter()

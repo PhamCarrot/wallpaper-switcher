@@ -319,7 +319,7 @@ fn poster_review_trace() {
                 ) + 36.0;
             }
             let cards: Vec<_> = app
-                .ordinary_base_frame()
+                .ordinary_frame()
                 .into_iter()
                 .filter_map(|entry| {
                     let card = entry.card;
@@ -349,7 +349,7 @@ fn poster_review_trace() {
                     let entry = app
                         .ordinary_frame()
                         .into_iter()
-                        .find(|entry| entry.card.index == selected && !entry.outgoing)?;
+                        .find(|entry| entry.card.index == selected)?;
                     let mut card = entry.card;
                     if entry.hex_style || entry.source_style {
                         donor_scene::launch_card(
@@ -736,4 +736,179 @@ fn parallax_intermediate_artwork_pixels() {
         println!("PARALLAX mode={mode:?} intermediate_channel_samples={samples}");
     }
     assert_eq!(submissions.load(Ordering::Acquire), 0);
+}
+
+#[test]
+#[ignore = "Owned mounted WGPU replay of same-gallery profile switches"]
+fn same_gallery_presets_keep_patterned_artwork_through_reversal() {
+    use candidate_state::preferences::BindingAction;
+    use view::settings::folio::intent::Message as SettingsIntent;
+
+    let out = owned_output();
+    let mut renderer = renderer();
+    for mode in [
+        GalleryMode::Slices,
+        GalleryMode::Geometric,
+        GalleryMode::Wall,
+        GalleryMode::Depth,
+    ] {
+        let (mut app, submissions) = d4a_fixture(3);
+        app.viewport = SIZE.map(|n| n as f32);
+        app.selected = Some(1);
+        app.browse_position_restored = true;
+        app.gallery_mode = mode;
+        let kind = gallery::gallery_kind(mode);
+        app.state.gallery.mode = kind;
+        app.state.gallery.slices.wobble = false;
+        app.state.gallery.geometric.rows = 1;
+        app.state.gallery.geometric.columns = 3;
+        app.state.gallery.wall.columns = 3;
+        app.state.gallery.wall.rows = 1;
+        app.state.gallery.depth.visible_count = 3.0;
+        app.state.frontend_preferences.launch.animation = Some("none".into());
+        app.state
+            .frontend_preferences
+            .bindings
+            .insert(BindingAction::PresetNext, "k".into());
+        app.state
+            .frontend_preferences
+            .bindings
+            .insert(BindingAction::PresetPrev, "j".into());
+        app.depth_frame = None;
+        for index in 0..3 {
+            let path = out.join(format!("preset-{}-{index}.png", mode.label()));
+            let image = ::image::RgbImage::from_fn(240, 180, |x, _| {
+                let mut rgb = [24 + 56 * u8::from(x >= 120); 3];
+                rgb[index] = 222;
+                ::image::Rgb(rgb)
+            });
+            image.save(&path).unwrap();
+            let wallpaper = &mut app.wallpapers[index];
+            wallpaper.file_target = path.clone();
+            wallpaper.preview_path = Some(path.clone());
+            app.catalog[index].width = 240;
+            app.catalog[index].height = 180;
+            app.poster_slots.insert(
+                index,
+                PosterSlot {
+                    layer: index as u32,
+                    kind: poster_worker::PosterKind::Still,
+                    generation: app.poster_generation.load(Ordering::Acquire),
+                    last_requested: 0,
+                    catalog_generation: app.catalog_generation.load(Ordering::Acquire),
+                    item_id: wallpaper.id.clone(),
+                    source: path.clone(),
+                },
+            );
+            Arc::make_mut(&mut app.posters)
+                .push(gpu_gallery::decode_poster(&path, index as u32).unwrap());
+        }
+        let prepare = |app: &mut GpuCandidate, width| {
+            app.state.gallery.slices.expanded_width = width;
+            app.state.gallery.geometric.radius = width * 0.5;
+            app.state.gallery.wall.card_width = width;
+            app.state.gallery.depth.width = width;
+            app.sync_gallery_presentation();
+            match mode {
+                GalleryMode::Slices => app.gallery_presentation.as_mut().unwrap().settle(),
+                GalleryMode::Geometric => app.hex_presentation.as_mut().unwrap().settle(),
+                GalleryMode::Wall => app.wall_presentation.as_mut().unwrap().settle(),
+                GalleryMode::Depth => {
+                    app.depth_presentation = Some(DepthPresentation::target(&app.state));
+                    app.reset_depth_transients();
+                    app.rebuild_depth_frame();
+                }
+            }
+            app.scene_motion.settle();
+        };
+        prepare(&mut app, 160.0);
+        app.save_gallery_preset().unwrap();
+        let small = app.state.mode_profiles.selected_id(kind).unwrap();
+        prepare(&mut app, 260.0);
+        app.save_gallery_preset().unwrap();
+        let large = app.state.mode_profiles.selected_id(kind).unwrap();
+
+        let show = |app: &GpuCandidate, renderer: &mut iced::Renderer, stage| {
+            let card = if mode == GalleryMode::Depth {
+                app.depth_frame
+                    .as_ref()
+                    .unwrap()
+                    .cards
+                    .iter()
+                    .find(|entry| entry.card.selected)
+                    .unwrap()
+                    .card
+            } else {
+                app.ordinary_frame()
+                    .into_iter()
+                    .find(|entry| entry.card.selected)
+                    .unwrap()
+                    .card
+            };
+            assert_eq!(card.index, 1);
+            let pixels = Scene::new(app, renderer).readback(renderer, app);
+            let index = (card.center[1] as usize * SIZE[0] as usize + card.center[0] as usize) * 4;
+            let color = &pixels[index..index + 3];
+            assert!(
+                color[1] > color[0].saturating_add(40) && color[1] > color[2].saturating_add(40),
+                "{mode:?} {stage}: selected patterned poster is green at {:?}, got {color:?}",
+                card.center
+            );
+            eprintln!(
+                "{mode:?} {stage}: selected artwork matches, size={:?}",
+                card.size
+            );
+            card.size[0]
+        };
+        let before = show(&app, &mut renderer, "large");
+        let _ = update(&mut app, Message::ToggleSettingsPanel);
+        app.settings_workbench.tab = "picker".into();
+        p3_profile_intent(&mut app, SettingsIntent::ApplyPreset(kind, small));
+        let _ = update(&mut app, Message::ToggleSettingsPanel);
+        app.scene_motion.settle();
+        assert_eq!(app.state.mode_profiles.selected_id(kind), Some(small));
+        let tick = |app: &mut GpuCandidate| match mode {
+            GalleryMode::Slices => app.gallery_presentation.as_mut().unwrap().tick(0.016),
+            GalleryMode::Geometric => app.hex_presentation.as_mut().unwrap().tick(0.016),
+            GalleryMode::Wall => app.wall_presentation.as_mut().unwrap().tick(0.016),
+            GalleryMode::Depth => d4a_motion_tick(app, 0.016),
+        };
+        assert!(tick(&mut app));
+        let during = show(&app, &mut renderer, "shrinking");
+        let key = |app: &mut GpuCandidate, value: &str| {
+            let event_window = app.window.unwrap();
+            let _ = update(
+                app,
+                Message::KeyPressed {
+                    key: keyboard::Key::Character(value.into()),
+                    modifiers: keyboard::Modifiers::empty(),
+                    event: NavigationKeyEvent {
+                        event_window,
+                        physical_key: keyboard::key::Physical::Unidentified(
+                            keyboard::key::NativeCode::Unidentified,
+                        ),
+                        location: keyboard::Location::Standard,
+                        repeat: false,
+                    },
+                },
+            );
+        };
+        key(&mut app, "k");
+        assert_eq!(app.state.mode_profiles.selected_id(kind), Some(large));
+        tick(&mut app);
+        show(&app, &mut renderer, "reversing");
+        key(&mut app, "j");
+        assert_eq!(app.state.mode_profiles.selected_id(kind), Some(small));
+        for _ in 0..160 {
+            if !tick(&mut app) {
+                break;
+            }
+        }
+        let after = show(&app, &mut renderer, "small");
+        assert!(
+            after < during && during < before,
+            "{mode:?}: {after} < {during} < {before}"
+        );
+        assert_eq!(submissions.load(Ordering::Acquire), 0);
+    }
 }

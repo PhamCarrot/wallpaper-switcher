@@ -419,8 +419,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let vfs = clamp(globals.vis, 0.0, 1.0);
         return vec4(in.fill.rgb * sa * vfs, sa * vfs);
     }
+    let wobble = (in.misc.w & 32u) != 0u;
+    let bend = clamp(in.flip.w, -2.7, 2.7);
+    var local = in.local;
+    var half_ext = in.half_ext;
+    if (wobble) {
+        half_ext /= max(in.flip.z, 1.0);
+        let yn = clamp(local.y / max(half_ext.y, 1.0), -1.35, 1.35);
+        local.x -= bend * half_ext.x * 0.5 * yn * yn;
+        local.y *= 1.0 + abs(bend) * 0.12 * (1.0 - clamp(abs(local.x / max(half_ext.x, 1.0)), 0.0, 1.0));
+    }
     var d: f32;
-    if ((in.misc.w & 1u) == 1u) {
+    if (!wobble && (in.misc.w & 1u) == 1u) {
         let shape = (in.misc.w >> 8u) & 15u;
         if (shape >= 1u && shape <= 4u) {
             d = sd_triangle(in.local, in.half_ext, shape - 1u);
@@ -434,46 +444,22 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             d = sd_hexagon_flat(in.local, in.half_ext);
         }
     } else {
-        d = sd_sheared_rounded_box(in.local, in.half_ext, in.radii, skew, in.shape.x);
+        d = sd_sheared_rounded_box(local, half_ext, in.radii, skew, in.shape.x);
     }
     let grad = max(length(vec2(dpdx(d), dpdy(d))), 0.0001);
     let shape_a = select(clamp(0.5 - d / grad, 0.0, 1.0), step(d, 0.0), (in.misc.w & 131072u) != 0u);
 
-    if ((in.misc.w & 32u) == 32u && in.misc.x > 0u) {
-        let bend = clamp(in.flip.w, -2.7, 2.7);
-        let par = in.flip.y;
-        let pad = max(in.flip.z, 1.0);
-        let hw = in.half_ext.x / pad;
-        let hh = in.half_ext.y / pad;
-        var loc = in.local;
-        let yn = clamp(loc.y / max(hh, 1.0), -1.35, 1.35);
-        loc.x -= bend * hw * 0.5 * yn * yn;
-        loc.y *= 1.0 + abs(bend) * 0.12 * (1.0 - clamp(abs(loc.x / max(hw, 1.0)), 0.0, 1.0));
-        let d2 = sd_sheared_rounded_box(loc, vec2(hw, hh), in.radii, skew, in.shape.x);
-        let grad2 = max(length(vec2(dpdx(d2), dpdy(d2))), 0.0001);
-        let sa = clamp(0.5 - d2 / grad2, 0.0, 1.0);
-        var norm = clamp(loc / (2.0 * vec2(hw, hh)) + vec2(0.5), vec2(0.0), vec2(1.0));
-        norm.x = clamp(norm.x + par * 0.05, 0.0, 1.0);
+    var base = in.fill;
+    if (wobble && in.misc.x > 0u) {
+        var norm = clamp(local / (2.0 * half_ext) + vec2(0.5), vec2(0.0), vec2(1.0));
+        norm.x = clamp(norm.x + in.flip.y * 0.05, 0.0, 1.0);
         let ca = abs(bend) * 0.02;
         let cr = sample_card(in, vec2(clamp(norm.x + ca, 0.0, 1.0), norm.y));
         let cg = sample_card(in, norm);
         let cb = sample_card(in, vec2(clamp(norm.x - ca, 0.0, 1.0), norm.y));
-        var col = vec3(cr.r, cg.g, cb.b);
-        col = mix(col, in.tint.rgb, in.tint.a);
-        let op = in.params.z;
-        let vf2 = clamp(globals.vis, 0.0, 1.0);
-        let fade2 = in.params.w;
-        let base2 = mix(in.fill.rgb, col, fade2);
-        let bw = in.params.y;
-        let stroke_d2 = abs(d2 + bw * 0.5) - bw * 0.5;
-        let sa2 = clamp(0.5 - stroke_d2 / grad2, 0.0, 1.0) * in.border.a * step(0.001, bw);
-        var rgbo = base2 * sa;
-        rgbo = rgbo * (1.0 - sa2) + in.border.rgb * sa2;
-        let ao = max(sa, sa2);
-        return vec4(rgbo * op * vf2, ao * op * vf2);
-    }
-    var base = in.fill;
-    if (in.misc.x > 0u) {
+        let col = mix(vec3(cr.r, cg.g, cb.b), in.tint.rgb, in.tint.a);
+        base = vec4(mix(in.fill.rgb, col, fade), 1.0);
+    } else if (in.misc.x > 0u) {
         let norm = clamp(
             in.local / (2.0 * in.half_ext) + vec2(0.5),
             vec2(0.0),
@@ -501,7 +487,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
     if ((in.misc.w & 2u) != 0u) {
         let sweep = fract(globals.time / 1.2);
-        let nx = clamp(in.local.x / (2.0 * max(in.half_ext.x, 1.0)) + 0.5, 0.0, 1.0);
+        let nx = clamp(local.x / (2.0 * max(half_ext.x, 1.0)) + 0.5, 0.0, 1.0);
         let band = 1.0 - abs(nx - sweep * 1.5 + 0.25) / 0.25;
         base = vec4(base.rgb + vec3(0.35) * clamp(band, 0.0, 1.0) * 0.35, base.a);
     }
@@ -509,12 +495,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if (flip_p > 0.001 && in.misc.x > 0u) {
         base = vec4(flip_color(in, clamp(flip_p, 0.0, 1.0)), base.a);
     }
-    base = vec4(mix(base.rgb, in.tint.rgb, in.tint.a), base.a);
-    // The donor scene dims non-selected cards through its style state.  
-    // keeps that state in the adapter payload so the existing gallery remains
-    // readable while adopting the donor item primitive.
-    if ((in.misc.w & 262144u) == 0u) {
-        base = vec4(base.rgb * select(1.0, in.shape.z, in.border.a < 0.5), base.a);
+    if (!wobble || in.misc.x == 0u) {
+        base = vec4(mix(base.rgb, in.tint.rgb, in.tint.a), base.a);
+        if ((in.misc.w & 262144u) == 0u) {
+            base = vec4(base.rgb * select(1.0, in.shape.z, in.border.a < 0.5), base.a);
+        }
     }
 
     let border_rgb = in.border.rgb;

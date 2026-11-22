@@ -1,8 +1,8 @@
 settings-selector-layout-card = লেআউট
 settings-selector-display-mode-label = প্রদর্শন মোড
 settings-selector-display-mode-desc = পিকারে ওয়ালপেপার কার্ডগুলো কীভাবে সাজানো হবে তা বেছে নিন।
-settings-selector-filter-motion-label = ফিল্টার গতি
-settings-selector-filter-motion-desc = ফিল্টারের ফলাফল বদলালে রোল কত দ্রুত চলবে। তিনটি ভাগ করা ওজন গতি সেটিংসে আছে।
+settings-selector-filter-motion-label = গ্যালারির গতিবেগ
+settings-selector-filter-motion-desc = গ্যালারিতে চলাচলের গতি নিয়ন্ত্রণ করে।
 settings-selector-presets-card = প্রিসেট
 settings-selector-presets-card-desc = বর্তমান লেআউট সেটিংস সংরক্ষণ করুন বা সংরক্ষিত একটি সেট প্রয়োগ করুন। প্রতিটি প্রদর্শন মোডের নিজস্ব প্রিসেট থাকে।
 settings-selector-preset-name-label = নাম

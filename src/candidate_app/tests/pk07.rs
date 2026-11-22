@@ -284,6 +284,7 @@ pub(super) struct Probe {
     pending: Option<iced::Vector>,
     pub(super) texts: Vec<(String, iced::Rectangle)>,
     pub(super) inputs: Vec<(Option<iced::widget::Id>, iced::Rectangle)>,
+    pub(super) focused: Vec<iced::widget::Id>,
     containers: Vec<(Option<iced::widget::Id>, iced::Rectangle)>,
     pub(super) scrolls: Vec<(
         Option<iced::widget::Id>,
@@ -316,6 +317,17 @@ impl Operation for Probe {
         self.inputs.push((id.cloned(), bounds - self.offset));
     }
 
+    fn focusable(
+        &mut self,
+        id: Option<&iced::widget::Id>,
+        _: iced::Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        if let Some(id) = id.filter(|_| state.is_focused()) {
+            self.focused.push(id.clone());
+        }
+    }
+
     fn container(&mut self, id: Option<&iced::widget::Id>, bounds: iced::Rectangle) {
         self.containers.push((id.cloned(), bounds - self.offset));
     }
@@ -336,9 +348,23 @@ impl Operation for Probe {
 
 impl<'a> Scene<'a> {
     pub(super) fn new(app: &'a GpuCandidate, renderer: &iced::Renderer) -> Self {
+        Self::with_tree(app, renderer, None)
+    }
+
+    pub(super) fn with_tree(
+        app: &'a GpuCandidate,
+        renderer: &iced::Renderer,
+        previous: Option<Tree>,
+    ) -> Self {
         let size = iced::Size::new(app.viewport[0], app.viewport[1]);
         let mut element = view(app, app.window.unwrap());
-        let mut tree = Tree::new(&element);
+        let mut tree = match previous {
+            Some(mut tree) => {
+                tree.diff(element.as_widget());
+                tree
+            }
+            None => Tree::new(&element),
+        };
         let node =
             element
                 .as_widget_mut()
@@ -350,6 +376,10 @@ impl<'a> Scene<'a> {
             bounds: iced::Rectangle::with_size(size),
             cursor: iced::mouse::Cursor::Unavailable,
         }
+    }
+
+    pub(super) fn into_tree(self) -> Tree {
+        self.tree
     }
 
     fn operate(&mut self, renderer: &iced::Renderer, operation: &mut dyn Operation) {

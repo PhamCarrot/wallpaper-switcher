@@ -2240,6 +2240,7 @@ fn dense_real_images_and_recreation(mode: GalleryMode) {
         assert!(entries.iter().all(|e| e.card.layer.is_some()));
         let snapshot = Arc::new(GallerySnapshot {
             defer_near_restore: false,
+            held_wall: None,
             ordinary: Some(entries.clone()),
             cards: entries.iter().map(|e| e.card).collect(),
             posters: app.posters.clone(),

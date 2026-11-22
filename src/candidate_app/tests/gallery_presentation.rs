@@ -807,13 +807,15 @@ fn p7_dense_visible_source_frame_requires_every_distinct_image() {
         .ordinary_frame()
         .iter()
         .all(|e| e.card.layer.is_some() && e.readiness == CardReadiness::Ready));
-    let legacy = depth_poster_sources(
+    let legacy = gallery::poster_sources_bounded(
         &requests,
         &app.poster_slots,
         &[],
         app.catalog_generation.load(Ordering::Acquire),
+        gpu_gallery::MAX_POSTERS,
+        false,
     );
-    assert_eq!(legacy.len(), 32, "Depth retains the old bounded union");
+    assert_eq!(legacy.len(), 32, "Depth keeps its current 32-layer budget");
     assert!(app.ordinary_capacity_issue().is_none());
 }
 
@@ -979,7 +981,7 @@ fn poster_navigation_captures_each_visible_card_source_once() {
         app.selected = Some(40);
         app.sync_gallery_presentation();
         let mut captures = 0;
-        let frame = app.ordinary_base_frame_with_source_selector(|wallpaper| {
+        let frame = app.ordinary_frame_with_source_selector(|wallpaper| {
             captures += 1;
             gallery::poster_media_for_item(wallpaper)
         });
@@ -997,9 +999,9 @@ fn poster_navigation_captures_each_visible_card_source_once() {
 }
 
 #[test]
-fn poster_navigation_shared_frame_capacity_excludes_outgoing_cards() {
+fn poster_navigation_shared_frame_capacity_counts_distinct_current_cards() {
     let app = fixture(80);
-    let frame = app.ordinary_base_frame();
+    let frame = app.ordinary_frame();
     let mut excess: Vec<_> = (0..=gpu_gallery::ordinary_poster_limit())
         .map(|index| {
             let mut entry = frame[0].clone();
@@ -1008,9 +1010,7 @@ fn poster_navigation_shared_frame_capacity_excludes_outgoing_cards() {
         })
         .collect();
     assert!(app.ordinary_capacity_issue_for_frame(&excess).is_some());
-    for entry in &mut excess {
-        entry.outgoing = true;
-    }
+    excess.pop();
     assert!(app.ordinary_capacity_issue_for_frame(&excess).is_none());
 }
 
@@ -1271,10 +1271,6 @@ fn depth_position_uses_the_shifted_card_for_hits_and_poster_demand() {
     app.start_detail(true, "depth-position-check");
     assert_eq!(selected(&app).card.center, shifted.card.center);
     assert_eq!(app.depth_detail_id.as_deref(), Some(shifted.id.as_str()));
-    let old = app.capture_depth_roll().unwrap().old;
-    assert!(old
-        .iter()
-        .any(|entry| entry.body.id == shifted.id && entry.body.card.center == shifted.card.center));
     app.cancel_detail("depth-position-check");
     app.save_gallery_preset().unwrap();
     let id = app
@@ -1357,7 +1353,7 @@ fn image_parallax_crop_reverses_from_the_current_frame_in_both_pickers() {
         };
         set(&mut app, false);
         settle(&mut app);
-        let old = app.ordinary_base_frame();
+        let old = app.ordinary_frame();
         assert_eq!(
             old.iter()
                 .find(|entry| entry.card.selected)
@@ -1368,7 +1364,7 @@ fn image_parallax_crop_reverses_from_the_current_frame_in_both_pickers() {
         );
         set(&mut app, true);
         settle(&mut app);
-        let enabled = app.ordinary_base_frame();
+        let enabled = app.ordinary_frame();
         let (off, on) = old
             .iter()
             .filter(|entry| !entry.card.selected)
@@ -1380,7 +1376,7 @@ fn image_parallax_crop_reverses_from_the_current_frame_in_both_pickers() {
             })
             .expect("off-centre cover responds to parallax");
         let current = |app: &GpuCandidate| {
-            app.ordinary_base_frame()
+            app.ordinary_frame()
                 .into_iter()
                 .find(|entry| entry.id == off.id)
                 .unwrap()
@@ -1398,7 +1394,7 @@ fn image_parallax_crop_reverses_from_the_current_frame_in_both_pickers() {
         assert_eq!(middle.card.layer, off.card.layer);
         assert_eq!(middle.source, off.source);
         let middle_center = app
-            .ordinary_base_frame()
+            .ordinary_frame()
             .into_iter()
             .find(|entry| entry.card.selected)
             .unwrap();
@@ -1452,7 +1448,7 @@ fn image_parallax_crop_reverses_from_the_current_frame_in_both_pickers() {
         app.sync_gallery_presentation();
         assert!(step(&mut app, 0.02));
         let centers = |app: &GpuCandidate| {
-            app.ordinary_base_frame()
+            app.ordinary_frame()
                 .into_iter()
                 .map(|entry| (entry.id, entry.card.center))
                 .collect::<Vec<_>>()
@@ -1505,7 +1501,7 @@ fn picker_cycle_keeps_current_input_while_decode_and_old_receipt_are_held() {
         let frame = app.ordinary_frame();
         let entry = frame
             .iter()
-            .find(|entry| entry.card.index == index && !entry.outgoing)
+            .find(|entry| entry.card.index == index)
             .unwrap();
         let mut card = entry.card;
         if entry.hex_style {
@@ -1592,7 +1588,7 @@ fn picker_cycle_keeps_current_input_while_decode_and_old_receipt_are_held() {
     let current_y = |app: &GpuCandidate| {
         app.ordinary_frame()
             .iter()
-            .find(|entry| entry.card.index == 1 && !entry.outgoing)
+            .find(|entry| entry.card.index == 1)
             .expect("the same visible Wall card on each entrance frame")
             .card
             .center[1]

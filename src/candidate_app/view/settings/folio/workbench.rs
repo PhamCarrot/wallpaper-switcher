@@ -173,21 +173,6 @@ impl FocusCtx<'_> {
     }
 }
 
-fn with_validation<'a>(
-    field: Element<'a, Message>,
-    error: Option<String>,
-    scale: f32,
-    palette: &Palette,
-) -> Element<'a, Message> {
-    if let Some(error) = error {
-        column![field, label(error, TYPE_SMALL, scale, palette.tertiary)]
-            .spacing(3.0 * scale)
-            .into()
-    } else {
-        field
-    }
-}
-
 #[derive(Clone, Copy)]
 pub struct ChromeCtx<'a> {
     pub viewport: (f32, f32),
@@ -934,7 +919,11 @@ pub fn picker_layout_workbench<'a>(
     let mut controls = column![].spacing(13.0 * scale);
     let mut compact_mode = None;
     for (index, setting) in rows.into_iter().enumerate() {
-        let validation = focus.validation_for(&setting.control);
+        let validation = matches!(
+            setting.control,
+            Control::Number { .. } | Control::TextField { .. } | Control::Resolution { .. }
+        )
+        .then(|| focus.validation_for(&setting.control));
         let is_mode = setting.title == tr("settings-selector-display-mode-label");
         let is_pinned = is_mode
             || matches!(
@@ -955,7 +944,16 @@ pub fn picker_layout_workbench<'a>(
             GLYPH_FADE,
             motion,
         );
-        let field = with_validation(field, validation, scale, palette);
+        let field = if let Some(error) = validation {
+            // The input stays at child index zero through validation and correction.
+            let mut decorated = column![field].spacing(3.0 * scale);
+            if let Some(error) = error {
+                decorated = decorated.push(label(error, TYPE_SMALL, scale, palette.tertiary));
+            }
+            decorated.into()
+        } else {
+            field
+        };
         if is_mode && compact_height {
             compact_mode = Some(field);
         } else if is_pinned {
@@ -1166,8 +1164,7 @@ fn picker_layout_field<'a>(
     }
     if setting.control.is_inline_editor() {
         let (focused, focused_choice) = focus.on(SettingsFocus::Controls, index);
-        let validation = focus.validation_for(&setting.control);
-        let field = compact_inline_field(
+        return compact_inline_field(
             catalog,
             setting,
             index,
@@ -1181,11 +1178,9 @@ fn picker_layout_field<'a>(
             fade,
             motion,
         );
-        return with_validation(field, validation, scale, palette);
     }
     if setting.control.is_group_editor() {
-        let validation = focus.validation_for(&setting.control);
-        let field = compact_group_field(
+        return compact_group_field(
             catalog,
             setting,
             index,
@@ -1198,7 +1193,6 @@ fn picker_layout_field<'a>(
             fade,
             motion,
         );
-        return with_validation(field, validation, scale, palette);
     }
     let (focused, focused_choice) = focus.on(SettingsFocus::Controls, index);
     if setting.control.is_compact_action() {

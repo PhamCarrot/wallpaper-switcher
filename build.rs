@@ -9,6 +9,18 @@ fn main() {
     };
     use windows::Win32::Graphics::Direct3D::{ID3DBlob, ID3DInclude};
 
+    #[cfg(target_env = "msvc")]
+    {
+        // The raised desktop needs a layered child window under the icon view.
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/app.manifest");
+        println!("cargo:rerun-if-changed={}", manifest.display());
+        println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+        println!(
+            "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
+            manifest.display()
+        );
+    }
+
     let source_path = PathBuf::from("shaders/transition.hlsl");
     println!("cargo:rerun-if-changed={}", source_path.display());
     let source = fs::read(&source_path).expect("read transition shader source");

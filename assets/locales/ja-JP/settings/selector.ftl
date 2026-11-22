@@ -1,8 +1,8 @@
 settings-selector-layout-card = レイアウト
 settings-selector-display-mode-label = 表示モード
 settings-selector-display-mode-desc = ピッカーで壁紙カードをどう並べるかを選びます。
-settings-selector-filter-motion-label = フィルターのモーション
-settings-selector-filter-motion-desc = フィルター結果が変わったときにスクロールする速さです。3 つの共通の重みはモーション設定にあります。
+settings-selector-filter-motion-label = ギャラリーの動きの速さ
+settings-selector-filter-motion-desc = ギャラリー内の動きの速さを調整します。
 settings-selector-presets-card = プリセット
 settings-selector-presets-card-desc = 現在のレイアウト設定を保存するか、保存したセットを適用します。表示モードごとに独自のプリセットがあります。
 settings-selector-preset-name-label = 名前

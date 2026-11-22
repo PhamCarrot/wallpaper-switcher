@@ -1,8 +1,8 @@
 settings-selector-layout-card = چیدمان
 settings-selector-display-mode-label = حالت نمایش
 settings-selector-display-mode-desc = نحوهٔ چیدن کارت‌های تصویر زمینه در انتخابگر را انتخاب کنید.
-settings-selector-filter-motion-label = حرکت فیلتر
-settings-selector-filter-motion-desc = سرعت گردش کارت‌ها هنگام تغییر نتایج فیلتر. سه ضریب مشترک در تنظیمات حرکت قرار دارند.
+settings-selector-filter-motion-label = سرعت حرکت گالری
+settings-selector-filter-motion-desc = سرعت حرکت در گالری را تنظیم می‌کند.
 settings-selector-presets-card = پیش‌تنظیم‌ها
 settings-selector-presets-card-desc = تنظیمات چیدمان فعلی را ذخیره کنید یا یک مجموعهٔ ذخیره‌شده را اعمال کنید. هر حالت نمایش پیش‌تنظیم‌های خودش را دارد.
 settings-selector-preset-name-label = نام

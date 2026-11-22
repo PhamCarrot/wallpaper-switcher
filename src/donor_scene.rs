@@ -58,10 +58,6 @@ pub(crate) struct CardPresentation {
     pub loading_eligible: bool,
     pub entrance: f32,
     pub launch: LaunchAnimation,
-    pub outgoing: bool,
-    pub roll: f32,
-    pub captured_raw: Option<Vec<InstanceRaw>>,
-    pub retained: Option<crate::gpu_gallery::Poster>,
 }
 
 pub(crate) fn presented_instances(
@@ -73,24 +69,6 @@ pub(crate) fn presented_instances(
     let mut result = Vec::new();
     for entry in entries {
         let first = result.len();
-        if let Some(captured) = &entry.captured_raw {
-            if entry.card.layer.is_none() {
-                continue;
-            }
-            for raw in captured {
-                let mut raw = *raw;
-                raw.rect = raw.rect.map(|v| v * scale);
-                raw.radii = raw.radii.map(|v| v * scale);
-                raw.params[0] *= scale;
-                raw.params[1] *= scale;
-                raw.shape[0] *= scale;
-                roll_raw(&mut raw, entry.roll, false);
-                if raw.rect[2] >= 0.5 * scale {
-                    result.push(raw);
-                }
-            }
-            continue;
-        }
         let card = &entry.card;
         let mut raw = instance_for_card(
             card,
@@ -211,7 +189,9 @@ pub(crate) fn presented_instances(
             raw.misc[3] |= 32;
             raw.flip = [0.0, parallax, pad, bend];
         }
-        roll_raw(&mut raw, entry.roll, true);
+        for radius in &mut raw.radii {
+            *radius = radius.min(raw.rect[2]).min(raw.rect[3]);
+        }
         if raw.rect[2] >= 0.5 * scale {
             result.push(raw);
         }
@@ -222,11 +202,7 @@ pub(crate) fn presented_instances(
             }
         }
     }
-    let cards: Vec<_> = entries
-        .iter()
-        .filter(|e| !e.outgoing)
-        .map(|e| e.card)
-        .collect();
+    let cards: Vec<_> = entries.iter().map(|e| e.card).collect();
     append_external_detail(&mut result, &cards, colors, scale, scene, None);
     result
 }
@@ -265,13 +241,6 @@ pub(crate) fn depth_instances(
             scene.detail_progress
         },
     );
-    result.extend(depth_body_instances(
-        &frame.outgoing,
-        frame,
-        colors,
-        scale,
-        0.0,
-    ));
     if scene.external_detail {
         let cards: Vec<_> = frame.cards.iter().map(|entry| entry.card).collect();
         append_external_detail(
@@ -296,7 +265,6 @@ fn depth_body_instances(
     bodies
         .iter()
         .flat_map(|entry| {
-            let detail_progress = entry.visual_detail_progress.unwrap_or(detail_progress);
             let mut style = *colors;
             style.show_selection_border = frame.selection_frame;
             style.selection_border_width = if entry.card.selected { 3.0 } else { 1.0 };
@@ -430,10 +398,10 @@ fn append_external_detail(
     if !scene.external_detail || p <= 0.001 {
         return;
     }
-    let Some(source) = cards
-        .iter()
-        .find(|card| card.selected)
-        .or(scene.detail_card.as_ref())
+    let Some(source) = scene
+        .detail_card
+        .as_ref()
+        .or_else(|| cards.iter().find(|card| card.selected))
     else {
         return;
     };
@@ -943,32 +911,11 @@ mod tests {
     }
 }
 
-/// Source horizontal crop/half-width cuts. This is a reveal, not a vertex rotation.
-pub(crate) fn roll_raw(raw: &mut InstanceRaw, fraction: f32, incoming: bool) {
-    let f = fraction.clamp(0.0, 1.0);
-    let hw = raw.rect[2];
-    if incoming {
-        raw.rect[0] += hw * (1.0 - f);
-        raw.rect[2] = hw * f;
-        raw.crop[2] *= f;
-    } else {
-        raw.rect[0] -= hw * f;
-        raw.rect[2] = hw * (1.0 - f);
-        raw.crop[0] += raw.crop[2] * f;
-        raw.crop[2] *= 1.0 - f;
-    }
-    for r in &mut raw.radii {
-        *r = r.min(raw.rect[2]).min(raw.rect[3]);
-    }
-}
-
 pub(crate) fn presented_hit_card(entry: &CardPresentation) -> Option<SliceCard> {
-    if entry.outgoing || entry.card.opacity <= 0.0 || entry.entrance <= 0.0 {
+    if entry.card.opacity <= 0.0 || entry.entrance <= 0.0 {
         return None;
     }
     let mut card = entry.card;
-    card.center[0] += card.size[0] * 0.5 * (1.0 - entry.roll);
-    card.size[0] *= entry.roll;
     card.corner_radius = card.corner_radius.min(card.size[0].min(card.size[1]) * 0.5);
     (card.size[0] >= 1.0).then_some(card)
 }
@@ -980,18 +927,20 @@ pub(crate) fn presented_slice_contains(
     viewport: [f32; 2],
     point: [f32; 2],
 ) -> bool {
-    if entry.outgoing || entry.card.opacity <= 0.0 || entry.entrance <= 0.0 {
+    if entry.card.opacity <= 0.0 || entry.entrance <= 0.0 {
         return false;
     }
     let mut raw = instance_for_card(&entry.card, colors, 1.0, 0.0);
     raw.radii = entry.radii;
     let (pad, bend) = match entry.payload {
-        SurfacePayload::Wobble { pad, bend, .. } => (pad, bend),
+        SurfacePayload::Wobble { pad, bend, .. } => (pad.max(1.0), bend.clamp(-2.7, 2.7)),
         _ => (1.0, 0.0),
     };
     raw.rect[2] *= pad;
     raw.rect[3] *= pad;
-    roll_raw(&mut raw, entry.roll, true);
+    for radius in &mut raw.radii {
+        *radius = radius.min(raw.rect[2]).min(raw.rect[3]);
+    }
     if raw.rect[2] < 0.5 {
         return false;
     }
@@ -1003,7 +952,7 @@ pub(crate) fn presented_slice_contains(
     if x.abs() > hw || y.abs() > hh {
         return false;
     }
-    if pad != 1.0 && entry.card.layer.is_some() {
+    if matches!(entry.payload, SurfacePayload::Wobble { .. }) {
         hw /= pad;
         hh /= pad;
         let yn = (y / hh.max(1.0)).clamp(-1.35, 1.35);

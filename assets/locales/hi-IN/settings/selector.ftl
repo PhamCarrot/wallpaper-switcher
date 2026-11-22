@@ -1,8 +1,8 @@
 settings-selector-layout-card = लेआउट
 settings-selector-display-mode-label = डिस्प्ले मोड
 settings-selector-display-mode-desc = चुनें कि पिकर में वॉलपेपर कार्ड कैसे सजाए जाएँ।
-settings-selector-filter-motion-label = फ़िल्टर गति
-settings-selector-filter-motion-desc = फ़िल्टर परिणाम बदलने पर रोल कितनी तेज़ी से चलता है। तीनों साझा वेट Motion सेटिंग्स में हैं।
+settings-selector-filter-motion-label = गैलरी की गति
+settings-selector-filter-motion-desc = गैलरी में होने वाली हलचल की गति तय करता है।
 settings-selector-presets-card = प्रीसेट
 settings-selector-presets-card-desc = वर्तमान लेआउट सेटिंग्स सहेजें या कोई सहेजा हुआ सेट लागू करें। हर डिस्प्ले मोड के अपने प्रीसेट होते हैं।
 settings-selector-preset-name-label = नाम

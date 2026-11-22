@@ -231,6 +231,158 @@ fn press(key: keyboard::Key, modifiers: keyboard::Modifiers, text: Option<&str>)
     })
 }
 
+#[test]
+#[ignore = "Mounted Studio input with retained Iced widget state; explicit headless invocation"]
+fn pk08_slices_height_keeps_focus_through_replacement_and_saves_new_preset() {
+    use candidate_state::mode_profiles::Snapshot;
+    use iced::advanced::widget::Tree;
+    use keyboard::{key::Named, Key, Modifiers};
+
+    let (mut app, submissions, _) = fixture();
+    app.settings_locale = localization::Catalog::new("en-US", "en-US").unwrap();
+    app.viewport = [1920.0, 1080.0];
+    app.state.gallery.mode = GalleryKind::Slices;
+    app.gallery_mode = GalleryMode::Slices;
+    app.state.gallery.slices.height = 520.0;
+    app.state.save(&app.state_path).unwrap();
+    open(&mut app);
+    let renderer = renderer();
+    hit_section(&mut app, &renderer, "settings-section-layout-presets");
+    assert!(app.settings_workbench.layout_studio());
+
+    const HEIGHT: &str = composed::keys::selector::SLICE_HEIGHT;
+    const ERROR: &str = "Enter a finite number.";
+    let id = composed::workbench_input_id(HEIGHT);
+    let (mut tree, click) = {
+        let mut scene = Scene::new(&app, &renderer);
+        let point = scene
+            .probe(&renderer)
+            .inputs
+            .into_iter()
+            .find(|(input, _)| input.as_ref() == Some(&id))
+            .expect("mounted Slices height input")
+            .1
+            .center();
+        let messages = scene.click(&renderer, point, iced::mouse::Button::Left);
+        assert!(scene.probe(&renderer).focused.contains(&id));
+        (Some(scene.into_tree()), messages)
+    };
+    for message in click {
+        let _ = update(&mut app, message);
+    }
+
+    let event = |app: &mut GpuCandidate, tree: &mut Option<Tree>, event| {
+        let (retained, messages) = {
+            let mut scene = Scene::with_tree(app, &renderer, tree.take());
+            assert!(
+                scene.probe(&renderer).focused.contains(&id),
+                "the same input must retain focus before {event:?}"
+            );
+            let messages = scene.event(&renderer, iced::mouse::Cursor::Unavailable, event);
+            (scene.into_tree(), messages)
+        };
+        *tree = Some(retained);
+        for message in messages {
+            let _ = update(app, message);
+        }
+    };
+    let expect_errors = |app: &GpuCandidate, tree: &mut Option<Tree>, count| {
+        let mut scene = Scene::with_tree(app, &renderer, tree.take());
+        let actual = scene
+            .probe(&renderer)
+            .texts
+            .iter()
+            .filter(|(text, _)| text == ERROR)
+            .count();
+        assert_eq!(actual, count);
+        *tree = Some(scene.into_tree());
+    };
+    let named = |key| press(Key::Named(key), Modifiers::empty(), None);
+    let digit = |key: &str| press(Key::Character(key.into()), Modifiers::empty(), Some(key));
+
+    for select_all in [
+        iced::Event::Keyboard(keyboard::Event::ModifiersChanged(Modifiers::CTRL)),
+        press(Key::Character("a".into()), Modifiers::CTRL, None),
+        iced::Event::Keyboard(keyboard::Event::ModifiersChanged(Modifiers::empty())),
+    ] {
+        event(&mut app, &mut tree, select_all);
+    }
+    for (key, raw, geometry) in [
+        (named(Named::Backspace), "", 520.0),
+        (digit("1"), "1", 1.0),
+        (digit("3"), "13", 13.0),
+    ] {
+        event(&mut app, &mut tree, key);
+        assert_eq!(app.settings_workbench.draft.raw_inputs[HEIGHT], raw);
+        assert_eq!(app.state.gallery.slices.height, geometry);
+        assert_eq!(
+            CandidateState::load(&app.state_path).gallery.slices.height,
+            520.0
+        );
+        expect_errors(&app, &mut tree, 0);
+    }
+    event(&mut app, &mut tree, named(Named::Enter));
+    assert!(!app.settings_workbench.draft.raw_inputs.contains_key(HEIGHT));
+    assert_eq!(
+        CandidateState::load(&app.state_path).gallery.slices.height,
+        13.0
+    );
+
+    for _ in 0..2 {
+        event(&mut app, &mut tree, named(Named::Backspace));
+    }
+    expect_errors(&app, &mut tree, 0);
+    event(&mut app, &mut tree, named(Named::Enter));
+    assert_eq!(app.settings_workbench.draft.raw_inputs[HEIGHT], "");
+    expect_errors(&app, &mut tree, 1);
+
+    event(&mut app, &mut tree, digit("2"));
+    assert_eq!(app.settings_workbench.draft.raw_inputs[HEIGHT], "2");
+    assert_eq!(app.state.gallery.slices.height, 2.0);
+    expect_errors(&app, &mut tree, 0);
+    event(&mut app, &mut tree, named(Named::Backspace));
+    expect_errors(&app, &mut tree, 0);
+    d3_key(&mut app, Named::Tab);
+    assert_eq!(app.settings_workbench.draft.raw_inputs[HEIGHT], "");
+    expect_errors(&app, &mut tree, 1);
+    d3_key(&mut app, Named::Escape);
+    expect_errors(&app, &mut tree, 0);
+    assert!(!app.settings_workbench.draft.raw_inputs.contains_key(HEIGHT));
+    assert_eq!(app.state.gallery.slices.height, 13.0);
+
+    let save = {
+        let mut scene = Scene::with_tree(&app, &renderer, tree.take());
+        scene.hit_label(
+            &renderer,
+            app.settings_locale
+                .text_static("settings-selector-preset-save-current"),
+            |message| {
+                matches!(
+                    message,
+                    Message::SettingsIntent {
+                        intent: Intent::SavePreset(GalleryKind::Slices),
+                        ..
+                    }
+                )
+            },
+        )
+    };
+    let _ = update(&mut app, save);
+    let saved = CandidateState::load(&app.state_path);
+    assert_eq!(saved.gallery.slices.height, 13.0);
+    let preset = saved
+        .mode_profiles
+        .selected_id(GalleryKind::Slices)
+        .unwrap();
+    let Some(Snapshot::Slices(snapshot)) =
+        saved.mode_profiles.snapshot(GalleryKind::Slices, preset)
+    else {
+        panic!("reloaded Slices preset is missing its geometry");
+    };
+    assert_eq!(snapshot.height, 13.0);
+    assert_eq!(submissions.load(Ordering::Acquire), 0);
+}
+
 fn input(
     app: &mut GpuCandidate,
     renderer: &iced::Renderer,

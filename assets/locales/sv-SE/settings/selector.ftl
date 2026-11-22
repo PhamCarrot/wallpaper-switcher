@@ -1,8 +1,8 @@
 settings-selector-layout-card = Layout
 settings-selector-display-mode-label = Visningsläge
 settings-selector-display-mode-desc = Välj hur bakgrundskorten arrangeras i väljaren.
-settings-selector-filter-motion-label = Filterrörelse
-settings-selector-filter-motion-desc = Hur snabbt rullningen går när filterresultaten ändras. De tre delade vikterna finns i Rörelse-inställningarna.
+settings-selector-filter-motion-label = Galleriets rörelsehastighet
+settings-selector-filter-motion-desc = Styr rörelsehastigheten i galleriet.
 settings-selector-presets-card = Förval
 settings-selector-presets-card-desc = Spara de aktuella layoutinställningarna eller använd en sparad uppsättning. Varje visningsläge har egna förval.
 settings-selector-preset-name-label = Namn

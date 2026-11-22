@@ -1,8 +1,8 @@
 settings-selector-layout-card = Раскладка
 settings-selector-display-mode-label = Режим отображения
 settings-selector-display-mode-desc = Выберите, как карточки обоев располагаются в окне выбора.
-settings-selector-filter-motion-label = Движение фильтра
-settings-selector-filter-motion-desc = Как быстро прокручивается лента при изменении результатов фильтра. Три общие скорости задаются в настройках движения.
+settings-selector-filter-motion-label = Скорость движения галереи
+settings-selector-filter-motion-desc = Управляет скоростью движения в галерее.
 settings-selector-presets-card = Предустановки
 settings-selector-presets-card-desc = Сохраните текущие настройки раскладки или примените сохранённый набор. У каждого режима отображения свои предустановки.
 settings-selector-preset-name-label = Название

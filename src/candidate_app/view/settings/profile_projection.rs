@@ -465,16 +465,6 @@ fn install_after_edit(
     }
     let previous = app.state.gallery.depth.clone();
     let changed = proposed.gallery != app.state.gallery;
-    let ordinary_outgoing = if changed && app.gallery_mode != GalleryMode::Depth {
-        app.capture_ordinary_roll()?
-    } else {
-        None
-    };
-    let depth_outgoing = if changed && app.gallery_mode == GalleryMode::Depth {
-        app.capture_depth_roll()
-    } else {
-        None
-    };
     app.commit_local_state_change(proposed).map_err(|error| {
         app.save_failure
             .clone()
@@ -487,14 +477,10 @@ fn install_after_edit(
             .insert(key.into(), value);
     }
     if changed {
+        app.release_wall_colour_hold("preset-geometry-changed");
         if app.gallery_mode == GalleryMode::Depth {
             app.depth_settings_changed(&previous);
-            if depth_outgoing.is_some() {
-                app.depth_roll = depth_outgoing;
-                app.start_motion(0.0);
-            }
         } else {
-            app.ordinary_roll = ordinary_outgoing;
             app.start_motion(0.0);
         }
         app.wall_scroll_offset = 0.0;

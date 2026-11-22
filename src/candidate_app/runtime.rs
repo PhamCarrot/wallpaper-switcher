@@ -692,10 +692,7 @@ fn boot(
         preset_wheel: None,
         depth_revision: 0,
         depth_frame: None,
-        depth_roll: None,
-        ordinary_roll: None,
-        ordinary_transition_issue: None,
-        depth_roll_fallbacks: 0,
+        wall_colour_hold: None,
         depth_presentation: None,
         #[cfg(test)]
         deterministic_animation: false,

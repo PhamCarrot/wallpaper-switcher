@@ -2050,6 +2050,7 @@ fn apply_with_outcomes(
                 |mut output| {
                     let display = &output.monitor.device_id;
                     if output.incoming.is_none() {
+                        output.session.ensure_wallpaper_layer()?;
                         let endpoint = context
                             .confirmed_capture_owners
                             .borrow()

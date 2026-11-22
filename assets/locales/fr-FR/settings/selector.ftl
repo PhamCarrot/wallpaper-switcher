@@ -1,8 +1,8 @@
 settings-selector-layout-card = Disposition
 settings-selector-display-mode-label = Mode d’affichage
 settings-selector-display-mode-desc = Choisissez la disposition des cartes de fonds d’écran dans le sélecteur.
-settings-selector-filter-motion-label = Mouvement du filtre
-settings-selector-filter-motion-desc = Vitesse du défilement lorsque les résultats du filtre changent. Les trois poids partagés se trouvent dans les réglages Mouvement.
+settings-selector-filter-motion-label = Vitesse des mouvements de la galerie
+settings-selector-filter-motion-desc = Règle la vitesse des mouvements dans la galerie.
 settings-selector-presets-card = Préréglages
 settings-selector-presets-card-desc = Enregistrez les réglages de disposition actuels ou appliquez un ensemble enregistré. Chaque mode d’affichage conserve ses propres préréglages.
 settings-selector-preset-name-label = Nom

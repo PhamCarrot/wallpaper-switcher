@@ -13,7 +13,7 @@ For the user-facing explanation of source discovery, disk caching, GPU memory an
 | `src/candidate_app/catalog_watch.rs` | One catalog scan/watch worker; native notification ownership outside the state mutex, generation-checked publication and bounded owner shutdown. |
 | `src/candidate_app/catalog_snapshot.rs`, `catalog_watch.rs`, `runtime.rs` | Bounded/versioned derived startup catalog, read-only load and stale display; reducer-accepted worker persistence through existing staged publication. Freshness guards startup and automatic provider authority separately from content revision. |
 | `src/scanner.rs`, `src/library.rs`, `src/candidate_app/catalog.rs` | Cached Steam discovery, bounded ordered metadata/header phases and single-pass precise stamps; accepted content revision/diff and stable healthy poster remap. Scan request cancellation uses its own clock. |
-| `src/candidate_app/ordinary_roll.rs` | Outgoing poster and material pins through gallery transitions, with stable identity checks and shared layer demand. |
+| `src/candidate_app/wall_colour_hold.rs` | The frozen Wall view and exact poster pins while Colour's current order loads. |
 | `src/library/media_still.rs`, `src/candidate_app/images.rs`, `src/poster_worker.rs` | Capture source identity and freshness, start the worker, submit bounded poster work, and signal completion. |
 | `src/poster_worker/cache.rs`, `src/poster_worker/colour.rs`, `src/file_publication.rs` | Cache root and epoch guards, colour analysis, and atomic staged publication. |
 | `src/candidate_app/events.rs` | Reducer installs current catalog and poster results, including `Wake::PostersReady`. |
@@ -31,7 +31,7 @@ lanes are4–8,2 on one logical processor; optional top-level `catalog_scan_thre
 1–8 takes effect at restart. Policy logs once; opt-in phase traces report actual
 activity and elapsed I/O work separately from serial discovery/startup/presentation.
 
-For incorrect or missing posters, trace the current frame through `schedule_posters`, the worker mailbox, `Wake::PostersReady`, and GPU residency. Validate both selected/detail and pinned outgoing resources. Ordinary cards use up to 256 logical slots in a packed far atlas up to 2048×2048 with 160×88 tiles. The ordinary view promotes cards by selection, detail and displayed size. In Depth, selected, hovered and active detail cards qualify for the 512×512 near array. Other visible neighbors keep their far textures. The near array has six mips down to 16px. It grows in increments of eight up to 32 layers and stays within device limits. The same worker creates far tiles and handles near promotion or restoration. The GPU checks resource identity before remapping logical slots. The combined upload cap stays at 8 MiB per frame.
+For incorrect or missing posters, trace the current frame through `schedule_posters`, the worker mailbox, `Wake::PostersReady`, and GPU residency. Validate the selected and detail resources and any active Wall Colour pins. Ordinary cards use up to 256 logical slots in a packed far atlas up to 2048×2048 with 160×88 tiles. The ordinary view promotes cards by selection, detail and displayed size. In Depth, selected, hovered and active detail cards qualify for the 512×512 near array. Other visible neighbors keep their far textures. The near array has six mips down to 16px. It grows in increments of eight up to 32 layers and stays within device limits. The same worker creates far tiles and handles near promotion or restoration. The GPU checks resource identity before remapping logical slots. The combined upload cap stays at 8 MiB per frame.
 
 The worker handles cache barriers, far restores and current decode in that
 order. Near restores wait for 100 ms of far/decode quiet, then take one
@@ -44,7 +44,7 @@ visible clip and sufficient opacity. A prewarm can settle at far quality for
 those clipped cards. Queued near work counts as activity for maintenance,
 colour analysis and cache pregeneration.
 
-Within a demand batch, matching media kinds, paths and file fingerprints share a decode. A current reusable slot or roll pin can supply that result. Each logical slot retains its own upload state and incremental completion. Restore shares one canonical read or decode per path and captured recovery key within the restore batch.
+Within a demand batch, matching media kinds, paths and file fingerprints share a decode. A current reusable slot or Wall Colour pin can supply that result. Each logical slot retains its own upload state and incremental completion. Restore shares one canonical read or decode per path and captured recovery key within the restore batch.
 
 On a compressed Depth surface, a restore request can already own the finished
 160×88 RGBA tile. The worker packs those tiles directly to BC1 and asks for one
@@ -101,6 +101,15 @@ that gate. Modifier bookkeeping remains active. One maintenance wake revisits id
 shrink; bounded16ms wakes pump pending GPU receipts without blocking the render
 thread. Upload/fence completion is separate from actual presented-frame timing.
 
+When Wall Colour publishes a reordered catalog, the current order drives poster
+demand. The last visible full-card frame and its exact resources can stay on
+screen until the matching GPU receipt or the four-second deadline. The wheel can
+interrupt this hold. Gallery hits resume when the current order is visible.
+Current-scene capacity and external Detail use the current layout throughout.
+
+Slices keeps a padded backing quad for wobble. The item shader and hit test
+project the same unpadded, bent silhouette regardless of texture residency.
+
 
 P5.5 presentation inputs (filtered IDs/aspects/index positions) are cached by the
 existing catalog/filter revision owners. Unchanged refresh retains shared Arc
@@ -135,10 +144,11 @@ Config publication. Next and Previous preset resolve a stable ID in the current
 picker's displayed order, then use the same owner as a manual preset selection.
 Older individual preset bindings are retained as inert compatibility data.
 
-Same-gallery profile application captures the outgoing ordinary or Depth presentation
-before geometry publication. It restores the captured roll, restarts the existing
-motion owner, and reschedules visible poster demand. Library search, source filters,
-folder selection, and favourites reuse the existing catalogue and filter owners.
+Same-gallery profile application publishes the new geometry through the
+existing springs and reschedules visible poster demand. Filter and catalog
+publication build full cards for the current identities in all four modes.
+Library search, source filters, folder selection, and favourites reuse the
+existing catalogue and filter owners.
 Hand and Collection are documented contracts only until they have their own stable
 identity, draw and hit model, poster-demand mapping, settings projection, v4
 compatibility rules, transition owner, and focused Preview evidence.

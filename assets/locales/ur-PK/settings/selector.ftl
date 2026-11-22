@@ -1,8 +1,8 @@
 settings-selector-layout-card = ترتیب
 settings-selector-display-mode-label = ڈسپلے موڈ
 settings-selector-display-mode-desc = منتخب کریں کہ پکر میں وال پیپر کارڈ کیسے ترتیب دیے جائیں۔
-settings-selector-filter-motion-label = فلٹر کی حرکت
-settings-selector-filter-motion-desc = فلٹر کے نتائج بدلنے پر رول کتنی تیزی سے چلتا ہے۔ تینوں مشترکہ وزن حرکت کی ترتیبات میں ہیں۔
+settings-selector-filter-motion-label = گیلری میں حرکت کی رفتار
+settings-selector-filter-motion-desc = گیلری کے اندر حرکت کی رفتار کو کنٹرول کرتی ہے۔
 settings-selector-presets-card = پری سیٹس
 settings-selector-presets-card-desc = موجودہ ترتیب کی ترتیبات محفوظ کریں یا محفوظ شدہ سیٹ لاگو کریں۔ ہر ڈسپلے موڈ اپنے الگ پری سیٹ رکھتا ہے۔
 settings-selector-preset-name-label = نام

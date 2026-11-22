@@ -224,9 +224,6 @@ impl GpuCandidate {
 
     /// Retain only exact healthy resources, remapping stable IDs before replacing the catalog.
     pub(super) fn retain_catalog_posters(&mut self, incoming: &[WallpaperItem], revision: u64) {
-        self.depth_roll = None;
-        self.ordinary_roll = None;
-        self.ordinary_transition_issue = None;
         self.depth_frame = None;
         self.invalidate_poster_work();
         let mut slots = HashMap::new();
@@ -298,18 +295,14 @@ impl GpuCandidate {
     }
 
     pub(super) fn refresh_filter_with_poster_hold(&mut self, hold_wall_posters: bool) {
-        let hold_wall_posters = hold_wall_posters && self.atlas_entry.is_none();
+        let hold_wall_posters = hold_wall_posters
+            && self.visible
+            && self.gallery_mode == GalleryMode::Wall
+            && self.atlas_entry.is_none();
         let defer_wall_colour = self.defer_wall_colour_sort();
         if !defer_wall_colour {
             self.prune_colour_stamps();
         }
-        self.ordinary_transition_issue = None;
-        let previous_filtered = self.filtered_indices.clone();
-        let outgoing = self.capture_depth_roll();
-        let (ordinary_outgoing, ordinary_error) = match self.capture_ordinary_roll() {
-            Ok(roll) => (roll, None),
-            Err(error) => (None, Some(error)),
-        };
         let monitor_key = self.active_monitor_key();
         let index_by_id: HashMap<&str, usize> = self
             .catalog
@@ -341,7 +334,7 @@ impl GpuCandidate {
         } else {
             &self.colours.sorting
         };
-        self.filtered_indices = library::query_catalog(
+        let filtered = library::query_catalog(
             &self.catalog,
             &self.filter_rule,
             &self.state.favorites,
@@ -373,8 +366,20 @@ impl GpuCandidate {
                 .get(*index)
                 .is_some_and(|wallpaper| self.source_filter.accepts(wallpaper.source))
         })
-        .collect();
-        if previous_filtered != self.filtered_indices {
+        .collect::<Vec<_>>();
+        let replacement = self.filtered_indices != filtered;
+        if !hold_wall_posters || filtered.is_empty() {
+            self.release_wall_colour_hold("filter-input-changed");
+        }
+        let mut hold = if replacement && hold_wall_posters && !filtered.is_empty() {
+            self.wall_colour_hold
+                .take()
+                .or_else(|| self.capture_wall_colour_hold())
+        } else {
+            None
+        };
+        self.filtered_indices = filtered;
+        if replacement {
             self.presentation_inputs = None;
         }
         if self.colours.passive_requery {
@@ -404,40 +409,20 @@ impl GpuCandidate {
                 )
             });
         }
-        let replacement = previous_filtered != self.filtered_indices;
         if !replacement {
             self.update_catalog_status();
             return;
         }
         self.reset_depth_transients();
         self.invalidate_poster_work();
-        if replacement
-            && self.visible
-            && self.gallery_mode == GalleryMode::Depth
-            && !self.filtered_indices.is_empty()
-            && outgoing.is_some()
-        {
-            self.depth_roll = outgoing;
-            self.start_motion(0.0);
+        if let Some(hold) = &mut hold {
+            hold.deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
         }
-        if replacement
-            && self.visible
-            && self.gallery_mode != GalleryMode::Depth
-            && !self.filtered_indices.is_empty()
-        {
-            self.ordinary_roll = ordinary_outgoing.map(|mut roll| {
-                if hold_wall_posters && !roll.old.is_empty() {
-                    roll.poster_wait_deadline =
-                        Some(std::time::Instant::now() + std::time::Duration::from_secs(4));
-                }
-                roll
-            });
+        self.wall_colour_hold = hold;
+        if self.visible && self.gallery_mode != GalleryMode::Depth {
             self.start_motion(0.0);
         }
         self.poster_failure = false;
-        if replacement {
-            self.ordinary_transition_issue = ordinary_error;
-        }
         self.update_catalog_status();
     }
 
@@ -464,11 +449,7 @@ impl GpuCandidate {
             CatalogPresentation::Loading => Some("Loading wallpapers…".into()),
             CatalogPresentation::Ready => None,
         };
-        let status = self
-            .engine_properties_diagnostic
-            .clone()
-            .or_else(|| self.ordinary_transition_issue.clone())
-            .or(catalog_status);
+        let status = self.engine_properties_diagnostic.clone().or(catalog_status);
         self.status = status
             .as_deref()
             .map(|message| self.status_with_persistence_issue(message))

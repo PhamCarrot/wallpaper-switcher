@@ -54,7 +54,6 @@ fn next_frame(app: &GpuCandidate, dt: f32) -> (bool, Wake) {
             state,
             selection: app.depth_selection.clone(),
             presentation: app.depth_presentation,
-            filter_wave: None,
             ordinary: app.gallery_presentation.clone(),
             hex,
             wall: app.wall_presentation.clone(),
@@ -454,7 +453,7 @@ fn studio_uses_live_geometry_and_settles_in_all_modes() {
 }
 
 fn corners(app: &GpuCandidate) -> [f32; 4] {
-    app.ordinary_base_frame()
+    app.ordinary_frame()
         .into_iter()
         .find(|e| e.card.selected)
         .unwrap()
@@ -504,7 +503,7 @@ fn corners_reverse_and_reload_from_raw_settings() {
         [5.0, 23.0, 34.0, app.state.gallery.slices.corner_radius]
     );
     let hit = |app: &GpuCandidate| {
-        let entries = app.ordinary_base_frame();
+        let entries = app.ordinary_frame();
         let entry = entries.iter().find(|e| e.card.selected).unwrap();
         let [x, y] = entry.card.center;
         let [w, h] = entry.card.size;

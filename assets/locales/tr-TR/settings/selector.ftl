@@ -1,8 +1,8 @@
 settings-selector-layout-card = Yerleşim
 settings-selector-display-mode-label = Görüntüleme modu
 settings-selector-display-mode-desc = Duvar kâğıdı kartlarının seçicide nasıl düzenlendiğini seçin.
-settings-selector-filter-motion-label = Filtre hareketi
-settings-selector-filter-motion-desc = Filtre sonuçları değiştiğinde kaydırmanın hızı. Paylaşılan üç hız, Hareket ayarlarındadır.
+settings-selector-filter-motion-label = Galeri hareket hızı
+settings-selector-filter-motion-desc = Galerideki hareketin hızını ayarlar.
 settings-selector-presets-card = Ön ayarlar
 settings-selector-presets-card-desc = Mevcut düzen ayarlarını kaydedin veya kaydedilmiş bir küme uygulayın. Her görüntüleme modu kendi ön ayarlarını tutar.
 settings-selector-preset-name-label = Ad

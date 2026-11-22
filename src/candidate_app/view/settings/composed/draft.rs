@@ -1,5 +1,7 @@
 use super::{schema, Card, Control, Row};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+const FINITE_NUMBER_ERROR: &str = "Enter a finite number.";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -13,6 +15,7 @@ pub struct Draft {
     pub values: HashMap<String, Value>,
     pub raw_inputs: HashMap<String, String>,
     pub errors: HashMap<String, String>,
+    empty_numbers: HashSet<String>,
     original_inputs: HashMap<String, Option<Value>>,
     generation: u64,
     active: bool,
@@ -38,6 +41,7 @@ impl Draft {
     pub fn cancel_input(&mut self, path: &str) -> Option<Value> {
         self.raw_inputs.remove(path);
         self.errors.remove(path);
+        self.empty_numbers.remove(path);
         let original = self.original_inputs.remove(path)?;
         match &original {
             Some(value) => {
@@ -50,11 +54,27 @@ impl Draft {
         original
     }
 
+    pub fn validate_input(&mut self, path: &str) -> Result<(), String> {
+        if self.empty_numbers.remove(path) {
+            self.errors
+                .insert(path.to_owned(), FINITE_NUMBER_ERROR.into());
+        }
+        self.errors
+            .get(path)
+            .map_or(Ok(()), |error| Err(error.clone()))
+    }
+
+    pub fn validate_empty_numbers(&mut self) {
+        self.errors.extend(
+            self.empty_numbers
+                .drain()
+                .map(|path| (path, FINITE_NUMBER_ERROR.into())),
+        );
+    }
+
     /// A failed field commit leaves its buffer and cancellation snapshot intact.
     pub fn commit_input(&mut self, path: &str) -> Result<Option<Value>, String> {
-        if let Some(error) = self.errors.get(path) {
-            return Err(error.clone());
-        }
+        self.validate_input(path)?;
         if self.raw_inputs.remove(path).is_none() {
             return Ok(None);
         }
@@ -91,7 +111,13 @@ impl Draft {
             .entry(path.to_owned())
             .or_insert_with(|| self.values.get(path).cloned());
         self.raw_inputs.insert(path.to_owned(), raw.clone());
+        self.empty_numbers.remove(path);
         let parsed = match control {
+            Control::Number { .. } | Control::MotionWeights { .. } if raw.trim().is_empty() => {
+                self.errors.remove(path);
+                self.empty_numbers.insert(path.to_owned());
+                return None;
+            }
             Control::Number { .. } | Control::MotionWeights { .. } => raw
                 .trim()
                 .parse::<f64>()
@@ -122,7 +148,7 @@ impl Draft {
                 let message = if matches!(control, Control::Resolution { .. }) {
                     "Enter positive width × height."
                 } else {
-                    "Enter a finite number."
+                    FINITE_NUMBER_ERROR
                 };
                 self.errors.insert(path.to_owned(), message.into());
                 None
@@ -293,7 +319,12 @@ mod tests {
         );
         assert_eq!(draft.raw_inputs["general.uiScale"], "");
         assert_eq!(draft.values["general.uiScale"], Value::Number(1.4));
-        assert!(draft.errors.contains_key("general.uiScale"));
+        assert!(draft.errors.is_empty());
+        assert_eq!(
+            draft.commit_input("general.uiScale"),
+            Err(FINITE_NUMBER_ERROR.into())
+        );
+        assert_eq!(draft.raw_inputs["general.uiScale"], "");
         for raw in ["NaN", "inf", "-inf", "1e9999"] {
             assert_eq!(
                 draft.input(token, &fields, "general.uiScale", raw.into()),

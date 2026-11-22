@@ -1,8 +1,8 @@
 settings-selector-layout-card = Layout
 settings-selector-display-mode-label = Modo de exibição
 settings-selector-display-mode-desc = Escolha como os cartões de papel de parede são organizados no seletor.
-settings-selector-filter-motion-label = Movimento do filtro
-settings-selector-filter-motion-desc = A velocidade da rolagem quando os resultados do filtro mudam. Os três pesos compartilhados ficam nas configurações de Movimento.
+settings-selector-filter-motion-label = Velocidade de movimento da galeria
+settings-selector-filter-motion-desc = Controla a velocidade de movimento na galeria.
 settings-selector-presets-card = Predefinições
 settings-selector-presets-card-desc = Salve as configurações de layout atuais ou aplique um conjunto salvo. Cada modo de exibição tem as próprias predefinições.
 settings-selector-preset-name-label = Nome

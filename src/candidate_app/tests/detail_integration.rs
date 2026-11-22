@@ -254,7 +254,7 @@ fn p10_shared_toggle_defaults_payload_and_depth_real_frame_shadow_controls() {
 }
 
 fn seed(app: &mut GpuCandidate) {
-    let entries = app.ordinary_base_frame();
+    let entries = app.ordinary_frame();
     let generation = app.catalog_generation.load(Ordering::Acquire);
     app.poster_slots.clear();
     let mut posters = Vec::new();
@@ -280,89 +280,58 @@ fn seed(app: &mut GpuCandidate) {
 }
 
 #[test]
-fn p10_ordinary_filter_cut_owns_outgoing_images_and_rejects_stale_hidden_frames() {
+fn p10_ordinary_filters_publish_one_full_card_per_current_item() {
     for mode in [
         GalleryMode::Slices,
         GalleryMode::Geometric,
         GalleryMode::Wall,
     ] {
         let mut app = fixture(mode, 24);
-        app.filtered_indices = (0..8).collect();
-        app.presentation_inputs = None;
-        app.selected = Some(3);
-        app.sync_gallery_presentation();
-        if let Some(p) = &mut app.gallery_presentation {
-            p.settle();
+        for start in [0, 8, 0] {
+            app.state.favorites = (start..start + 8)
+                .map(|i| app.wallpapers[i].id.clone())
+                .collect();
+            app.filter_rule.favorites_only = true;
+            app.refresh_filter();
+            app.sync_gallery_presentation();
+            let entries = app.ordinary_frame();
+            assert!(!entries.is_empty());
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| &entry.id)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                entries.len()
+            );
+            for entry in &entries {
+                assert!(app.filtered_indices.contains(&entry.card.index));
+                assert_eq!(entry.id, app.wallpapers[entry.card.index].id);
+                let hit = donor_scene::presented_hit_card(entry).unwrap();
+                assert_eq!((hit.center, hit.size), (entry.card.center, entry.card.size));
+                let raw = donor_scene::presented_instances(
+                    std::slice::from_ref(entry),
+                    &GalleryColors::default(),
+                    1.0,
+                    &scene(&app),
+                );
+                let body = raw.last().unwrap();
+                assert_eq!(body.crop, entry.crop);
+                let pad = match entry.payload {
+                    donor_scene::SurfacePayload::Wobble { pad, .. } => pad,
+                    _ => 1.0,
+                };
+                assert!((body.rect[2] * 2.0 / pad - hit.size[0]).abs() < 0.001);
+            }
         }
-        if let Some(p) = &mut app.hex_presentation {
-            p.settle();
-        }
-        seed(&mut app);
-        let captured = app.capture_ordinary_roll().unwrap().unwrap();
-        assert!(!captured.old.is_empty());
-        let poster = captured.old[0].pin.poster.clone();
-        let original = captured.old[0].entry.captured_raw.clone().unwrap();
-        app.filtered_indices = (8..16).collect();
-        app.presentation_inputs = None;
-        app.selected = Some(10);
-        app.sync_gallery_presentation();
-        app.ordinary_roll = Some(captured);
-        app.reconcile_ordinary_roll();
-        let roll = app.ordinary_roll.as_mut().unwrap();
-        roll.advance_to(0.5);
-        let frame = app.ordinary_frame();
-        assert!(frame.iter().any(|e| e.outgoing));
-        assert!(frame
-            .iter()
-            .filter(|e| e.outgoing)
-            .all(|e| donor_scene::presented_hit_card(e).is_none()));
-        assert!(app
-            .gallery_pins()
-            .iter()
-            .any(|g| g.poster.same_resource(&poster)));
-        assert_eq!(
-            app.ordinary_roll.as_ref().unwrap().old[0]
-                .entry
-                .captured_raw
-                .as_ref()
-                .unwrap()[0]
-                .rect,
-            original[0].rect
-        );
-        let generation = app.motion_generation.load(Ordering::Acquire);
-        app.stop_gallery_transients("p10-hide");
-        assert!(app.ordinary_roll.is_none());
-        let _ = update(
-            &mut app,
-            Message::Wake(Wake::MotionFrame {
-                generation,
-                value: 1.0,
-                velocity: 0.0,
-                state: GalleryMotionState::source(1.0, 1.0, 250.0, 1.0),
-                selection: HashMap::new(),
-                presentation: None,
-                filter_wave: Some(0.6),
-                ordinary: None,
-                hex: None,
-                wall: None,
-                scene: None,
-            }),
-        );
-        assert!(app.ordinary_roll.is_none());
+        app.filter_rule.text = "no wallpaper has this name".into();
+        app.refresh_filter();
+        assert!(app.ordinary_frame().is_empty());
     }
-    let mut raw = donor_scene::InstanceRaw {
-        rect: [100.0, 80.0, 40.0, 30.0],
-        crop: [0.1, 0.2, 0.6, 0.5],
-        ..bytemuck::Zeroable::zeroed()
-    };
-    donor_scene::roll_raw(&mut raw, 0.25, false);
-    assert_eq!(raw.rect, [90.0, 80.0, 30.0, 30.0]);
-    assert!((raw.crop[0] - 0.25).abs() < 0.00001);
-    assert_eq!(raw.shape[1], 0.0);
 }
 
 #[test]
-fn p10_wall_unchanged_cells_keep_visible_hits_and_64_plus_64_union_is_pinned() {
+fn p10_wall_colour_hold_reserves_64_exact_layers_for_a_disjoint_view() {
     let mut app = fixture(GalleryMode::Wall, 160);
     app.state.gallery.wall.columns = 8;
     app.state.gallery.wall.rows = 8;
@@ -376,24 +345,14 @@ fn p10_wall_unchanged_cells_keep_visible_hits_and_64_plus_64_union_is_pinned() {
     app.sync_gallery_presentation();
     app.wall_presentation.as_mut().unwrap().settle();
     seed(&mut app);
-    let old = app.capture_ordinary_roll().unwrap().unwrap();
-    assert_eq!(old.old.len(), 64);
-    app.ordinary_roll = Some(old.clone());
-    app.reconcile_ordinary_roll();
-    assert!(app.ordinary_roll.as_ref().unwrap().old.is_empty());
-    assert!(app
-        .ordinary_frame()
-        .iter()
-        .all(|e| e.roll == 1.0 && donor_scene::presented_hit_card(e).is_some()));
+    app.wall_colour_hold = app.capture_wall_colour_hold();
+    assert_eq!(app.wall_colour_pins().len(), 64);
     app.filtered_indices = (64..128).collect();
     app.presentation_inputs = None;
     app.selected = Some(67);
     app.sync_gallery_presentation();
-    app.ordinary_roll = Some(old);
-    app.reconcile_ordinary_roll();
-    assert_eq!(app.gallery_pins().len(), 64);
     let requested: Vec<_> = app
-        .ordinary_base_frame()
+        .ordinary_frame()
         .iter()
         .map(|e| PosterRequestIdentity {
             index: e.card.index,
@@ -405,38 +364,22 @@ fn p10_wall_unchanged_cells_keep_visible_hits_and_64_plus_64_union_is_pinned() {
     let sources = gallery::poster_sources_bounded(
         &requested,
         &app.poster_slots,
-        &app.gallery_pins(),
+        app.wall_colour_pins(),
         app.catalog_generation.load(Ordering::Acquire),
-        app.ordinary_union_limit(),
+        gpu_gallery::ordinary_poster_limit(),
         true,
     );
     assert_eq!(sources.len(), 64);
     let layers: HashSet<_> = sources
         .iter()
         .map(|s| s.layer)
-        .chain(app.gallery_pins().iter().map(|g| g.slot.layer))
+        .chain(app.wall_colour_pins().iter().map(|g| g.slot.layer))
         .collect();
     assert_eq!(
         layers.len(),
         128,
         "incoming cannot overwrite immutable outgoing slots"
     );
-}
-
-#[test]
-fn p10_transition_refusal_survives_catalog_status_and_ready_then_recovers() {
-    let mut app = fixture(GalleryMode::Wall, 8);
-    app.ordinary_transition_issue = Some(
-        "Filter roll requires too many simultaneous preview images; reduce layout and retry."
-            .into(),
-    );
-    app.update_catalog_status();
-    let refusal = app.status.clone();
-    let _ = update(&mut app, Message::Wake(Wake::PostersReady));
-    assert_eq!(app.status, refusal);
-    app.refresh_filter();
-    assert!(app.ordinary_transition_issue.is_none());
-    assert_ne!(app.status, refusal);
 }
 
 #[test]
@@ -494,6 +437,15 @@ fn p10_external_detail_retains_selected_source_when_current_frame_moves_away() {
     for mode in [GalleryMode::Wall, GalleryMode::Geometric] {
         let mut app = fixture(mode, 100);
         seed(&mut app);
+        let held = (mode == GalleryMode::Wall).then(|| {
+            let mut entry = app
+                .ordinary_frame()
+                .into_iter()
+                .find(|entry| entry.card.selected)
+                .unwrap();
+            entry.card.layer = None;
+            (Arc::new(vec![entry]), app.wall_frame_clip())
+        });
         app.start_detail(true, "capture");
         let source = app.detail_source.unwrap();
         app.detail_progress = 0.74;
@@ -518,8 +470,9 @@ fn p10_external_detail_retains_selected_source_when_current_frame_moves_away() {
         assert_eq!(instances.len(), 3);
         let geometry = donor_detail::external_body(source, app.viewport, app.detail_progress);
         assert_eq!(instances[2].rect[0], geometry.center[0]);
-        let snapshot = gpu_gallery::GallerySnapshot {
+        let mut snapshot = gpu_gallery::GallerySnapshot {
             defer_near_restore: false,
+            held_wall: None,
             ordinary: Some(Vec::new()),
             cards: Vec::new(),
             posters: app.posters.clone(),
@@ -535,42 +488,20 @@ fn p10_external_detail_retains_selected_source_when_current_frame_moves_away() {
             missing[2].misc[0], 0,
             "failed reupload must not sample old layer"
         );
+        if held.is_some() {
+            snapshot.held_wall = held;
+            let resident = snapshot.ordinary_resident_instances(&app.posters, 1.0);
+            assert_eq!(
+                resident.last().unwrap().misc[..2],
+                [2, scene.detail_card.unwrap().layer.unwrap()]
+            );
+        }
 
         let element = view::view(&app, window::Id::unique());
         assert!(!iced::advanced::widget::Tree::new(&element)
             .children
             .is_empty());
     }
-}
-
-#[test]
-fn p10_repeated_filter_cells_share_retained_resources_without_false_overflow() {
-    let mut app = fixture(GalleryMode::Wall, 8);
-    seed(&mut app);
-    let mut roll = app.capture_ordinary_roll().unwrap().unwrap();
-    let ghost = roll.old[0].clone();
-    roll.old.clear();
-    for i in 0..257 {
-        let mut g = ghost.clone();
-        g.entry.card.center = [i as f32 * 1000.0, 50.0];
-        roll.old.push(g);
-    }
-    app.ordinary_roll = Some(roll);
-    let captured = app
-        .capture_ordinary_roll()
-        .expect("visual cells sharing a poster do not exhaust the atlas")
-        .unwrap();
-    assert!(captured.old.len() > gpu_gallery::MAX_ORDINARY_POSTERS);
-    assert!(
-        captured
-            .old
-            .iter()
-            .map(|g| g.pin.slot.layer)
-            .collect::<HashSet<_>>()
-            .len()
-            <= 8
-    );
-    assert!(app.ordinary_transition_issue.is_none());
 }
 
 #[test]

@@ -1,8 +1,8 @@
 settings-selector-layout-card = Layout
 settings-selector-display-mode-label = Display mode
 settings-selector-display-mode-desc = Choose how wallpaper cards are arranged in the picker.
-settings-selector-filter-motion-label = Filter motion
-settings-selector-filter-motion-desc = How quickly the roll runs when filter results change. The three shared weights live in Motion settings.
+settings-selector-filter-motion-label = Gallery motion speed
+settings-selector-filter-motion-desc = Controls the speed of gallery movement.
 settings-selector-presets-card = Presets
 settings-selector-presets-card-desc = Save the current layout settings or apply a saved set. Each display mode keeps its own presets.
 settings-selector-preset-name-label = Name

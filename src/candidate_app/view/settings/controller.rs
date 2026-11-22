@@ -805,9 +805,7 @@ fn set_theme_target(app: &mut GpuCandidate, provider: &str, enabled: bool) -> Re
     Ok(())
 }
 fn commit_path(app: &mut GpuCandidate, path: &str) -> Result<Task<Message>, String> {
-    if let Some(error) = app.settings_workbench.draft.errors.get(path) {
-        return Err(error.clone());
-    }
+    app.settings_workbench.draft.validate_input(path)?;
     let session = &mut app.settings_workbench;
     if let Some(Value::Text(value)) = session.draft.values.get(path) {
         if session.lists.text(path).is_some() {
@@ -828,6 +826,7 @@ fn commit_path(app: &mut GpuCandidate, path: &str) -> Result<Task<Message>, Stri
     Ok(value.map_or_else(Task::none, |value| apply_value(app, path, value)))
 }
 fn commit(app: &mut GpuCandidate) -> Result<Task<Message>, (Task<Message>, String)> {
+    app.settings_workbench.draft.validate_empty_numbers();
     let errors = &app.settings_workbench.draft.errors;
     if let Some(error) = app
         .settings_workbench
@@ -1116,9 +1115,6 @@ fn apply_value(app: &mut GpuCandidate, path: &str, value: Value) -> Task<Message
             };
             if app.state.gallery_motion_speed != speed {
                 app.state.gallery_motion_speed = speed;
-                if app.gallery_mode == GalleryMode::Depth && app.depth_roll.is_some() {
-                    app.start_motion(0.0);
-                }
                 app.persist_state();
             }
             None

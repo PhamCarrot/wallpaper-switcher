@@ -391,11 +391,10 @@ fn wall_colour_indexing_keeps_order_and_holds_art_until_current_gpu_receipt() {
     app.selected = Some(blue);
     app.sync_wall_presentation();
     app.wall_presentation.as_mut().unwrap().settle();
-    app.ordinary_roll = None;
 
     let catalog_generation = app.catalog_generation.load(Ordering::Acquire);
     let mut posters = Vec::new();
-    for (layer, entry) in app.ordinary_base_frame().into_iter().enumerate() {
+    for (layer, entry) in app.ordinary_frame().into_iter().enumerate() {
         let layer = layer as u32;
         app.poster_slots.insert(
             entry.card.index,
@@ -434,6 +433,7 @@ fn wall_colour_indexing_keeps_order_and_holds_art_until_current_gpu_receipt() {
         persistence: Ok(()),
         worker_failure: None,
     };
+    let displayed_before = app.ordinary_frame();
     let order_before = app.filtered_indices.clone();
     let generation_before = app.poster_generation.load(Ordering::Acquire);
     let motion_before = app.motion_generation.load(Ordering::Acquire);
@@ -452,28 +452,35 @@ fn wall_colour_indexing_keeps_order_and_holds_art_until_current_gpu_receipt() {
     assert!(!app.colours.active);
     assert_eq!(app.filtered_indices, [red, blue]);
     assert_eq!(app.selected, Some(blue));
-    assert!(app.wall_colour_roll_held());
-    let frame = app.ordinary_frame();
-    assert!(
-        frame
+    assert!(app.wall_colour_hold.is_some());
+    let current = app.ordinary_frame();
+    let hold = app.wall_colour_hold.as_ref().unwrap();
+    let held_wall = Some((hold.entries.clone(), hold.clip));
+    let cards = |entries: &[donor_scene::CardPresentation]| {
+        entries
             .iter()
-            .filter(|entry| entry.outgoing && entry.roll == 0.0)
-            .count()
-            >= 1
-    );
-    assert!(frame
+            .map(|entry| (entry.id.clone(), entry.card, entry.crop))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(cards(&hold.entries), cards(&displayed_before));
+    assert_ne!(cards(&hold.entries), cards(&current));
+    assert!(current
         .iter()
-        .filter(|entry| !entry.outgoing)
-        .all(|entry| { donor_scene::presented_hit_card(entry).is_none() }));
+        .all(|entry| donor_scene::presented_hit_card(entry).is_some()));
+    assert!(app.wall_colour_pins().iter().all(|pin| app
+        .posters
+        .iter()
+        .any(|poster| poster.same_resource(&pin.poster))));
 
-    // A receipt can release the roll only for the current, finished demand.
+    // The view remains coherent until this demand's exact GPU receipt.
     let key = app.atlas_prewarm_key();
     let posters = app.posters.clone();
     let mut program = GalleryProgram {
         prewarm: Some((key, false)),
         snapshot: Arc::new(GallerySnapshot {
             defer_near_restore: false,
-            ordinary: Some(frame),
+            held_wall,
+            ordinary: Some(current),
             cards: Vec::new(),
             posters: posters.clone(),
             colors: GalleryColors::default(),
@@ -526,7 +533,7 @@ fn wall_colour_indexing_keeps_order_and_holds_art_until_current_gpu_receipt() {
             posters: posters.clone(),
         })),
     );
-    assert!(app.wall_colour_roll_held());
+    assert!(app.wall_colour_hold.is_some());
     let _ = update(
         &mut app,
         Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Prewarmed {
@@ -534,7 +541,7 @@ fn wall_colour_indexing_keeps_order_and_holds_art_until_current_gpu_receipt() {
             posters: Arc::new(posters.as_ref().clone()),
         })),
     );
-    assert!(app.wall_colour_roll_held());
+    assert!(app.wall_colour_hold.is_some());
     let _ = update(
         &mut app,
         Message::Wake(Wake::PosterGpu(gpu_gallery::PosterFeedback::Prewarmed {
@@ -542,10 +549,53 @@ fn wall_colour_indexing_keeps_order_and_holds_art_until_current_gpu_receipt() {
             posters,
         })),
     );
-    assert!(!app.wall_colour_roll_held());
-    app.ordinary_roll.as_mut().unwrap().advance_to(1.6);
+    assert!(app.wall_colour_hold.is_none());
+    assert!(app.wall_colour_pins().is_empty());
     assert!(app
         .ordinary_frame()
         .iter()
-        .all(|entry| !entry.outgoing && entry.roll == 1.0));
+        .all(|entry| donor_scene::presented_hit_card(entry).is_some()));
+
+    app.wall_colour_hold = app.capture_wall_colour_hold();
+    app.wall_colour_hold.as_mut().unwrap().deadline = std::time::Instant::now();
+    app.start_motion(0.0);
+    let generation = app.motion_generation.load(Ordering::Acquire);
+    let _ = update(
+        &mut app,
+        Message::Wake(Wake::MotionFrame {
+            generation,
+            value: 0.0,
+            velocity: 0.0,
+            state: GalleryMotionState::source(0.0, 0.0, 250.0, 1.0),
+            selection: HashMap::new(),
+            presentation: None,
+            ordinary: None,
+            hex: None,
+            wall: None,
+            scene: None,
+        }),
+    );
+    assert!(app.wall_colour_hold.is_none());
+    assert!(app.wall_colour_pins().is_empty());
+
+    app.wall_colour_hold = app.capture_wall_colour_hold();
+    let bound = crate::candidate_app::lifecycle::bind_gallery_input(
+        &app,
+        GalleryMessage::BoundWheel {
+            amount: -1.0,
+            vertical: -1.0,
+            modifiers: Default::default(),
+            sequence: None,
+        },
+    );
+    let _ = update(&mut app, bound);
+    assert!(app.wall_colour_hold.is_none());
+    assert!(app.wall_colour_pins().is_empty());
+
+    app.wall_colour_hold = app.capture_wall_colour_hold();
+    let reordered = app.filtered_indices.clone();
+    app.refresh_filter();
+    assert_eq!(app.filtered_indices, reordered);
+    assert!(app.wall_colour_hold.is_none());
+    assert!(app.wall_colour_pins().is_empty());
 }

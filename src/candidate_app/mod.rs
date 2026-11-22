@@ -20,7 +20,8 @@ mod localization;
 mod motion_mailbox;
 mod native_caption;
 mod operations;
-mod ordinary_roll;
+mod wall_colour_hold;
+use wall_colour_hold::WallPosterPin;
 mod persistence;
 mod playlists;
 mod runtime;
@@ -35,11 +36,10 @@ mod wall_presentation;
 use gallery::{
     activate_gallery_variant, advance_gallery_motion, apply_saved_gallery_preset,
     choose_geometric_curve, choose_geometric_shape, configure_wall_variant_geometry,
-    depth_poster_requests, depth_poster_sources, gallery_layout_params,
-    gallery_variant_for_viewport, ghost_matches_request, navigate_gallery_mode,
-    next_gallery_variant_index, next_shape_filter, poster_indices_for_view,
+    depth_poster_requests, gallery_layout_params, gallery_variant_for_viewport,
+    navigate_gallery_mode, next_gallery_variant_index, next_shape_filter, poster_indices_for_view,
     poster_mode_requires_invalidation, poster_request_changed, poster_source_for_item,
-    prioritized_poster_indices, wall_visible_poster_indices, DepthGhost, GalleryNavigationEffect,
+    prioritized_poster_indices, wall_visible_poster_indices, GalleryNavigationEffect,
 };
 use gallery::{
     apply_gallery_viewport_policy, card_click_action, consume_depth_pointer, depth_wheel_steps,
@@ -48,7 +48,7 @@ use gallery::{
     poster_completion_is_current, poster_completion_matches, poster_slot_matches,
     set_gallery_number_value, shape_chip_label, trace_gallery_mouse_consumption,
     view_legacy_selection, wall_layout_choices, CardClickAction, DepthPointerIntent,
-    DepthPresentation, DepthRoll, GalleryNumberField, PosterRequestIdentity, PosterSlot,
+    DepthPresentation, GalleryNumberField, PosterRequestIdentity, PosterSlot,
     DEPTH_POSITION_FIELDS,
 };
 #[cfg(test)]
@@ -206,7 +206,6 @@ enum Wake {
         state: GalleryMotionState,
         selection: HashMap<String, GalleryMotionState>,
         presentation: Option<DepthPresentation>,
-        filter_wave: Option<f32>,
         ordinary: Option<gallery_presentation::GalleryPresentation>,
         hex: Option<hex_presentation::HexPresentation>,
         wall: Option<wall_presentation::WallPresentation>,
@@ -735,10 +734,7 @@ struct GpuCandidate {
     preset_wheel: Option<(events::PresetWheelBinding, f32)>,
     depth_revision: u64,
     depth_frame: Option<gpu_gallery::DepthSnapshot>,
-    depth_roll: Option<DepthRoll>,
-    ordinary_roll: Option<ordinary_roll::OrdinaryRoll>,
-    ordinary_transition_issue: Option<String>,
-    depth_roll_fallbacks: u64,
+    wall_colour_hold: Option<wall_colour_hold::WallColourHold>,
     depth_presentation: Option<DepthPresentation>,
     #[cfg(test)]
     deterministic_animation: bool,

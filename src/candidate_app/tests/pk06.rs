@@ -317,7 +317,6 @@ pub(super) fn open_selected_item_tag_editor(
     renderer: &iced::Renderer,
 ) -> String {
     app.set_gallery_mode(GalleryMode::Geometric);
-    app.ordinary_roll = None;
     app.deterministic_animation = true;
     assert!(app.depth_frame.is_none());
     app.start_detail(true, "headless-detail-tags");

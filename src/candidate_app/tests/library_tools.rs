@@ -81,7 +81,6 @@ fn w4_hidden_real_watch_publication_preserves_tags_selection_and_stops_visual_de
             state: GalleryMotionState::source(0.0, 0.0, 250.0, 1.0),
             selection: Default::default(),
             presentation: None,
-            filter_wave: None,
             ordinary: None,
             hex: None,
             wall: None,

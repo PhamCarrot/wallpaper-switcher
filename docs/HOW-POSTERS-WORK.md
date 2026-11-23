@@ -34,10 +34,12 @@ operation owned by Apply.
 | Worker memory | Decoded pixels and packed tiles waiting for upload |
 | GPU memory | The tile atlas and the high-detail textures currently needed |
 
-The disk cache sizes itself to roughly one poster per library item
-(never more than a quarter of the free disk space, with a 128–512 MiB
-floor; a `cache_max_mib` setting overrides it). The original files stay
-in their source folders — nothing is moved or modified.
+The automatic disk cache cap is the larger of a base cap and a library
+estimate. The base is 128 MiB, or 512 MiB when at least 10 GB is free.
+The estimate allows one poster per library item plus 25% headroom, up
+to a quarter of free disk space. A positive `cache_max_mib` overrides
+the automatic cap. The original files stay in their source folders —
+nothing is moved or modified.
 
 ## Why a card can appear late or look empty
 

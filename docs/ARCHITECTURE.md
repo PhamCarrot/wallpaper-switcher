@@ -19,8 +19,7 @@ Folders / Workshop projects
    WallpaperCoordinator ── only component allowed to change the desktop
         │
         ├── Windows native wallpaper (pictures)
-        ├── Video playback (Windows Media Foundation)
-        └── Wallpaper Engine (named-pipe control)
+        └── Wallpaper Engine (local videos and Workshop projects)
         │
         ▼
    Transition cover: captures the outgoing frame, holds it over the
@@ -33,10 +32,10 @@ Folders / Workshop projects
 | --- | --- | --- |
 | App entry & UI | `src/bin/`, `src/candidate_app/` | The gallery window, settings, detail view, playlists, theme designer and tray. Browsing never touches the desktop. |
 | Catalog | `src/scanner.rs`, `src/library.rs`, `candidate_app/catalog*.rs` | Discovers local folders and Workshop projects, keeps a watch worker and a versioned startup snapshot. |
-| Poster pipeline | `src/poster_worker*`, `src/gpu_gallery.rs` | Decodes sources to a 512² canvas, caches them on disk, and uploads tiles/high-detail textures within an 8 MiB per-frame budget. See [How posters work](HOW-POSTERS-WORK.md). |
+| Poster pipeline | `src/poster_worker*`, `src/gpu_gallery.rs` | Decodes sources to a 512² canvas, using Windows Media Foundation to extract video frames. Caches posters on disk and uploads tiles/high-detail textures within an 8 MiB per-frame budget. See [How posters work](HOW-POSTERS-WORK.md). |
 | Coordinator | `src/coordinator.rs` | The single owner of desktop and provider state: rollback snapshots, capability checks, Apply, restore and shutdown. |
 | Transitions | `src/transition.rs`, `src/d3d11_transition.rs`, `src/desktop_transition.rs`, `shaders/transition.hlsl` | 30 effects. Static images blend two captured frames; live wallpapers are revealed through a premultiplied cover because the live frame cannot be captured. |
-| Provider glue | `src/engine_ipc.rs`, `src/engine_capture.rs`, `src/native_wallpaper.rs` | Engine named-pipe control and absence/presence observation, frame capture, Windows wallpaper APIs. |
+| Provider glue | `src/engine_ipc.rs`, `src/engine_capture.rs`, `src/native_wallpaper.rs` | Wallpaper Engine control commands and state queries, frame capture, and Windows wallpaper APIs. |
 | State | `src/config.rs`, `candidate_app/persistence.rs` | `config.toml` + v4 `candidate-state.toml`; loads stay read-only and older versions are migrated on save. |
 
 ## Safety rules

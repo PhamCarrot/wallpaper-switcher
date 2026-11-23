@@ -139,7 +139,7 @@ pub fn next_widget_mouse_sequence() -> u64 {
 /// command-buffer completion; it is not a compositor presentation counter.
 pub fn next_gallery_frame_sequence() -> u64 {
     GALLERY_FRAME_SEQUENCE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
         .expect("gallery frame trace sequence exhausted")

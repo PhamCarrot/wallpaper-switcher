@@ -2066,7 +2066,17 @@ fn apply_with_outcomes(
                 ),
             );
         }
-        Err(error) => {
+        Err(PrepareFailure::Refused(error)) => {
+            crate::apply_trace::event("transition-preflight-refused", &error);
+            outcomes.extend(apply_direct_to_monitors(request, monitors, context));
+            return (
+                order_outcomes(outcomes),
+                TransitionResult::not_attempted(
+                    "the provider capability preflight refused the request before any cover was shown",
+                ),
+            );
+        }
+        Err(PrepareFailure::Unavailable(error)) => {
             crate::log_debug(&format!(
                 "Transition unavailable; using direct switch fallback: {error}"
             ));
@@ -2076,6 +2086,18 @@ fn apply_with_outcomes(
                 TransitionResult::direct_fallback(error),
             );
         }
+    }
+}
+
+#[derive(Debug)]
+enum PrepareFailure {
+    Refused(String),
+    Unavailable(String),
+}
+
+impl From<String> for PrepareFailure {
+    fn from(error: String) -> Self {
+        Self::Unavailable(error)
     }
 }
 
@@ -2488,7 +2510,7 @@ fn outgoing_frame(
     context: &ApplyContext,
     overlay_windows: &[usize],
     requested: &std::path::Path,
-) -> Result<Option<FrozenFrame>, String> {
+) -> Result<Option<(FrozenFrame, bool)>, String> {
     crate::apply_trace::event(
         "outgoing-capture-start",
         format!(
@@ -2500,7 +2522,7 @@ fn outgoing_frame(
     );
     let result = outgoing_frame_inner(operation_id, monitor, context, overlay_windows, requested);
     match &result {
-        Ok(Some(frame)) => crate::apply_trace::event(
+        Ok(Some((frame, _))) => crate::apply_trace::event(
             "outgoing-capture-complete",
             format!(
                 "display={:?} width={} height={}",
@@ -2528,7 +2550,7 @@ fn outgoing_frame_inner(
     context: &ApplyContext,
     overlay_windows: &[usize],
     requested: &std::path::Path,
-) -> Result<Option<FrozenFrame>, String> {
+) -> Result<Option<(FrozenFrame, bool)>, String> {
     match engine_ipc::availability() {
         engine_ipc::EngineAvailability::ControlAvailable => {
             let location = context.engine_location_for_device(&monitor.device_id)?;
@@ -2557,7 +2579,7 @@ fn outgoing_frame_inner(
                         overlay_windows,
                         None,
                     )
-                    .map(Some);
+                    .map(|frame| Some((frame, true)));
                 }
                 EngineObservationState::ConfirmedAbsent
                     if observation
@@ -2582,7 +2604,7 @@ fn outgoing_frame_inner(
     }
     let outgoing_path = native_wallpaper::get_wallpaper_for_device(&monitor.device_id)?;
     FrozenFrame::from_path_cover(&outgoing_path, monitor.rect.width(), monitor.rect.height())
-        .map(Some)
+        .map(|frame| Some((frame, false)))
 }
 
 fn prepare_transition(
@@ -2590,17 +2612,16 @@ fn prepare_transition(
     targets: Vec<native_wallpaper::NativeMonitor>,
     effect: TransitionEffect,
     context: &ApplyContext,
-) -> Result<Option<PreparedTransition>, String> {
-    let mut outputs = Vec::with_capacity(targets.len());
-    let mut overlay_windows = Vec::with_capacity(targets.len());
+) -> Result<Option<PreparedTransition>, PrepareFailure> {
+    let mut captured = Vec::with_capacity(targets.len());
     for monitor in targets {
         #[cfg(test)]
         eprintln!("trace: capturing outgoing frame");
-        let Some(outgoing) = outgoing_frame(
+        let outgoing = outgoing_frame(
             request.operation_id,
             &monitor,
             context,
-            &overlay_windows,
+            &[],
             request.wallpaper.engine_target(),
         )
         .map_err(|error| {
@@ -2608,8 +2629,21 @@ fn prepare_transition(
                 "{}: outgoing frame unavailable ({error})",
                 monitor.device_id
             )
-        })?
-        else {
+        })?;
+        if let Some((_, engine_owned)) = &outgoing {
+            check_operation_capability(
+                request.wallpaper.source,
+                &monitor.device_id,
+                *engine_owned,
+                context.engine_capabilities,
+            )
+            .map_err(PrepareFailure::Refused)?;
+        }
+        captured.push((monitor, outgoing));
+    }
+    let mut outputs = Vec::with_capacity(captured.len());
+    for (monitor, outgoing) in captured {
+        let Some((outgoing, _)) = outgoing else {
             outputs.push((monitor.device_id, None));
             continue;
         };
@@ -2653,7 +2687,8 @@ fn prepare_transition(
                         return Err(format!(
                             "{}: incoming image unavailable ({error})",
                             monitor.device_id
-                        ));
+                        )
+                        .into());
                     }
                 }
             }
@@ -2683,7 +2718,6 @@ fn prepare_transition(
                 session.placement_trace()
             )
         });
-        overlay_windows.push(session.window_identity());
         outputs.push((
             monitor.device_id.clone(),
             Some(PreparedOutput {
@@ -2961,25 +2995,35 @@ fn validate_operation_capabilities(
     capabilities: engine_ipc::EngineCapabilities,
 ) -> Result<(), String> {
     for (target_id, baseline) in target_ids.iter().zip(baselines) {
-        let requirement = match (source, baseline) {
-            (WallpaperSource::LocalImage, MonitorProviderState::Engine { .. }) => {
-                Some("forward Engine-to-native handoff")
-            }
-            (
-                WallpaperSource::LocalVideo | WallpaperSource::WallpaperEngine,
-                MonitorProviderState::Native { .. },
-            ) => Some("required rollback to the native baseline after Engine Apply"),
-            _ => None,
-        };
-        if let Some(requirement) = requirement {
-            capabilities
-                .require_absence_confirmation()
-                .map_err(|error| {
-                    format!(
-                        "Request not started: target {target_id} requires {requirement}; {error}"
-                    )
-                })?;
+        check_operation_capability(
+            source,
+            target_id,
+            matches!(baseline, MonitorProviderState::Engine { .. }),
+            capabilities,
+        )?;
+    }
+    Ok(())
+}
+
+fn check_operation_capability(
+    source: WallpaperSource,
+    target_id: &str,
+    engine_owned: bool,
+    capabilities: engine_ipc::EngineCapabilities,
+) -> Result<(), String> {
+    let requirement = match (source, engine_owned) {
+        (WallpaperSource::LocalImage, true) => Some("forward Engine-to-native handoff"),
+        (WallpaperSource::LocalVideo | WallpaperSource::WallpaperEngine, false) => {
+            Some("required rollback to the native baseline after Engine Apply")
         }
+        _ => None,
+    };
+    if let Some(requirement) = requirement {
+        capabilities
+            .require_absence_confirmation()
+            .map_err(|error| {
+                format!("Request not started: target {target_id} requires {requirement}; {error}")
+            })?;
     }
     Ok(())
 }
@@ -5488,6 +5532,55 @@ mod contract_tests {
             (TransitionEffect::Swirl, "configured"),
             "static targets keep every effect, also on the CPU surface"
         );
+    }
+
+    #[test]
+    fn transition_preflight_uses_the_provider_capability_rule() {
+        use engine_ipc::{AbsenceConfirmationCapability as A, EngineCapabilities};
+        let unsupported = EngineCapabilities {
+            absence_confirmation: A::Unsupported,
+        };
+        let supported = EngineCapabilities {
+            absence_confirmation: A::SyntheticSupported,
+        };
+        let native = MonitorProviderState::Native {
+            wallpaper: "C:/owned-baseline.jpg".into(),
+            position: native_wallpaper::FILL_POSITION,
+        };
+        let engine = MonitorProviderState::Engine {
+            wallpaper: "C:/owned/project.json".into(),
+            location: "Monitor0".into(),
+        };
+        for source in [
+            WallpaperSource::LocalImage,
+            WallpaperSource::LocalVideo,
+            WallpaperSource::WallpaperEngine,
+        ] {
+            for (owned, baseline) in [(true, &engine), (false, &native)] {
+                for capabilities in [unsupported, supported] {
+                    let early =
+                        check_operation_capability(source, "display-a", owned, capabilities);
+                    let provider = validate_operation_capabilities(
+                        source,
+                        &["display-a".to_string()],
+                        std::slice::from_ref(baseline),
+                        capabilities,
+                    );
+                    assert_eq!(early, provider, "{source:?} engine_owned={owned}");
+                }
+            }
+        }
+        let refusal =
+            check_operation_capability(WallpaperSource::LocalImage, "display-a", true, unsupported)
+                .unwrap_err();
+        assert!(
+            refusal.contains("forward Engine-to-native handoff"),
+            "{refusal}"
+        );
+        let reason = TransitionResult::not_attempted(
+            "the provider capability preflight refused the request before any cover was shown",
+        );
+        assert_eq!(reason.status_name(), "not-attempted");
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub(in crate::poster_worker) struct Maintenance {
     profile: PathBuf,
     override_mib: Option<u32>,
     preview: bool,
+    logged_budget: std::sync::atomic::AtomicU64,
 }
 
 impl Maintenance {
@@ -26,17 +27,23 @@ impl Maintenance {
             profile,
             override_mib,
             preview,
+            logged_budget: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    pub(in crate::poster_worker) fn budget(&self) -> u64 {
+    pub(in crate::poster_worker) fn budget(&self, library_items: usize) -> u64 {
         let free = free_bytes(&self.profile);
-        let budget = budget_bytes(free, self.override_mib);
-        crate::config::log_debug(&format!(
-            "Disk cache cap: {} MiB (override={:?}, available_bytes={free:?})",
-            budget / MIB,
-            self.override_mib
-        ));
+        let budget = budget_bytes(free, self.override_mib, library_items);
+        let previous = self
+            .logged_budget
+            .swap(budget, std::sync::atomic::Ordering::AcqRel);
+        if previous != budget {
+            crate::config::log_debug(&format!(
+                "Disk cache cap: {} MiB (override={:?}, available_bytes={free:?}, library_items={library_items})",
+                budget / MIB,
+                self.override_mib
+            ));
+        }
         budget
     }
 
@@ -148,18 +155,20 @@ fn free_bytes(profile: &Path) -> Option<u64> {
         .then_some(available)
 }
 
-fn budget_bytes(free: Option<u64>, override_mib: Option<u32>) -> u64 {
-    let cap_mib = override_mib
-        .filter(|&mib| mib > 0)
-        .map(u64::from)
-        .unwrap_or_else(|| {
-            if free.is_some_and(|bytes| bytes >= LOW_DISK_BYTES) {
-                512
-            } else {
-                128
-            }
-        });
-    cap_mib * MIB
+fn budget_bytes(free: Option<u64>, override_mib: Option<u32>, library_items: usize) -> u64 {
+    if let Some(mib) = override_mib.filter(|&mib| mib > 0) {
+        return u64::from(mib) * MIB;
+    }
+    let base = if free.is_some_and(|bytes| bytes >= LOW_DISK_BYTES) {
+        512 * MIB
+    } else {
+        128 * MIB
+    };
+    let library = (library_items as u64)
+        .saturating_mul(crate::gpu_gallery::POSTER_BYTES as u64)
+        .saturating_mul(5)
+        / 4;
+    base.max(library.min(free.unwrap_or(0) / 4))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -457,11 +466,22 @@ mod tests {
 
     #[test]
     fn budget_uses_section_zero_threshold_and_positive_config_override() {
-        assert_eq!(budget_bytes(Some(LOW_DISK_BYTES), None), 512 * MIB);
-        assert_eq!(budget_bytes(Some(LOW_DISK_BYTES - 1), None), 128 * MIB);
-        assert_eq!(budget_bytes(None, None), 128 * MIB);
-        assert_eq!(budget_bytes(None, Some(0)), 128 * MIB);
-        assert_eq!(budget_bytes(Some(0), Some(3)), 3 * MIB);
+        assert_eq!(budget_bytes(Some(LOW_DISK_BYTES), None, 0), 512 * MIB);
+        assert_eq!(budget_bytes(Some(LOW_DISK_BYTES - 1), None, 0), 128 * MIB);
+        assert_eq!(budget_bytes(None, None, 0), 128 * MIB);
+        assert_eq!(budget_bytes(None, Some(0), 0), 128 * MIB);
+        assert_eq!(budget_bytes(Some(0), Some(3), 0), 3 * MIB);
+        let poster = crate::gpu_gallery::POSTER_BYTES as u64;
+        let ample = Some(20_000 * MIB);
+        assert_eq!(
+            budget_bytes(Some(6_000 * MIB), None, 267),
+            267 * poster * 5 / 4
+        );
+        assert_eq!(budget_bytes(ample, None, 100), 512 * MIB);
+        assert_eq!(budget_bytes(ample, None, 2_221), 2_221 * poster * 5 / 4);
+        assert_eq!(budget_bytes(Some(4_000 * MIB), None, 10_000), 1_000 * MIB);
+        assert_eq!(budget_bytes(Some(400 * MIB), None, 10_000), 128 * MIB);
+        assert_eq!(budget_bytes(ample, Some(128), 2_221), 128 * MIB);
     }
 
     #[test]

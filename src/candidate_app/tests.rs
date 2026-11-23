@@ -954,6 +954,7 @@ fn d3_application_fixture(count: usize) -> (GpuCandidate, Arc<std::sync::atomic:
         automation_suspended: false,
         gallery_mode: GalleryMode::Depth,
         atlas_entry: None,
+        startup_loading: None,
         benchmark: Default::default(),
         scenario: Default::default(),
         screenshot_path: Default::default(),
@@ -13341,6 +13342,92 @@ fn e3_manual_and_automation_capture_native_config_despite_different_inert_source
     );
     assert_eq!(automated.as_deref(), Some(expected.as_str()));
     assert!(app.active_operation.is_none() && !app.apply_pending);
+}
+
+#[test]
+fn startup_loading_covers_discovery_and_releases_on_previews_deadline_or_empty() {
+    use startup_loading::{startup_loading_status, StartupLoading, PREVIEW_WAIT};
+    let (mut app, _) = d3_application_fixture(3);
+    app.gallery_mode = GalleryMode::Slices;
+    app.catalog_loaded = false;
+    app.poster_failed_indices.clear();
+    app.startup_loading = Some(StartupLoading::new(std::time::Instant::now()));
+    assert!(app
+        .settle_startup_loading()
+        .is_some_and(|wake| wake <= startup_loading::DISCOVERY_LIMIT));
+    assert_eq!(
+        app.settle_startup_loading(),
+        None,
+        "one discovery wake only"
+    );
+    let loading = app
+        .startup_loading
+        .expect("discovery keeps the loading screen");
+    assert_eq!(startup_loading_status(&loading), "Finding wallpapers…");
+
+    app.catalog_loaded = true;
+    let frame = app.ordinary_frame();
+    assert!(!frame.is_empty() && frame.iter().all(|entry| entry.card.layer.is_none()));
+    assert_eq!(app.settle_startup_loading(), Some(PREVIEW_WAIT));
+    let mut loading = app.startup_loading.expect("previews are still pending");
+    assert_eq!(loading.total, frame.len());
+    assert_eq!(
+        startup_loading_status(&loading),
+        format!("Preparing previews · 0 of {}", frame.len())
+    );
+    assert_eq!(app.settle_startup_loading(), None, "one deadline wake only");
+    loading.catalog_at = Some(std::time::Instant::now() - PREVIEW_WAIT);
+    app.startup_loading = Some(loading);
+    assert_eq!(app.settle_startup_loading(), None);
+    assert!(
+        app.startup_loading.is_none(),
+        "the deadline releases the screen"
+    );
+
+    app.startup_loading = Some(StartupLoading::new(std::time::Instant::now()));
+    app.poster_failed_indices
+        .extend(frame.iter().map(|entry| entry.card.index));
+    assert_eq!(app.settle_startup_loading(), Some(PREVIEW_WAIT));
+    assert!(
+        app.startup_loading.is_none(),
+        "settled failures release the screen"
+    );
+
+    app.startup_loading = Some(StartupLoading::new(std::time::Instant::now()));
+    let selected = app.selected;
+    let event = NavigationKeyEvent {
+        event_window: app.window.unwrap(),
+        physical_key: keyboard::key::Physical::Unidentified(
+            keyboard::key::NativeCode::Unidentified,
+        ),
+        location: keyboard::Location::Standard,
+        repeat: false,
+    };
+    for named in [
+        keyboard::key::Named::ArrowRight,
+        keyboard::key::Named::Enter,
+    ] {
+        let _ = update_with_startup(
+            &mut app,
+            Message::KeyPressed {
+                key: keyboard::Key::Named(named),
+                modifiers: keyboard::Modifiers::empty(),
+                event: event.clone(),
+            },
+        );
+    }
+    assert_eq!(
+        app.selected, selected,
+        "gallery keys wait for the loading screen"
+    );
+    assert!(!app.apply_pending);
+    app.startup_loading = Some(StartupLoading::new(std::time::Instant::now()));
+    app.filtered_indices.clear();
+    app.settle_startup_loading();
+    assert!(
+        app.startup_loading.is_none(),
+        "an empty view releases the screen"
+    );
 }
 
 #[test]

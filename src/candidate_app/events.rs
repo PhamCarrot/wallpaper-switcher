@@ -301,6 +301,27 @@ fn encode_detail_bitmap(path: &std::path::Path) -> Result<Vec<u8>, String> {
     Ok(bmp)
 }
 
+pub(super) fn update_with_startup(app: &mut GpuCandidate, message: Message) -> Task<Message> {
+    if app.startup_loading.is_some() {
+        if let Message::KeyPressed { key, modifiers, .. } = &message {
+            if !super::lifecycle::matches_candidate_key(key, *modifiers, "escape") {
+                return Task::none();
+            }
+        }
+    }
+    let task = update(app, message);
+    match app.settle_startup_loading() {
+        Some(delay) => Task::batch([
+            task,
+            delayed_poster_wake(
+                delay + std::time::Duration::from_millis(50),
+                Wake::StartupLoadingCheck,
+            ),
+        ]),
+        None => task,
+    }
+}
+
 pub(super) fn update(app: &mut GpuCandidate, message: Message) -> Task<Message> {
     app.reconcile_tag_editor();
     app.reconcile_playlist_editor();
@@ -1456,6 +1477,7 @@ fn reduce(app: &mut GpuCandidate, message: Message) -> Task<Message> {
                     .map(|message| app.status_with_persistence_issue(message));
             }
         }
+        Message::Wake(Wake::StartupLoadingCheck) => return Task::none(),
         Message::Wake(Wake::MotionReady) => {
             if let Some(frame) = app.motion_mailbox.take() {
                 return update_inner(app, Message::Wake(frame));

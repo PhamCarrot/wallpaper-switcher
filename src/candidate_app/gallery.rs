@@ -2663,6 +2663,9 @@ impl GpuCandidate {
         if retry && (self.wallpapers.is_empty() || self.filtered_indices.is_empty()) {
             return;
         }
+        if let Some(worker) = &self.poster_worker {
+            worker.set_library_items(self.wallpapers.len());
+        }
         let depth_retry = retry && self.gallery_mode == GalleryMode::Depth;
         if !depth_retry {
             self.restore_wall_start_position();

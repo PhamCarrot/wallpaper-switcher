@@ -95,8 +95,10 @@ This inventory includes license files from the Cargo dependency graph resolved f
 | image 0.25.10 | MIT OR Apache-2.0 | [Registry archive](https://static.crates.io/crates/image/image-0.25.10.crate) |
 | image-webp 0.2.4 | MIT OR Apache-2.0 | [Registry archive](https://static.crates.io/crates/image-webp/image-webp-0.2.4.crate) |
 | indexmap 2.14.2 | Apache-2.0 OR MIT | [Registry archive](https://static.crates.io/crates/indexmap/indexmap-2.14.2.crate) |
+| intel_tex_2 0.5.0 | MIT/Apache-2.0 | [Registry archive](https://static.crates.io/crates/intel_tex_2/intel_tex_2-0.5.0.crate) |
 | intl-memoizer 0.5.3 | Apache-2.0 OR MIT | [Registry archive](https://static.crates.io/crates/intl-memoizer/intl-memoizer-0.5.3.crate) |
 | intl_pluralrules 7.0.2 | Apache-2.0/MIT | [Registry archive](https://static.crates.io/crates/intl_pluralrules/intl_pluralrules-7.0.2.crate) |
+| ispc_rt 2.0.4 | MIT | [Registry archive](https://static.crates.io/crates/ispc_rt/ispc_rt-2.0.4.crate) |
 | itoa 1.0.18 | MIT OR Apache-2.0 | [Registry archive](https://static.crates.io/crates/itoa/itoa-1.0.18.crate) |
 | kamadak-exif 0.6.1 | BSD-2-Clause | [Registry archive](https://static.crates.io/crates/kamadak-exif/kamadak-exif-0.6.1.crate) |
 | keyboard-types 0.8.3 | MIT OR Apache-2.0 | [Registry archive](https://static.crates.io/crates/keyboard-types/keyboard-types-0.8.3.crate) |
@@ -126,6 +128,7 @@ This inventory includes license files from the Cargo dependency graph resolved f
 | mutate_once 0.1.2 | BSD-2-Clause | [Registry archive](https://static.crates.io/crates/mutate_once/mutate_once-0.1.2.crate) |
 | naga 27.0.3 | MIT OR Apache-2.0 | [Registry archive](https://static.crates.io/crates/naga/naga-27.0.3.crate) |
 | num-traits 0.2.19 | MIT OR Apache-2.0 | [Registry archive](https://static.crates.io/crates/num-traits/num-traits-0.2.19.crate) |
+| num_cpus 1.17.0 | MIT OR Apache-2.0 | [Registry archive](https://static.crates.io/crates/num_cpus/num_cpus-1.17.0.crate) |
 | once_cell 1.21.4 | MIT OR Apache-2.0 | [Registry archive](https://static.crates.io/crates/once_cell/once_cell-1.21.4.crate) |
 | option-ext 0.2.0 | MPL-2.0 | [Registry archive](https://static.crates.io/crates/option-ext/option-ext-0.2.0.crate) |
 | ordered-float 5.5.0 | MIT | [Registry archive](https://static.crates.io/crates/ordered-float/ordered-float-5.5.0.crate) |

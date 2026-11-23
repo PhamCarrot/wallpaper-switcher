@@ -659,6 +659,7 @@ struct Shared {
     wake: Condvar,
     cache_epoch: AtomicU64,
     colour_revision: AtomicU64,
+    library_items: AtomicUsize,
     shutdown: AtomicBool,
     running: AtomicBool,
     failure: Mutex<Option<WorkerFailure>>,
@@ -690,6 +691,7 @@ impl Shared {
             wake: Condvar::new(),
             cache_epoch: AtomicU64::new(0),
             colour_revision: AtomicU64::new(0),
+            library_items: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             running: AtomicBool::new(true),
             failure: Mutex::new(None),
@@ -1071,6 +1073,10 @@ impl PosterWorker {
         }
     }
 
+    pub fn set_library_items(&self, items: usize) {
+        self.shared.library_items.store(items, Ordering::Release);
+    }
+
     pub fn unavailable_reason(&self) -> Option<WorkerFailure> {
         if let Ok(failure) = self.shared.failure.lock() {
             if failure.is_some() {
@@ -1366,7 +1372,7 @@ impl Drop for BackgroundActivity<'_> {
 
 fn run_background_lane(
     shared: &Shared,
-    maintenance: Option<(&cache::Maintenance, u64)>,
+    maintenance: Option<&cache::Maintenance>,
     decoder: &PosterDecoder,
 ) {
     use windows_sys::Win32::System::Threading::{
@@ -1397,7 +1403,8 @@ fn run_background_lane(
             let pass = queue.pregeneration.take().unwrap();
             let idle_since = queue.poster_idle_since.unwrap();
             drop(queue);
-            if let Some((cache, budget)) = maintenance {
+            if let Some(cache) = maintenance {
+                let budget = cache.budget(shared.library_items.load(Ordering::Acquire));
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     pass.run(shared, cache, budget, idle_since, decoder);
                 }))
@@ -1732,7 +1739,7 @@ fn run_worker<P, D>(
     #[cfg(test)]
     let _ = shared.decode_pool.set(decoder.weak_pool());
     let (generation_clock, decoder, decode) = (&*generation_clock, &decoder, &decode);
-    let maintenance = maintenance.as_ref().map(|cache| (cache, cache.budget()));
+    let maintenance = maintenance.as_ref();
     std::thread::scope(|scope| {
         // Signal shutdown to the scoped colour thread before joining it.
         let _exit_guard = WorkerExitGuard { shared };
@@ -1787,7 +1794,7 @@ fn run_lane(
     shared: &Shared,
     generation_clock: &AtomicU64,
     publish: impl Fn(PosterCompletion) -> bool,
-    maintenance: Option<(&cache::Maintenance, u64)>,
+    maintenance: Option<&cache::Maintenance>,
     decoder: &PosterDecoder,
     pool: &[mpsc::Sender<DecodeTask>],
 ) {
@@ -1802,8 +1809,9 @@ fn run_lane(
         let batch = match work {
             Work::Posters(batch) => batch,
             Work::MaintainCache => {
-                if let Some((cache, budget)) = &maintenance {
-                    let complete = cache.run(*budget, || maintenance_idle(shared));
+                if let Some(cache) = &maintenance {
+                    let budget = cache.budget(shared.library_items.load(Ordering::Acquire));
+                    let complete = cache.run(budget, || maintenance_idle(shared));
                     maintenance_due = Some(
                         Instant::now()
                             + if complete {

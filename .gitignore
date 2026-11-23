@@ -18,3 +18,9 @@
 Thumbs.db
 Desktop.ini
 .DS_Store
+__pycache__/
+/AGENTS.md
+/docs/*
+!/docs/ARCHITECTURE.md
+!/docs/HOW-POSTERS-WORK.md
+!/docs/third_party/

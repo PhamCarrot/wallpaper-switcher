@@ -555,6 +555,7 @@ fn boot(
         config,
         gallery_mode: gallery_mode(state.gallery.mode),
         atlas_entry: None,
+        startup_loading: None,
         state,
         state_path,
         wallpapers: Vec::new(),
@@ -752,6 +753,9 @@ fn boot(
         _tray: tray,
         coordinator,
     };
+    if app.visible && app.screenshot_path.is_none() {
+        app.startup_loading = Some(startup_loading::StartupLoading::new(boot_started));
+    }
     if let Some(snapshot) = cached_catalog {
         app.install_cached_catalog(snapshot);
     }
@@ -1077,7 +1081,7 @@ pub(crate) fn run() -> iced::Result {
     .expect("validated saved startup language");
     iced::daemon(
         move || boot(launch_policy, startup_state.clone()),
-        update,
+        update_with_startup,
         view,
     )
     .title("Wallpaper Switcher GPU Candidate")

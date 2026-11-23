@@ -8049,3 +8049,112 @@ fn r5_owned_save_footer_shows_the_live_fallback_note() {
     )
     .unwrap();
 }
+
+#[test]
+#[ignore = "Owned D1 startup loading capture; requires D1_LAYOUT_OUTPUT and explicit invocation"]
+fn d1_owned_startup_loading_screen_covers_the_gallery_with_progress() {
+    use iced::advanced::{
+        layout,
+        renderer::{Headless, Renderer as _},
+        widget::{Operation, Tree},
+        Layout,
+    };
+    #[derive(Default)]
+    struct Probe {
+        texts: Vec<(String, iced::Rectangle)>,
+    }
+    impl Operation for Probe {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(&mut self, _: Option<&iced::widget::Id>, bounds: iced::Rectangle, value: &str) {
+            self.texts.push((value.into(), bounds));
+        }
+    }
+    let output =
+        std::path::PathBuf::from(std::env::var_os("D1_LAYOUT_OUTPUT").expect("owned output"));
+    std::fs::create_dir_all(&output).unwrap();
+    let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+        UI_FONT,
+        iced::Pixels(16.0),
+        Some("wgpu"),
+    ))
+    .unwrap();
+    let (width, height) = (1920u32, 1080u32);
+    for (case, catalog, ready, total) in [("discovering", false, 0, 0), ("previews", true, 5, 12)] {
+        let (mut app, _) = d4a_fixture(3);
+        app.viewport = [width as f32, height as f32];
+        app.launch_policy = p1_preview_policy();
+        iced::advanced::graphics::text::font_system()
+            .write()
+            .unwrap()
+            .load_font(std::borrow::Cow::Borrowed(app.settings_locale.font_bytes()));
+        let mut loading = startup_loading::StartupLoading::new(std::time::Instant::now());
+        if catalog {
+            loading.catalog_at = Some(std::time::Instant::now());
+            loading.ready = ready;
+            loading.total = total;
+        }
+        app.startup_loading = Some(loading);
+        let window = app.window.unwrap();
+        let theme = theme(&app, window);
+        let style = application_style(&app, &theme);
+        let size = iced::Size::new(width as f32, height as f32);
+        let viewport = iced::Rectangle::with_size(size);
+        let mut element = view(&app, window);
+        let mut tree = Tree::new(&element);
+        let node =
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &layout::Limits::new(size, size));
+        let mut probe = Probe::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+        let status = startup_loading::startup_loading_status(&loading);
+        let find = |label: &str| {
+            probe
+                .texts
+                .iter()
+                .rev()
+                .find(|(text, bounds)| text == label && viewport.contains(bounds.center()))
+                .map(|(_, bounds)| *bounds)
+                .unwrap_or_else(|| panic!("{case}: missing {label:?}: {:?}", probe.texts))
+        };
+        let title = find("Loading wallpapers");
+        let line = find(&status);
+        eprintln!("{case}: title={title:?} status={line:?}");
+        assert!(
+            (title.center_x() - viewport.center_x()).abs() < 200.0,
+            "{case}: centred"
+        );
+        assert!(line.y > title.y, "{case}: status under the title");
+        renderer.reset(viewport);
+        element.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &theme,
+            &iced::advanced::renderer::Style {
+                text_color: style.text_color,
+            },
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &viewport,
+        );
+        let bytes = Headless::screenshot(
+            &mut renderer,
+            iced::Size::new(width, height),
+            1.0,
+            style.background_color,
+        );
+        ::image::save_buffer_with_format(
+            output.join(format!("d1-startup-loading-{case}.png")),
+            &bytes,
+            width,
+            height,
+            ::image::ColorType::Rgba8,
+            ::image::ImageFormat::Png,
+        )
+        .unwrap();
+    }
+}

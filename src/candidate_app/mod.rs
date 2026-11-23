@@ -25,6 +25,7 @@ use wall_colour_hold::WallPosterPin;
 mod persistence;
 mod playlists;
 mod runtime;
+mod startup_loading;
 #[cfg(test)]
 mod tests;
 mod theme_workflow;
@@ -72,7 +73,7 @@ use persistence::successful_engine_persistence_status;
 #[cfg(test)]
 use persistence::{diagnostic_status, state_save_failure_message};
 
-use events::update;
+use events::{update, update_with_startup};
 #[cfg(test)]
 use lifecycle::{
     close_owned_sheet, exit_action_for_ui, matched_selection_navigation, matches_candidate_key,
@@ -188,6 +189,7 @@ enum Wake {
     ColourReady(poster_worker::colour::Completion),
     CatalogSnapshotSaved(Result<(), String>),
     PostersReady,
+    StartupLoadingCheck,
     RetryPosters(u64),
     PosterWorkerExited(poster_worker::WorkerExit),
     PosterGpu(gpu_gallery::PosterFeedback),
@@ -756,6 +758,7 @@ struct GpuCandidate {
     automation_suspended: bool,
     gallery_mode: GalleryMode,
     atlas_entry: Option<GalleryMode>,
+    startup_loading: Option<startup_loading::StartupLoading>,
     benchmark: Option<BenchmarkState>,
     scenario: Option<ScenarioState>,
     screenshot_path: Option<std::path::PathBuf>,

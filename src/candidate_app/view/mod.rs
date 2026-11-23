@@ -922,7 +922,46 @@ pub(super) fn view(app: &GpuCandidate, _id: window::Id) -> Element<'_, Message> 
             .padding(28),
         );
     }
+    if let Some(loading) = &app.startup_loading {
+        layers = layers.push(startup_loading_view(loading, folio_palette));
+    }
     layers.width(Fill).height(Fill).into()
+}
+
+fn startup_loading_view<'a>(
+    loading: &super::startup_loading::StartupLoading,
+    palette: donor_ui::Palette,
+) -> Element<'a, Message> {
+    let mut panel = column![
+        text("Loading wallpapers").size(22).font(UI_FONT),
+        text(super::startup_loading::startup_loading_status(loading))
+            .size(14)
+            .font(UI_FONT),
+    ]
+    .spacing(10)
+    .width(360);
+    if loading.total > 0 {
+        panel = panel.push(
+            iced::widget::progress_bar(
+                0.0..=loading.total as f32,
+                loading.ready.min(loading.total) as f32,
+            )
+            .girth(6),
+        );
+    }
+    let backdrop = palette.background;
+    iced::widget::opaque(
+        container(
+            container(panel)
+                .padding(24)
+                .style(move |_| donor_ui::box_style(palette.surface, palette.outline)),
+        )
+        .center(Fill)
+        .style(move |_| iced::widget::container::Style {
+            background: Some(iced::Background::Color(backdrop)),
+            ..Default::default()
+        }),
+    )
 }
 
 fn detail_modified_date(seconds: u64) -> Option<String> {
